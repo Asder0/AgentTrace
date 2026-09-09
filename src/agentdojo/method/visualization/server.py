@@ -32,6 +32,12 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from ..capture.interceptor import TrackingContext, _defense_enabled, PromptInjectionBlockedError
+from ..analysis.defense_config import (
+    RING_METHODS,
+    get_config,
+    set_ring_enabled,
+    set_method_enabled,
+)
 from ..modeling.graph_db import (
     get_graph_data,
     get_graph_summary,
@@ -272,6 +278,9 @@ def api_get_status():
                 "has_api_key": bool(_llm_config["api_key"]),
             },
             "defense_enabled": _defense_enabled,
+            "defense_rings": {
+                ring: cfg["enabled"] for ring, cfg in get_config().items()
+            },
             "graph_stats": {
                 "nodes": node_count,
                 "edges": edge_count,
@@ -468,28 +477,73 @@ def api_set_llm_config():
 
 @app.route('/api/config/defense', methods=['GET'])
 def api_get_defense_config():
-    """获取当前防御机制状态。"""
+    """获取当前防御机制状态（总开关 + 各 Ring + 各硬编码检测方法）。"""
+    config = get_config()
     return jsonify({
         "enabled": _defense_enabled,
+        "rings": {
+            ring: {
+                "enabled": cfg["enabled"],
+                "methods": cfg["methods"],
+                "method_labels": RING_METHODS[ring],
+            }
+            for ring, cfg in config.items()
+        },
     })
 
 
 @app.route('/api/config/defense', methods=['POST'])
 def api_set_defense_config():
-    """设置防御机制状态（开启/关闭）。"""
+    """
+    设置防御机制状态。
+
+    兼容旧格式：{"enabled": bool}
+    支持新格式：
+    {
+      "enabled": bool,                       # 可选：总开关
+      "rings": {                             # 可选：Ring 级/方法级开关
+        "ring_0": {"enabled": bool, "methods": {"regex": bool, "model": bool}},
+        ...
+      }
+    }
+    """
     try:
         data = request.get_json()
-        if not data or 'enabled' not in data:
-            return jsonify({'error': '缺少 enabled 参数'}), 400
+        if not data or ('enabled' not in data and 'rings' not in data):
+            return jsonify({'error': '缺少 enabled 或 rings 参数'}), 400
         import sys
         interceptor_mod = sys.modules.get('agentdojo.method.capture.interceptor')
         if interceptor_mod is None:
             from ..capture import interceptor as interceptor_mod
-        interceptor_mod._defense_enabled = bool(data['enabled'])
-        status_text = "已启用" if interceptor_mod._defense_enabled else "已关闭"
-        print(f"🛡️ 防御机制状态已更新: {status_text}")
+        if 'enabled' in data:
+            interceptor_mod._defense_enabled = bool(data['enabled'])
+            status_text = "已启用" if interceptor_mod._defense_enabled else "已关闭"
+            print(f"[defense] 防御机制状态已更新: {status_text}")
+        if 'rings' in data:
+            rings_cfg = data['rings']
+            if not isinstance(rings_cfg, dict):
+                return jsonify({'error': 'rings 必须是对象'}), 400
+            for ring, ring_cfg in rings_cfg.items():
+                if not isinstance(ring_cfg, dict):
+                    return jsonify({'error': f'{ring} 配置必须是对象'}), 400
+                if 'enabled' in ring_cfg:
+                    set_ring_enabled(ring, ring_cfg['enabled'])
+                methods_cfg = ring_cfg.get('methods')
+                if isinstance(methods_cfg, dict):
+                    for method, flag in methods_cfg.items():
+                        set_method_enabled(ring, method, flag)
+            print(f"[defense] Ring 配置已更新: {rings_cfg}")
+        config = get_config()
         return jsonify({
             "enabled": interceptor_mod._defense_enabled,
+            "rings": {
+                ring: {
+                    "enabled": cfg["enabled"],
+                    "methods": cfg["methods"],
+                    "method_labels": RING_METHODS[ring],
+                }
+                for ring, cfg in config.items()
+            },
             "status": "ok",
         })
     except Exception as e:

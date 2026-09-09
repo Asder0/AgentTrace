@@ -426,6 +426,14 @@ const CONSOLE = {
                         关闭后跳过 Ring 1-4 检测
                     </span>
                 </div>
+                <div class="llm-config-row" style="flex-direction: column; align-items: stretch; gap: 6px; margin-top: 6px;">
+                    <div style="font-size: 12px; color: var(--text-secondary);">
+                        Ring 级开关（可单独关闭/开启每个 Ring，及其内部硬编码检测方法）
+                    </div>
+                    <div id="ringTogglesContainer" style="display: flex; flex-direction: column; gap: 8px;">
+                        <!-- 动态渲染：每个 Ring 一行，含 Ring 开关 + 方法开关 -->
+                    </div>
+                </div>
             </div>
         `;
         
@@ -473,6 +481,16 @@ const CONSOLE = {
         if (defenseToggle) {
             defenseToggle.addEventListener('change', () => {
                 this._toggleDefense();
+            });
+        }
+
+        // Ring 级 / 方法级开关切换事件（事件委托）
+        const ringContainer = document.getElementById('ringTogglesContainer');
+        if (ringContainer) {
+            ringContainer.addEventListener('change', (e) => {
+                if (e.target && e.target.type === 'checkbox' && e.target.dataset.role) {
+                    this._updateRingConfig();
+                }
             });
         }
     },
@@ -542,8 +560,89 @@ const CONSOLE = {
                 statusText.textContent = config.enabled ? '🟢 已启用' : '🔴 已关闭';
                 statusText.className = config.enabled ? 'defense-status enabled' : 'defense-status disabled';
             }
+            this._renderRingToggles(config.rings || {});
         } catch (err) {
             console.warn('获取防御配置失败:', err.message);
+        }
+    },
+
+    /**
+     * 渲染每个 Ring 的开关行（Ring 开关 + 硬编码检测方法开关）
+     */
+    _renderRingToggles(rings) {
+        const container = document.getElementById('ringTogglesContainer');
+        if (!container || !rings) return;
+
+        const ringNames = {
+            ring_0: 'Ring 0 · 初始 Prompt 注入检测',
+            ring_1: 'Ring 1 · 工具输出注入检测',
+            ring_2: 'Ring 2 · 意图一致性检查',
+            ring_3: 'Ring 3 · 数据过度暴露(DOE)',
+        };
+
+        const rows = Object.keys(rings).map((ring) => {
+            const cfg = rings[ring] || {};
+            const enabled = !!cfg.enabled;
+            const methodFlags = cfg.methods || {};
+            const methodLabels = cfg.method_labels || {};
+            const methodToggles = Object.keys(methodFlags).map((method) => {
+                const checked = methodFlags[method] ? 'checked' : '';
+                const label = methodLabels[method] || method;
+                return `
+                    <label style="display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); margin-right: 10px; cursor: pointer;">
+                        <input type="checkbox" data-role="method" data-ring="${ring}" data-method="${method}" ${checked}>
+                        <span title="${label}">${method}</span>
+                    </label>
+                `;
+            }).join('');
+            return `
+                <div style="border: 1px solid var(--border-color); border-radius: 6px; padding: 6px 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px;">
+                    <label style="display: inline-flex; align-items: center; gap: 6px; min-width: 220px;">
+                        <input type="checkbox" data-role="ring" data-ring="${ring}" ${enabled ? 'checked' : ''}>
+                        <span style="font-size: 13px; font-weight: 600;">${ringNames[ring] || ring}</span>
+                    </label>
+                    <div style="display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px; flex: 1;">
+                        ${methodToggles}
+                    </div>
+                </div>
+            `;
+        }).join('');
+        container.innerHTML = rows;
+    },
+
+    /**
+     * 将当前 Ring 级/方法级开关状态提交到后端
+     */
+    async _updateRingConfig() {
+        const container = document.getElementById('ringTogglesContainer');
+        if (!container) return;
+
+        const rings = {};
+        container.querySelectorAll('input[data-role="ring"]').forEach((el) => {
+            const ring = el.dataset.ring;
+            if (!rings[ring]) rings[ring] = {};
+            rings[ring].enabled = el.checked;
+        });
+        container.querySelectorAll('input[data-role="method"]').forEach((el) => {
+            const ring = el.dataset.ring;
+            if (!rings[ring]) rings[ring] = {};
+            if (!rings[ring].methods) rings[ring].methods = {};
+            rings[ring].methods[el.dataset.method] = el.checked;
+        });
+
+        try {
+            const result = await API.setDefenseConfig(null, rings);
+            if (result && result.status === 'ok') {
+                this._showFeedback('🛡️ Ring/检测方法开关已更新', 'info');
+            }
+        } catch (err) {
+            console.error('设置 Ring 配置失败:', err);
+            this._showFeedback(`❌ 设置 Ring 配置失败: ${err.message}`, 'error');
+            // 重新拉取配置，恢复实际状态
+            try {
+                const config = await API.getDefenseConfig();
+                this._renderRingToggles(config.rings || {});
+            } catch (e) { /* ignore */ }
         }
     },
 

@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Sequence
 from dataclasses import dataclass, field
 
 from ..analysis.pipeline import process_before_execution, process_after_execution, process_after_execution_with_details
+from ..analysis.defense_config import get_config
 
 # 防御开关（全局，默认开启）
 # 关闭后，Analysis Pipeline 的 4 个 Ring 将全部跳过
@@ -328,7 +329,7 @@ def capture_tool_call(func: Callable):
         intended_data_categories = set()
         if _defense_enabled:
             allow, modified_kwargs, defense_diagnostics, intended_data_categories = process_before_execution(
-                event_record, prompt=user_prompt
+                event_record, prompt=user_prompt, options=get_config()
             )
         else:
             allow, modified_kwargs = True, kwargs
@@ -454,6 +455,7 @@ def capture_tool_call(func: Callable):
                 final_result, after_diagnostics = process_after_execution_with_details(
                     event_complete, result,
                     intent_data=intended_data_categories,
+                    options=get_config(),
                 )
             else:
                 final_result = result
@@ -553,4 +555,3 @@ def _patch_llm_query_methods():
         print(f"Data Flow Tracking enabled: {patched_count} LLM query methods intercepted.")
     else:
         print("Warning: No LLM query methods were patched.")
-

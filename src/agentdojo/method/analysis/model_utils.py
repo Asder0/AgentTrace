@@ -14,6 +14,7 @@ import re
 import logging
 from typing import Optional, Tuple, List, Any
 from functools import lru_cache
+from .defense_config import effective_method_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +222,12 @@ def get_sentence_encoder():
     return _model_cache["sentence_encoder"]
 
 
-def compute_intent_similarity(user_intent: str, action_name: str, action_args: dict = None) -> float:
+def compute_intent_similarity(
+    user_intent: str,
+    action_name: str,
+    action_args: dict = None,
+    options: dict = None,
+) -> float:
     """
     Compute semantic similarity between user intent and an action.
     
@@ -250,8 +256,11 @@ def compute_intent_similarity(user_intent: str, action_name: str, action_args: d
             logger.warning(f"Sentence encoder inference failed: {e}")
             # Fall through to keyword fallback
     
-    # Fallback: keyword overlap
-    return _keyword_similarity_fallback(user_intent, action_name)
+    # Fallback: keyword overlap (can be disabled via ring_2.keyword toggle)
+    if effective_method_enabled("ring_2", "keyword", options):
+        return _keyword_similarity_fallback(user_intent, action_name)
+    # Keyword fallback disabled → neutral similarity (no judgment, allow)
+    return 0.5
 
 
 def _keyword_similarity_fallback(user_intent: str, action_name: str) -> float:
@@ -336,7 +345,7 @@ SENSITIVE_PATTERNS: list = [
 ]
 
 
-def detect_sensitive_data(text: str) -> List[dict]:
+def detect_sensitive_data(text: str, options: dict = None) -> List[dict]:
     """
     Detect sensitive data in text using NER model + regex patterns.
     
@@ -366,23 +375,24 @@ def detect_sensitive_data(text: str) -> List[dict]:
         except Exception as e:
             logger.warning(f"NER inference failed: {e}")
     
-    # Regex patterns for additional coverage
-    for pattern, label in SENSITIVE_PATTERNS:
-        for match in re.finditer(pattern, text):
-            # Avoid duplicates with NER results
-            if not any(abs(r["start"] - match.start()) < 5 for r in results):
-                results.append({
-                    "text": match.group(0),
-                    "label": f"REGEX_{label}",
-                    "score": 0.8,
-                    "start": match.start(),
-                    "end": match.end(),
-                })
+    # Regex patterns for additional coverage (can be disabled via ring_3.regex toggle)
+    if effective_method_enabled("ring_3", "regex", options):
+        for pattern, label in SENSITIVE_PATTERNS:
+            for match in re.finditer(pattern, text):
+                # Avoid duplicates with NER results
+                if not any(abs(r["start"] - match.start()) < 5 for r in results):
+                    results.append({
+                        "text": match.group(0),
+                        "label": f"REGEX_{label}",
+                        "score": 0.8,
+                        "start": match.start(),
+                        "end": match.end(),
+                    })
     
     return results
 
 
-def redact_sensitive_data(text: str, replacement: str = "[REDACTED]") -> str:
+def redact_sensitive_data(text: str, replacement: str = "[REDACTED]", options: dict = None) -> str:
     """
     Redact sensitive data from text.
     
@@ -392,7 +402,7 @@ def redact_sensitive_data(text: str, replacement: str = "[REDACTED]") -> str:
     if not text or not isinstance(text, str):
         return text
     
-    sensitive_items = detect_sensitive_data(text)
+    sensitive_items = detect_sensitive_data(text, options)
     
     # Sort by start position in reverse order to avoid offset issues
     sensitive_items.sort(key=lambda x: x["start"], reverse=True)
@@ -470,17 +480,25 @@ INTENT_CATEGORY_KEYWORDS = {
 }
 
 
-def extract_necessary_categories(tool_intent: str) -> set:
-    """Extract D_nec: data categories that are necessary for the tool's function."""
+def extract_necessary_categories(tool_intent: str, options: dict = None) -> set:
+    """Extract D_nec: data categories that are necessary for the tool's function.
+
+    Uses the hardcoded TOOL_NEC_CATEGORIES table (ring_3.keyword toggle).
+    When disabled, returns an empty set (no tool-intrinsic allowance).
+    """
+    if not effective_method_enabled("ring_3", "keyword", options):
+        return set()
     return TOOL_NEC_CATEGORIES.get(tool_intent, set())
 
 
-def extract_intended_categories(user_intent_text: str) -> set:
+def extract_intended_categories(user_intent_text: str, options: dict = None) -> set:
     """Extract D_int: data categories the user explicitly intended to access.
 
     Parses the user's original intent/prompt to determine which types of
     sensitive data the user legitimately needs to access in this task.
     """
+    if not effective_method_enabled("ring_3", "keyword", options):
+        return set()
     if not user_intent_text:
         return set()
     text_lower = user_intent_text.lower()
@@ -512,6 +530,7 @@ def redact_only_overexposed(
     text: str,
     allowed_categories: set = None,
     replacement: str = "[REDACTED]",
+    options: dict = None,
 ) -> str:
     """Redact only sensitive data whose category is NOT in allowed_categories.
 
@@ -526,9 +545,9 @@ def redact_only_overexposed(
         return text
     if allowed_categories is None:
         # Conservative default: redact everything (original behavior)
-        return redact_sensitive_data(text, replacement)
+        return redact_sensitive_data(text, replacement, options)
 
-    sensitive_items = detect_sensitive_data(text)
+    sensitive_items = detect_sensitive_data(text, options)
 
     # Filter: only redact items NOT in allowed categories
     to_redact = []

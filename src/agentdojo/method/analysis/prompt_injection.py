@@ -16,6 +16,7 @@ Ring 0: Prompt Injection Detection for initial user prompt.
 import re
 from typing import Tuple
 from .model_utils import detect_prompt_injection
+from .defense_config import effective_method_enabled
 
 # Ring 0 的检测阈值（比 Ring 1 更严格）
 # 因为 prompt 注入直接威胁初始安全边界，宁可误报不可漏报
@@ -60,7 +61,11 @@ INSTRUCTION_PATTERNS = [
 ]
 
 
-def check_prompt_for_injection(prompt: str, threshold: float = PROMPT_INJECTION_THRESHOLD) -> bool:
+def check_prompt_for_injection(
+    prompt: str,
+    threshold: float = PROMPT_INJECTION_THRESHOLD,
+    options: dict = None,
+) -> bool:
     """
     检查用户提交的 prompt 是否包含注入指令。
     
@@ -79,27 +84,50 @@ def check_prompt_for_injection(prompt: str, threshold: float = PROMPT_INJECTION_
     """
     if not prompt or not isinstance(prompt, str):
         return True  # 空 prompt 视为安全
+
+    regex_enabled = effective_method_enabled("ring_0", "regex", options)
+    model_enabled = effective_method_enabled("ring_0", "model", options)
+
+    # 没有任何检测方法开启时，直接放行
+    if not regex_enabled and not model_enabled:
+        return True
     
     # 先检查安全模式，避免误判
-    for safe_pattern in SAFE_PROMPT_PATTERNS:
-        if re.search(safe_pattern, prompt):
-            return True
+    if regex_enabled:
+        for safe_pattern in SAFE_PROMPT_PATTERNS:
+            if re.search(safe_pattern, prompt):
+                return True
     
-    # 使用模型检测
-    is_injection, safety_score = detect_prompt_injection(prompt, threshold)
-    
-    if is_injection:
-        # 二次验证：模型判定为注入后，还需检查是否包含指令性关键词
+    # 正则指令关键词检测（与模型并联或独立执行）
+    regex_injection_detected = False
+    if regex_enabled:
         for instr_pattern in INSTRUCTION_PATTERNS:
             if re.search(instr_pattern, prompt):
+                regex_injection_detected = True
+                break
+
+    if model_enabled:
+        # 使用模型检测
+        is_injection, safety_score = detect_prompt_injection(prompt, threshold)
+        if is_injection:
+            # 二次验证：模型判定为注入后，还需检查是否包含指令性关键词
+            # 若 regex 已关闭，模型单独命中即判定为注入
+            if not regex_enabled or regex_injection_detected:
                 return False  # 模型 + 指令关键词双重确认 → 真正的注入
-        # 模型判定为注入，但不含指令关键词 → 视为误判，放行
-        return True
+            # 模型判定为注入，但不含指令关键词 → 视为误判，放行
+            return True
+    elif regex_injection_detected:
+        # 模型关闭时，正则指令关键词命中即阻断
+        return False
     
     return True  # 未检测到注入
 
 
-def check_prompt_for_injection_with_details(prompt: str, threshold: float = PROMPT_INJECTION_THRESHOLD) -> dict:
+def check_prompt_for_injection_with_details(
+    prompt: str,
+    threshold: float = PROMPT_INJECTION_THRESHOLD,
+    options: dict = None,
+) -> dict:
     """
     检查 prompt 是否包含注入，返回完整详情用于审计追踪。
     
@@ -117,41 +145,63 @@ def check_prompt_for_injection_with_details(prompt: str, threshold: float = PROM
         "detection_method": "empty_prompt",
         "prompt_length": 0,
         "matched_pattern": None,
+        "regex_enabled": True,
+        "model_enabled": True,
     }
     
     if not prompt or not isinstance(prompt, str):
         return result
     
     result["prompt_length"] = len(prompt)
+    regex_enabled = effective_method_enabled("ring_0", "regex", options)
+    model_enabled = effective_method_enabled("ring_0", "model", options)
+    result["regex_enabled"] = regex_enabled
+    result["model_enabled"] = model_enabled
+
+    # 所有检测方法都关闭 → 直接放行
+    if not regex_enabled and not model_enabled:
+        result["detection_method"] = "no_method_enabled"
+        return result
     
     # 先检查安全模式
-    for safe_pattern in SAFE_PROMPT_PATTERNS:
-        if re.search(safe_pattern, prompt):
-            result["safety_score"] = 1.0
-            result["detection_method"] = "safe_pattern"
-            result["matched_pattern"] = safe_pattern
-            return result
+    if regex_enabled:
+        for safe_pattern in SAFE_PROMPT_PATTERNS:
+            if re.search(safe_pattern, prompt):
+                result["safety_score"] = 1.0
+                result["detection_method"] = "safe_pattern"
+                result["matched_pattern"] = safe_pattern
+                return result
     
-    # 使用模型检测
-    is_injection, safety_score = detect_prompt_injection(prompt, threshold)
-    result["safety_score"] = safety_score
-    
-    if is_injection:
-        # 二次验证
-        has_instruction = False
+    # 正则指令关键词检测
+    regex_injection_detected = False
+    if regex_enabled:
         for instr_pattern in INSTRUCTION_PATTERNS:
             if re.search(instr_pattern, prompt):
-                has_instruction = True
+                regex_injection_detected = True
                 result["matched_pattern"] = instr_pattern
                 break
-        
-        if has_instruction:
-            result["passed"] = False
-            result["detection_method"] = "deberta_model"
+
+    if model_enabled:
+        # 使用模型检测
+        is_injection, safety_score = detect_prompt_injection(prompt, threshold)
+        result["safety_score"] = safety_score
+
+        if is_injection:
+            # 二次验证：模型判定为注入后，还需检查是否包含指令性关键词
+            # 若 regex 关闭，模型单独命中即判定为注入
+            if not regex_enabled or regex_injection_detected:
+                result["passed"] = False
+                result["detection_method"] = "deberta_model"
+            else:
+                result["passed"] = True
+                result["detection_method"] = "deberta_model_with_secondary_check"
         else:
-            result["passed"] = True
-            result["detection_method"] = "deberta_model_with_secondary_check"
+            result["detection_method"] = "deberta_model"
+    elif regex_injection_detected:
+        # 模型关闭时，正则指令关键词命中即阻断
+        result["passed"] = False
+        result["detection_method"] = "regex_pattern"
     else:
-        result["detection_method"] = "deberta_model"
+        result["detection_method"] = "no_model_regex_clean"
     
     return result

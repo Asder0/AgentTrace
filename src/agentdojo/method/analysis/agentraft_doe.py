@@ -27,6 +27,7 @@ def _compute_allowed_categories(
     event_complete: dict,
     nec_data: set = None,
     intent_data: set = None,
+    options: dict = None,
 ) -> set:
     """Compute D_nec U D_int = the set of allowed data categories.
 
@@ -36,13 +37,13 @@ def _compute_allowed_categories(
     tool_intent = event_complete.get("tool_intent", "")
 
     if nec_data is None:
-        d_nec = extract_necessary_categories(tool_intent)
+        d_nec = extract_necessary_categories(tool_intent, options)
     else:
         d_nec = nec_data
 
     if intent_data is None:
         thought_prompt = event_complete.get("thought_prompt", "")
-        d_int = extract_intended_categories(thought_prompt)
+        d_int = extract_intended_categories(thought_prompt, options)
     else:
         d_int = intent_data
 
@@ -55,6 +56,7 @@ def apply_doe_mitigation(
     result: any,
     nec_data: set = None,
     intent_data: set = None,
+    options: dict = None,
 ) -> any:
     """
     D_OE = (D_trans \\ (D_nec U D_int)) n D_total
@@ -71,12 +73,12 @@ def apply_doe_mitigation(
     if not isinstance(result, str):
         return result
 
-    allowed = _compute_allowed_categories(event_complete, nec_data, intent_data)
-    sanitized = redact_only_overexposed(result, allowed)
+    allowed = _compute_allowed_categories(event_complete, nec_data, intent_data, options)
+    sanitized = redact_only_overexposed(result, allowed, options=options)
 
     if sanitized != result:
         redacted_items = set()
-        for item in detect_sensitive_data(result):
+        for item in detect_sensitive_data(result, options):
             cat = _get_item_category(item["label"])
             if cat not in allowed:
                 redacted_items.add(cat)
@@ -94,6 +96,7 @@ def apply_doe_mitigation_with_details(
     result: any,
     nec_data: set = None,
     intent_data: set = None,
+    options: dict = None,
 ) -> dict:
     """
     Apply DOE mitigation and return full details for audit tracing.
@@ -137,12 +140,12 @@ def apply_doe_mitigation_with_details(
     # Compute D_nec and D_int
     tool_intent = event_complete.get("tool_intent", "")
     if nec_data is None:
-        d_nec = extract_necessary_categories(tool_intent)
+        d_nec = extract_necessary_categories(tool_intent, options)
     else:
         d_nec = nec_data
     if intent_data is None:
         thought_prompt = event_complete.get("thought_prompt", "")
-        d_int = extract_intended_categories(thought_prompt)
+        d_int = extract_intended_categories(thought_prompt, options)
     else:
         d_int = intent_data
     allowed = d_nec | d_int
@@ -151,13 +154,13 @@ def apply_doe_mitigation_with_details(
     details["d_int"] = sorted(d_int)
 
     # Detect all sensitive data
-    sensitive_items = detect_sensitive_data(result)
+    sensitive_items = detect_sensitive_data(result, options)
     details["items"] = sensitive_items
     details["sensitive_items_found"] = len(sensitive_items)
     details["original_result"] = result[:200] if len(result) > 200 else result
 
     # Apply category-aware redaction
-    sanitized = redact_only_overexposed(result, allowed)
+    sanitized = redact_only_overexposed(result, allowed, options=options)
     details["sanitized_result"] = sanitized
 
     # Compute D_OE (over-exposed categories)

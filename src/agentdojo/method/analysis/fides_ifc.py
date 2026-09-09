@@ -11,6 +11,7 @@ Falls back to keyword matching if the model is unavailable.
 import re
 from typing import Dict, Any, Optional, List
 from .model_utils import compute_intent_similarity
+from .defense_config import effective_method_enabled
 
 # Similarity threshold below which an action is considered inconsistent
 SIMILARITY_THRESHOLD = 0.25
@@ -123,6 +124,7 @@ def _is_action_consistent_with_intent(
     user_intent: str,
     action_args: dict = None,
     threshold: float = SIMILARITY_THRESHOLD,
+    options: dict = None,
 ) -> bool:
     """
     Check if an action is consistent with the user's stated intent.
@@ -132,15 +134,18 @@ def _is_action_consistent_with_intent(
         return True  # Can't judge without intent
     
     # Compute semantic similarity using Sentence-BERT (or fallback)
-    similarity = compute_intent_similarity(user_intent, action, action_args)
+    similarity = compute_intent_similarity(user_intent, action, action_args, options)
     
     # Graduated thresholds — no blind bypass for read actions
-    if action in READ_ACTIONS:
-        effective_threshold = READ_THRESHOLD       # 0.10 — only block clearly malicious
-    elif action in SENSITIVE_ACTIONS:
-        effective_threshold = SENSITIVE_THRESHOLD  # 0.35 — strict for mutations
+    if effective_method_enabled("ring_2", "action_class", options):
+        if action in READ_ACTIONS:
+            effective_threshold = READ_THRESHOLD       # 0.10 — only block clearly malicious
+        elif action in SENSITIVE_ACTIONS:
+            effective_threshold = SENSITIVE_THRESHOLD  # 0.35 — strict for mutations
+        else:
+            effective_threshold = NORMAL_THRESHOLD     # 0.20 — standard
     else:
-        effective_threshold = NORMAL_THRESHOLD     # 0.20 — standard
+        effective_threshold = NORMAL_THRESHOLD
     
     return similarity >= effective_threshold
 
@@ -148,6 +153,7 @@ def _is_action_consistent_with_intent(
 def check_intent_consistency(
     event: dict,
     threshold: float = SIMILARITY_THRESHOLD,
+    options: dict = None,
 ) -> bool:
     """
     Check if the current action is consistent with the user's original intent.
@@ -181,12 +187,14 @@ def check_intent_consistency(
         tracker.user_task or '',
         action_args,
         threshold,
+        options,
     )
 
 
 def check_intent_consistency_with_details(
     event: dict,
     threshold: float = SIMILARITY_THRESHOLD,
+    options: dict = None,
 ) -> dict:
     """
     Check if the current action is consistent with the user's original intent,
@@ -225,20 +233,24 @@ def check_intent_consistency_with_details(
         return result  # Can't judge without intent
     
     # Determine action type and effective threshold
-    if current_intent in READ_ACTIONS:
-        result["action_type"] = "read_action"
-        effective_threshold = READ_THRESHOLD
-    elif current_intent in SENSITIVE_ACTIONS:
-        result["action_type"] = "sensitive_action"
-        result["is_sensitive"] = True
-        effective_threshold = SENSITIVE_THRESHOLD
+    if effective_method_enabled("ring_2", "action_class", options):
+        if current_intent in READ_ACTIONS:
+            result["action_type"] = "read_action"
+            effective_threshold = READ_THRESHOLD
+        elif current_intent in SENSITIVE_ACTIONS:
+            result["action_type"] = "sensitive_action"
+            result["is_sensitive"] = True
+            effective_threshold = SENSITIVE_THRESHOLD
+        else:
+            effective_threshold = NORMAL_THRESHOLD
     else:
+        result["action_type"] = "normal_action"
         effective_threshold = NORMAL_THRESHOLD
     
     result["threshold"] = effective_threshold
     
     # Compute semantic similarity — ALL actions get checked, no bypass
-    similarity = compute_intent_similarity(user_intent, current_intent, action_args)
+    similarity = compute_intent_similarity(user_intent, current_intent, action_args, options)
     result["similarity_score"] = similarity
     
     # Determine method used

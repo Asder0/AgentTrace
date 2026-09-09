@@ -16,6 +16,7 @@ injection payloads in tool outputs rather than blocking operation sequences.
 import re
 from typing import Optional, Tuple
 from .model_utils import detect_prompt_injection
+from .defense_config import effective_method_enabled
 
 # Safe patterns that should NOT be flagged as injection (false positive reduction)
 # These are checked BEFORE the model to avoid misclassifying benign content
@@ -63,7 +64,11 @@ INSTRUCTION_PATTERNS = [
 ]
 
 
-def check_tool_output_for_injection(output: str, threshold: float = 0.1) -> bool:
+def check_tool_output_for_injection(
+    output: str,
+    threshold: float = 0.1,
+    options: dict = None,
+) -> bool:
     """
     Check if a tool output contains indirect prompt injection patterns.
     Uses DeBERTa model AND regex patterns in PARALLEL (either one detects → block).
@@ -83,21 +88,32 @@ def check_tool_output_for_injection(output: str, threshold: float = 0.1) -> bool
     """
     if not output or not isinstance(output, str):
         return True  # Empty or non-string outputs are safe
+
+    regex_enabled = effective_method_enabled("ring_1", "regex", options)
+    model_enabled = effective_method_enabled("ring_1", "model", options)
+
+    # 所有检测方法都关闭 → 直接放行
+    if not regex_enabled and not model_enabled:
+        return True
     
     # First check safe patterns to avoid false positives
-    for safe_pattern in SAFE_PATTERNS:
-        if re.search(safe_pattern, output):
-            return True  # Matches a known safe pattern
+    if regex_enabled:
+        for safe_pattern in SAFE_PATTERNS:
+            if re.search(safe_pattern, output):
+                return True  # Matches a known safe pattern
     
     # Parallel detection: DeBERTa model
-    model_injection_detected, safety_score = detect_prompt_injection(output, threshold)
+    model_injection_detected = False
+    if model_enabled:
+        model_injection_detected, safety_score = detect_prompt_injection(output, threshold)
     
     # Parallel detection: regex instruction patterns (runs independently, not gated by model)
     regex_injection_detected = False
-    for instr_pattern in INSTRUCTION_PATTERNS:
-        if re.search(instr_pattern, output):
-            regex_injection_detected = True
-            break
+    if regex_enabled:
+        for instr_pattern in INSTRUCTION_PATTERNS:
+            if re.search(instr_pattern, output):
+                regex_injection_detected = True
+                break
     
     # Either detection method catches injection → block
     if model_injection_detected or regex_injection_detected:
@@ -106,7 +122,11 @@ def check_tool_output_for_injection(output: str, threshold: float = 0.1) -> bool
     return True  # No injection detected
 
 
-def check_tool_output_for_injection_with_details(output: str, threshold: float = 0.1) -> dict:
+def check_tool_output_for_injection_with_details(
+    output: str,
+    threshold: float = 0.1,
+    options: dict = None,
+) -> dict:
     """
     Check if a tool output contains indirect prompt injection, returning full details.
     
@@ -124,32 +144,47 @@ def check_tool_output_for_injection_with_details(output: str, threshold: float =
         "detection_method": "empty_output",
         "output_length": 0,
         "matched_pattern": None,
+        "regex_enabled": True,
+        "model_enabled": True,
     }
     
     if not output or not isinstance(output, str):
         return result
     
     result["output_length"] = len(output)
+    regex_enabled = effective_method_enabled("ring_1", "regex", options)
+    model_enabled = effective_method_enabled("ring_1", "model", options)
+    result["regex_enabled"] = regex_enabled
+    result["model_enabled"] = model_enabled
+
+    # 所有检测方法都关闭 → 直接放行
+    if not regex_enabled and not model_enabled:
+        result["detection_method"] = "no_method_enabled"
+        return result
     
     # First check safe patterns to avoid false positives
-    for safe_pattern in SAFE_PATTERNS:
-        if re.search(safe_pattern, output):
-            result["safety_score"] = 1.0
-            result["detection_method"] = "safe_pattern"
-            result["matched_pattern"] = safe_pattern
-            return result
+    if regex_enabled:
+        for safe_pattern in SAFE_PATTERNS:
+            if re.search(safe_pattern, output):
+                result["safety_score"] = 1.0
+                result["detection_method"] = "safe_pattern"
+                result["matched_pattern"] = safe_pattern
+                return result
     
     # Parallel detection: DeBERTa model
-    model_injection_detected, safety_score = detect_prompt_injection(output, threshold)
-    result["safety_score"] = safety_score
+    model_injection_detected = False
+    if model_enabled:
+        model_injection_detected, safety_score = detect_prompt_injection(output, threshold)
+        result["safety_score"] = safety_score
     
     # Parallel detection: regex instruction patterns (runs independently)
     regex_injection_detected = False
-    for instr_pattern in INSTRUCTION_PATTERNS:
-        if re.search(instr_pattern, output):
-            regex_injection_detected = True
-            result["matched_pattern"] = instr_pattern
-            break
+    if regex_enabled:
+        for instr_pattern in INSTRUCTION_PATTERNS:
+            if re.search(instr_pattern, output):
+                regex_injection_detected = True
+                result["matched_pattern"] = instr_pattern
+                break
     
     # Either detection method catches injection → block (parallel OR logic)
     if regex_injection_detected and model_injection_detected:
@@ -162,6 +197,8 @@ def check_tool_output_for_injection_with_details(output: str, threshold: float =
         result["passed"] = False
         result["detection_method"] = "deberta_model"
     else:
-        result["detection_method"] = "deberta_model"
+        result["detection_method"] = (
+            "deberta_model" if model_enabled else "regex_pattern_clean"
+        )
     
     return result

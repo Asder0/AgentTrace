@@ -263,12 +263,19 @@ const API = {
         } catch (err) { return null; }
     },
 
-    async setDefenseConfig(enabled) {
+    async setDefenseConfig(enabled, rings = null) {
         try {
+            const body = {};
+            if (enabled !== null && enabled !== undefined) {
+                body.enabled = enabled;
+            }
+            if (rings) {
+                body.rings = rings;
+            }
             const response = await fetch(`${this.BASE_URL}/config/defense`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ enabled })
+                body: JSON.stringify(body)
             });
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             return await response.json();
