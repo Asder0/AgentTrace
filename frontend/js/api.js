@@ -291,7 +291,7 @@ const API = {
 
     /**
      * 获取可用的攻击类型列表
-     * @returns {Promise<Array>} [{ id, name, description, icon }]
+     * @returns {Promise<Array>} [{ id, name, description }]
      */
     async getAttackTypes() {
         try {
@@ -336,7 +336,7 @@ const API = {
 
     /**
      * 获取所有可用的攻击场景列表
-     * @returns {Promise<Array>} [{ id, attack_type, attack_name, attack_icon, suite, user_task_id, injection_task_id, name, description }]
+     * @returns {Promise<Array>} [{ id, attack_type, attack_name, suite, user_task_id, injection_task_id, name, description }]
      */
     async getAttackScenarios() {
         try {

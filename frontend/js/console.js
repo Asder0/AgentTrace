@@ -91,7 +91,7 @@ const CONSOLE = {
                 }
                 
                 btn.dataset.action = scenario.id;
-                btn.title = scenario.description;
+                btn.title = this._cleanDisplayText(scenario.description);
                 
                 // 添加标签
                 let badges = '';
@@ -99,7 +99,10 @@ const CONSOLE = {
                 if (scenario.is_sensitive) badges += '<span class="badge badge-sensitive">敏感</span>';
                 if (scenario.cross_app) badges += '<span class="badge badge-cross">跨APP</span>';
                 
-                btn.innerHTML = `${scenario.name} ${badges}`;
+                const scenarioLabel = (scenario.id && scenario.suite)
+                    ? `${scenario.id} (${scenario.suite})`
+                    : this._cleanDisplayText(scenario.name);
+                btn.innerHTML = `${scenarioLabel} ${badges}`;
                 
                 btn.addEventListener('click', () => this._executeScenario(scenario.id));
                 
@@ -120,7 +123,7 @@ const CONSOLE = {
         if (this._isExecuting) return;
         
         this._isExecuting = true;
-        this._showFeedback('⏳ 正在通过 AgentPipeline 执行操作（LLM 自主决策）...', 'info');
+        this._showFeedback('正在执行操作（真实 LLM 自主决策）...', 'info');
         
         // 发布场景执行事件（触发追踪面板）
         Store.publish('scenario_executed', { action });
@@ -130,7 +133,7 @@ const CONSOLE = {
 
             
             if (result.error) {
-                this._showFeedback(`❌ ${result.error}`, 'error');
+                this._showFeedback(`执行失败：${result.error}`, 'error');
                 return;
             }
             
@@ -182,9 +185,9 @@ const CONSOLE = {
             if (result.blocked) {
                 const riskCount = result.risk_cards?.length || 0;
                 const reasons = result.risk_cards?.map(c => c.detail).join('; ') || '';
-                this._showFeedback(`🚫 操作已被阻断！(${riskCount} 个风险卡片) ${reasons ? '原因: ' + reasons.substring(0, 100) : ''}`, 'error');
+                this._showFeedback(`操作已被阻断（${riskCount} 个风险事件）${reasons ? '；原因：' + reasons.substring(0, 100) : ''}`, 'error');
             } else {
-                this._showFeedback(`✅ 操作执行成功 (${modeText})`, 'success');
+                this._showFeedback(`操作执行成功（${modeText}）`, 'success');
             }
             
             // 更新统计
@@ -197,7 +200,7 @@ const CONSOLE = {
             
         } catch (err) {
             console.error('执行场景失败:', err);
-            this._showFeedback(`❌ 执行失败: ${err.message}`, 'error');
+            this._showFeedback(`执行失败：${err.message}`, 'error');
         } finally {
             this._isExecuting = false;
         }
@@ -216,12 +219,12 @@ const CONSOLE = {
         
         const text = input.value.trim();
         if (!text) {
-            this._showFeedback('⚠️ 请输入指令内容', 'warning');
+            this._showFeedback('请输入指令内容', 'warning');
             return;
         }
         
         this._isExecuting = true;
-        this._showFeedback('⏳ 正在通过 AgentPipeline 解析并执行自定义指令（LLM 自主决策）...', 'info');
+        this._showFeedback('正在执行自定义指令（真实 LLM 自主决策）...', 'info');
         
         try {
             // 直接将原始指令发送给后端，不进行任何前端解析
@@ -234,7 +237,7 @@ const CONSOLE = {
 
             
             if (result.error) {
-                this._showFeedback(`❌ ${result.error}`, 'error');
+                this._showFeedback(`执行失败：${result.error}`, 'error');
                 return;
             }
             
@@ -284,9 +287,9 @@ const CONSOLE = {
             if (result.blocked) {
                 const riskCount = result.risk_cards?.length || 0;
                 const reasons = result.risk_cards?.map(c => c.detail).join('; ') || '';
-                this._showFeedback(`🚫 操作已被阻断！(${riskCount} 个风险卡片) ${reasons ? '原因: ' + reasons.substring(0, 100) : ''}`, 'error');
+                this._showFeedback(`操作已被阻断（${riskCount} 个风险事件）${reasons ? '；原因：' + reasons.substring(0, 100) : ''}`, 'error');
             } else {
-                this._showFeedback(`✅ 自定义指令执行成功 (${modeText})`, 'success');
+                this._showFeedback(`自定义指令执行成功（${modeText}）`, 'success');
             }
             
             // 清空输入框
@@ -303,7 +306,7 @@ const CONSOLE = {
         } catch (err) {
 
             console.error('执行自定义指令失败:', err);
-            this._showFeedback(`❌ 执行失败: ${err.message}`, 'error');
+            this._showFeedback(`执行失败：${err.message}`, 'error');
         } finally {
             this._isExecuting = false;
         }
@@ -316,25 +319,15 @@ const CONSOLE = {
         const feedback = document.getElementById('consoleFeedback');
         if (!feedback) return;
         
-        const typeStyles = {
-            'info': { bg: 'var(--accent-blue)', icon: 'ℹ️' },
-            'success': { bg: 'var(--accent-green)', icon: '✅' },
-            'error': { bg: 'var(--accent-red)', icon: '❌' },
-            'warning': { bg: 'var(--accent-yellow)', icon: '⚠️' },
-        };
-        
-        const style = typeStyles[type] || typeStyles.info;
-        
+        feedback.className = `console-feedback ${type || 'info'}`;
         feedback.textContent = message;
-        feedback.style.display = 'block';
-        feedback.style.borderLeftColor = style.bg;
-        feedback.style.background = `${style.bg}15`;
-        
+        feedback.hidden = false;
+
         // 自动隐藏（错误和警告保留更长时间）
         const duration = type === 'error' ? 8000 : type === 'warning' ? 6000 : 4000;
         clearTimeout(this._feedbackTimer);
         this._feedbackTimer = setTimeout(() => {
-            feedback.style.display = 'none';
+            feedback.hidden = true;
         }, duration);
     },
 
@@ -374,8 +367,8 @@ const CONSOLE = {
         
         llmSection.innerHTML = `
             <div class="console-label llm-config-header">
-                🤖 LLM 配置
-                <span class="llm-status" id="llmStatus">${hasApiKey ? '🟢 已配置' : '🔴 未配置'}</span>
+                LLM 配置
+                <span class="llm-status ${hasApiKey ? 'configured' : 'not-configured'}" id="llmStatus">${hasApiKey ? '已配置' : '未配置'}</span>
             </div>
             <div class="llm-config-grid">
                 <div class="llm-config-row">
@@ -400,19 +393,19 @@ const CONSOLE = {
                            placeholder="输入 API Key">
                 </div>
                 <div class="llm-config-row llm-config-actions">
-                    <button id="btnSaveLLMConfig" class="btn-execute llm-save-btn">💾 保存配置</button>
+                    <button id="btnSaveLLMConfig" class="btn-execute llm-save-btn" type="button">保存配置</button>
                 </div>
                 <div class="llm-config-row">
                     <p class="llm-config-hint">
                         ${hasApiKey 
-                            ? '✅ 真实 LLM 已配置，操作将通过 AgentPipeline 调用大模型 API 自主决策'
-                            : '💡 请配置 API Key 以启用真实 LLM。用户指令将直接输入给大模型，大模型根据可用工具 API 自主决策工具调用'}
+                            ? '真实 LLM 已配置，操作将通过 AgentPipeline 调用大模型 API 自主决策。'
+                            : '请配置 API Key 以启用真实 LLM。用户指令将直接输入给大模型，大模型根据可用工具 API 自主决策工具调用。'}
                     </p>
                 </div>
             </div>
             <!-- 防御机制开关 -->
-            <div class="console-label llm-config-header" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;">
-                🛡️ 防御机制
+            <div class="console-label llm-config-header defense-config-header">
+                防御机制
                 <span class="defense-status" id="defenseStatusText">加载中...</span>
             </div>
             <div class="llm-config-grid">
@@ -422,15 +415,11 @@ const CONSOLE = {
                         <input type="checkbox" id="defenseToggle" checked>
                         <span class="toggle-slider"></span>
                     </label>
-                    <span style="font-size: 12px; color: var(--text-secondary); margin-left: 8px;">
-                        关闭后跳过 Ring 1-4 检测
-                    </span>
+                    <span class="llm-config-help">关闭后跳过 Ring 1-4 检测</span>
                 </div>
-                <div class="llm-config-row" style="flex-direction: column; align-items: stretch; gap: 6px; margin-top: 6px;">
-                    <div style="font-size: 12px; color: var(--text-secondary);">
-                        Ring 级开关（可单独关闭/开启每个 Ring，及其内部硬编码检测方法）
-                    </div>
-                    <div id="ringTogglesContainer" style="display: flex; flex-direction: column; gap: 8px;">
+                <div class="llm-config-row llm-config-row-stack">
+                    <div class="llm-config-help">Ring 级开关（可单独关闭/开启每个 Ring 及其内部检测方法）</div>
+                    <div id="ringTogglesContainer" class="ring-config-list">
                         <!-- 动态渲染：每个 Ring 一行，含 Ring 开关 + 方法开关 -->
                     </div>
                 </div>
@@ -504,7 +493,7 @@ const CONSOLE = {
         const apiKey = document.getElementById('llmApiKey')?.value || '';
         
         if (!apiKey) {
-            this._showFeedback('⚠️ 需要提供 API Key', 'warning');
+            this._showFeedback('需要提供 API Key', 'warning');
             return;
         }
         
@@ -519,7 +508,8 @@ const CONSOLE = {
                 // 更新状态指示器
                 const statusEl = document.getElementById('llmStatus');
                 if (statusEl) {
-                    statusEl.textContent = '🟢 已配置';
+                    statusEl.textContent = '已配置';
+                    statusEl.className = 'llm-status configured';
                 }
                 
                 // 清空 API Key 输入框（安全）
@@ -529,15 +519,15 @@ const CONSOLE = {
                 }
                 
                 this._showFeedback(
-                    `✅ LLM 配置已保存，已启用 ${provider}/${model}`,
+                    `LLM 配置已保存，已启用 ${provider}/${model}`,
                     'success'
                 );
             } else {
-                this._showFeedback('❌ 保存 LLM 配置失败', 'error');
+                this._showFeedback('保存 LLM 配置失败', 'error');
             }
         } catch (err) {
             console.error('保存 LLM 配置失败:', err);
-            this._showFeedback(`❌ 保存失败: ${err.message}`, 'error');
+            this._showFeedback(`保存失败：${err.message}`, 'error');
         }
     },
 
@@ -557,7 +547,7 @@ const CONSOLE = {
                 toggle.checked = config.enabled;
             }
             if (statusText) {
-                statusText.textContent = config.enabled ? '🟢 已启用' : '🔴 已关闭';
+                statusText.textContent = config.enabled ? '已启用' : '已关闭';
                 statusText.className = config.enabled ? 'defense-status enabled' : 'defense-status disabled';
             }
             this._renderRingToggles(config.rings || {});
@@ -589,19 +579,19 @@ const CONSOLE = {
                 const checked = methodFlags[method] ? 'checked' : '';
                 const label = methodLabels[method] || method;
                 return `
-                    <label style="display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); margin-right: 10px; cursor: pointer;">
+                    <label class="ring-method">
                         <input type="checkbox" data-role="method" data-ring="${ring}" data-method="${method}" ${checked}>
                         <span title="${label}">${method}</span>
                     </label>
                 `;
             }).join('');
             return `
-                <div style="border: 1px solid var(--border-color); border-radius: 6px; padding: 6px 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px;">
-                    <label style="display: inline-flex; align-items: center; gap: 6px; min-width: 220px;">
+                <div class="ring-config-item">
+                    <label class="ring-config-label">
                         <input type="checkbox" data-role="ring" data-ring="${ring}" ${enabled ? 'checked' : ''}>
-                        <span style="font-size: 13px; font-weight: 600;">${ringNames[ring] || ring}</span>
+                        <span>${ringNames[ring] || ring}</span>
                     </label>
-                    <div style="display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px; flex: 1;">
+                    <div class="ring-method-list">
                         ${methodToggles}
                     </div>
                 </div>
@@ -633,11 +623,11 @@ const CONSOLE = {
         try {
             const result = await API.setDefenseConfig(null, rings);
             if (result && result.status === 'ok') {
-                this._showFeedback('🛡️ Ring/检测方法开关已更新', 'info');
+                this._showFeedback('Ring/检测方法开关已更新', 'info');
             }
         } catch (err) {
             console.error('设置 Ring 配置失败:', err);
-            this._showFeedback(`❌ 设置 Ring 配置失败: ${err.message}`, 'error');
+            this._showFeedback(`设置 Ring 配置失败：${err.message}`, 'error');
             // 重新拉取配置，恢复实际状态
             try {
                 const config = await API.getDefenseConfig();
@@ -660,11 +650,11 @@ const CONSOLE = {
             const result = await API.setDefenseConfig(enabled);
             if (result.status === 'ok') {
                 if (statusText) {
-                    statusText.textContent = enabled ? '🟢 已启用' : '🔴 已关闭';
+                    statusText.textContent = enabled ? '已启用' : '已关闭';
                     statusText.className = enabled ? 'defense-status enabled' : 'defense-status disabled';
                 }
                 this._showFeedback(
-                    enabled ? '🛡️ 防御机制已启用' : '🛡️ 防御机制已关闭',
+                    enabled ? '防御机制已启用' : '防御机制已关闭',
                     'info'
                 );
             }
@@ -672,7 +662,7 @@ const CONSOLE = {
             console.error('设置防御配置失败:', err);
             // 恢复开关状态
             toggle.checked = !enabled;
-            this._showFeedback(`❌ 设置防御配置失败: ${err.message}`, 'error');
+            this._showFeedback(`设置防御配置失败：${err.message}`, 'error');
         }
     },
 
@@ -719,19 +709,19 @@ const CONSOLE = {
             const selectorSection = document.createElement('div');
             selectorSection.className = 'attack-selector-section';
             selectorSection.innerHTML = `
-                <div class="attack-selector-title">🎛️ 自定义攻击组合</div>
+                <div class="attack-selector-title">自定义攻击组合</div>
                 <div class="attack-selector-grid">
                     <div class="attack-selector-row">
                         <label class="attack-selector-label">套件</label>
                         <select id="attackSuiteSelect" class="attack-selector-select">
-                            <option value="workspace">📋 Workspace</option>
-                            <option value="banking">🏦 Banking</option>
+                            <option value="workspace">Workspace</option>
+                            <option value="banking">Banking</option>
                         </select>
                     </div>
                     <div class="attack-selector-row">
                         <label class="attack-selector-label">攻击类型</label>
                         <select id="attackTypeSelect" class="attack-selector-select">
-                            ${attackTypes.map(at => `<option value="${at.id}">${at.icon} ${at.name}</option>`).join('')}
+                            ${attackTypes.map(at => `<option value="${at.id}">${at.name}</option>`).join('')}
                         </select>
                     </div>
                     <div class="attack-selector-row">
@@ -747,7 +737,7 @@ const CONSOLE = {
                         </select>
                     </div>
                     <div class="attack-selector-row attack-selector-actions">
-                        <button id="btnExecuteCustomAttack" class="btn-execute attack-execute-btn">🚀 执行自定义攻击</button>
+                        <button id="btnExecuteCustomAttack" class="btn-execute attack-execute-btn" type="button">执行自定义攻击</button>
                         <span class="attack-selector-hint">选择参数后点击执行</span>
                     </div>
                 </div>
@@ -766,7 +756,7 @@ const CONSOLE = {
             const presetSection = document.createElement('div');
             presetSection.className = 'attack-preset-section';
             presetSection.innerHTML = `
-                <div class="attack-preset-title">⚡ 快速预设</div>
+                <div class="attack-preset-title">快速预设</div>
             `;
             
             // 按攻击类型分组
@@ -775,7 +765,6 @@ const CONSOLE = {
                 if (!grouped[s.attack_type]) {
                     grouped[s.attack_type] = {
                         attack_name: s.attack_name,
-                        attack_icon: s.attack_icon,
                         items: []
                     };
                 }
@@ -790,11 +779,13 @@ const CONSOLE = {
                 
                 const header = document.createElement('div');
                 header.className = 'attack-group-header';
-                header.innerHTML = `
-                    <span class="attack-group-icon">${group.attack_icon}</span>
-                    <span class="attack-group-name">${group.attack_name}</span>
-                    <span class="attack-group-count">${group.items.length} 个场景</span>
-                `;
+                const name = document.createElement('span');
+                name.className = 'attack-group-name';
+                name.textContent = group.attack_name;
+                const count = document.createElement('span');
+                count.className = 'attack-group-count';
+                count.textContent = `${group.items.length} 个场景`;
+                header.append(name, count);
                 groupDiv.appendChild(header);
                 
                 const body = document.createElement('div');
@@ -804,14 +795,8 @@ const CONSOLE = {
                     const btn = document.createElement('button');
                     btn.className = 'scenario-btn attack-btn';
                     btn.dataset.scenarioId = scenario.id;
-                    btn.title = scenario.description;
-                    
-                    const suiteIcon = scenario.suite === 'workspace' ? '📋' : '🏦';
-                    btn.innerHTML = `
-                        ${suiteIcon} ${scenario.user_task_id} + ${scenario.injection_task_id}
-                        <span class="attack-badge">${group.attack_icon}</span>
-                    `;
-                    
+                    btn.title = this._cleanDisplayText(scenario.description);
+                    btn.textContent = `${scenario.user_task_id} + ${scenario.injection_task_id}`;
                     btn.addEventListener('click', () => this._executeAttackScenario(scenario));
                     
                     body.appendChild(btn);
@@ -827,6 +812,17 @@ const CONSOLE = {
             console.error('加载攻击场景列表失败:', err);
             container.innerHTML = '<p class="hint">加载攻击场景失败，请检查后端服务</p>';
         }
+    },
+
+    /**
+     * 展示层文本清洗：避免依赖后端拼接图标/装饰符号。
+     * 仅用于按钮 tooltip 等展示文本。
+     */
+    _cleanDisplayText(text) {
+        return String(text == null ? '' : text)
+            .replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{2BFF}\u{FE0F}\u{200D}]/gu, '')
+            .replace(/\s+/g, ' ')
+            .trim();
     },
 
     /**
@@ -899,7 +895,7 @@ const CONSOLE = {
         const injTaskId = injTaskSelect.value;
         
         if (!userTaskId || !injTaskId) {
-            this._showFeedback('⚠️ 请选择用户任务和注入任务', 'warning');
+            this._showFeedback('请选择用户任务和注入任务', 'warning');
             return;
         }
         
@@ -911,7 +907,6 @@ const CONSOLE = {
             id: `custom_${attackType}_${suite}_${userTaskId}_${injTaskId}`,
             attack_type: attackType,
             attack_name: typeSelect.options[typeSelect.selectedIndex]?.text?.replace(/^[^\s]+\s/, '') || attackType,
-            attack_icon: typeSelect.options[typeSelect.selectedIndex]?.text?.charAt(0) || '🔴',
             suite: suite,
             user_task_id: userTaskId,
             injection_task_id: injTaskId,
@@ -931,7 +926,7 @@ const CONSOLE = {
         if (this._isExecuting) return;
         
         this._isExecuting = true;
-        this._showFeedback(`⏳ 正在执行攻击场景: ${scenario.attack_name} (${scenario.user_task_id} + ${scenario.injection_task_id})...`, 'info');
+        this._showFeedback(`正在执行攻击场景：${scenario.attack_name} (${scenario.user_task_id} + ${scenario.injection_task_id})...`, 'info');
         
         try {
             const params = {
@@ -944,7 +939,7 @@ const CONSOLE = {
             const result = await API.executeAttack(params);
             
             if (result.error) {
-                this._showFeedback(`❌ ${result.error}`, 'error');
+                this._showFeedback(`执行失败：${result.error}`, 'error');
                 return;
             }
             
@@ -987,9 +982,9 @@ const CONSOLE = {
             if (result.blocked) {
                 const riskCount = result.risk_cards?.length || 0;
                 const reasons = result.risk_cards?.map(c => c.detail).join('; ') || '';
-                this._showFeedback(`🚫 攻击已被防御系统阻断！(${riskCount} 个风险卡片) ${reasons ? '原因: ' + reasons.substring(0, 100) : ''}`, 'error');
+                this._showFeedback(`攻击已被防御系统阻断（${riskCount} 个风险事件）${reasons ? '；原因：' + reasons.substring(0, 100) : ''}`, 'error');
             } else {
-                this._showFeedback(`⚠️ 攻击场景执行完成（防御系统未阻断）`, 'warning');
+                this._showFeedback('攻击场景执行完成（防御系统未阻断）', 'warning');
             }
             
             // 更新统计
@@ -1002,7 +997,7 @@ const CONSOLE = {
             
         } catch (err) {
             console.error('执行攻击场景失败:', err);
-            this._showFeedback(`❌ 执行失败: ${err.message}`, 'error');
+            this._showFeedback(`执行失败：${err.message}`, 'error');
         } finally {
             this._isExecuting = false;
         }

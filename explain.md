@@ -39,9 +39,8 @@ frontend/css/style.css - 暗色主题样式
 - 力导向图布局 (D3.js force simulation)
 - 5 种节点类型颜色编码
 - APP 泳道分区展示
-- 异常节点红色脉冲高亮
+- 异常节点红色描边高亮
 - 视图切换（技术视图/数据流视图）
-- 粒子动画展示数据流动方向
 - 悬停高亮关联路径
 - 拖拽/缩放/平移
 
@@ -98,7 +97,7 @@ tests/test_method_with_llm.py - 完整功能测试
 |------|------|------|
 | 数据流捕获 | interceptor.py + environment_snapshot.py | 通过 |
 | 拓扑图可视化 | frontend/js/graph.js (D3.js 1411 行) | 通过 |
-| 异常行为高亮 | 红色脉冲动画 + 风险卡片 | 通过 |
+| 异常行为高亮 | 红色描边高亮 + 风险卡片 | 通过 |
 | 审计与回溯 | 时间线 + 追踪面板 | 通过 |
 | 至少 3 个 APP | 4 个 Task Suite（banking/workspace/slack/travel） | 通过 |
 | 敏感数据标记 | Ring 3 DOE | 通过 |

@@ -3,61 +3,74 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AgentDojo 数据流追踪可视化平台</title>
+    <meta name="description" content="AgentDojo 数据流追踪与风险审计可视化控制台">
+    <title>AgentDojo · 数据流追踪控制台</title>
     <!-- D3.js v7 -->
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-    <!-- 顶部导航栏 -->
+    <!-- 顶部应用栏 -->
     <header class="navbar">
         <div class="navbar-brand">
-            <span class="logo">🛡️</span>
-            <h1>AgentDojo 数据流追踪可视化平台</h1>
+            <span class="logo" aria-hidden="true">AT</span>
+            <div class="navbar-title">
+                <h1>AgentDojo Trace</h1>
+                <span class="navbar-subtitle">数据流追踪与风险审计控制台</span>
+            </div>
         </div>
-        <nav class="navbar-tabs">
-            <button class="tab active" data-tab="monitor">📡 实时监控</button>
-            <button class="tab" data-tab="history">📜 历史回放</button>
-            <button class="tab" data-tab="audit">🔍 风险审计</button>
+
+        <nav class="navbar-tabs" aria-label="视图切换">
+            <button type="button" class="tab active" data-tab="monitor" aria-current="page">实时监控</button>
+            <button type="button" class="tab" data-tab="history">历史回放</button>
+            <button type="button" class="tab" data-tab="audit">风险审计</button>
         </nav>
-        <div class="navbar-status">
-            <span class="status-dot live"></span>
+
+        <div class="navbar-status" role="status">
+            <span class="status-dot live" aria-hidden="true"></span>
             <span id="statusText">实时</span>
         </div>
     </header>
 
     <div class="main-container">
         <!-- 左侧：拓扑图主区域 -->
-        <div class="graph-panel">
-            <div class="panel-header">
-                <h2>🌐 数据流拓扑图</h2>
+        <section class="graph-panel" aria-label="数据流拓扑图">
+            <header class="panel-header">
+                <h2>数据流拓扑图</h2>
                 <div class="graph-controls">
-                    <button id="btnReset" title="重置视图">🔄 重置</button>
-                    <button id="btnAutoLayout" title="自动布局">⚡ 自动布局</button>
-                    <label>
-                        <input type="checkbox" id="chkShowLabels" checked> 显示标签
+                    <button type="button" id="btnReset" title="重置视图缩放与平移">重置视图</button>
+                    <button type="button" id="btnAutoLayout" title="重新执行结构化布局">自动布局</button>
+                    <label class="control-checkbox">
+                        <input type="checkbox" id="chkShowLabels" checked>
+                        <span>显示标签</span>
                     </label>
                 </div>
-            </div>
+            </header>
+
             <div id="graph-container">
-                <svg id="graph-svg"></svg>
-                <!-- 图例 -->
-                <div class="legend">
-                    <div class="legend-item"><span class="legend-color" style="background:#4A90D9"></span> AIAgent</div>
-                    <div class="legend-item"><span class="legend-color" style="background:#2ECC71"></span> AIModelInvocation</div>
-                    <div class="legend-item"><span class="legend-color" style="background:#E67E22"></span> AgentTool</div>
-                    <div class="legend-item"><span class="legend-color" style="background:#F1C40F"></span> Prompt</div>
-                    <div class="legend-item"><span class="legend-color" style="background:#9B59B6"></span> DomainData</div>
-                    <div class="legend-item"><span class="legend-color" style="background:#E74C3C; animation: pulse 1.5s infinite;"></span> 异常节点</div>
+                <svg id="graph-svg" role="img" aria-label="数据流拓扑图"></svg>
+
+                <!-- 节点类型图例 -->
+                <div class="legend" aria-label="图例">
+                    <div class="legend-item"><span class="legend-color legend-agent"></span><span>AIAgent</span></div>
+                    <div class="legend-item"><span class="legend-color legend-llm"></span><span>AIModelInvocation</span></div>
+                    <div class="legend-item"><span class="legend-color legend-tool"></span><span>AgentTool</span></div>
+                    <div class="legend-item"><span class="legend-color legend-prompt"></span><span>Prompt</span></div>
+                    <div class="legend-item"><span class="legend-color legend-data"></span><span>DomainData</span></div>
+                    <div class="legend-item"><span class="legend-color legend-risk"></span><span>异常/阻断节点</span></div>
                 </div>
 
                 <!-- 节点详情浮动面板 -->
-                <div id="nodeDetailPanel" class="float-panel" style="display:none;">
+                <div id="nodeDetailPanel" class="float-panel" style="display:none;" role="dialog" aria-label="节点详情">
                     <div class="float-panel-header" id="nodeDetailDragHandle">
-                        <span class="float-panel-title">🔍 节点详情</span>
+                        <span class="float-panel-title">节点详情</span>
                         <div class="float-panel-actions">
-                            <button class="float-panel-btn" id="btnMinimizeNodeDetail" title="最小化">─</button>
-                            <button class="float-panel-btn" id="btnCloseNodeDetail" title="关闭">✕</button>
+                            <button type="button" class="float-panel-btn" id="btnMinimizeNodeDetail" title="最小化" aria-label="最小化">
+                                <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M3 8h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                            </button>
+                            <button type="button" class="float-panel-btn" id="btnCloseNodeDetail" title="关闭" aria-label="关闭">
+                                <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                            </button>
                         </div>
                     </div>
                     <div class="float-panel-body" id="nodeDetailBody">
@@ -65,43 +78,51 @@
                     </div>
                 </div>
             </div>
-        </div>
+        </section>
 
         <!-- 右侧：信息面板 -->
-        <div class="side-panel">
-            <!-- 操作控制台 -->
-            <div class="card console-card" id="agentConsole">
-                <h3>🎮 操作控制台</h3>
+        <aside class="side-panel" aria-label="信息面板">
+            <!-- 操作控制台（状态/追踪面板由模块动态插入） -->
+            <section class="card console-card" id="agentConsole" aria-label="操作控制台">
+                <header class="card-heading">
+                    <h3>操作控制台</h3>
+                </header>
+
                 <div class="console-section">
                     <div class="console-label">预设任务</div>
                     <div class="scenario-buttons" id="scenarioButtons">
                         <p class="hint">加载中...</p>
                     </div>
                 </div>
+
                 <div class="console-section">
                     <div class="console-label">自定义指令</div>
                     <div class="custom-input-group">
-                        <input type="text" id="inputCustomAction" 
-                               placeholder="输入指令，如：读取邮件、查询余额..." 
-                               class="custom-input">
-                        <button id="btnCustomAction" class="btn-execute" title="执行指令">▶ 执行</button>
+                        <input type="text" id="inputCustomAction"
+                               placeholder="输入指令，如：读取邮件、查询余额..."
+                               class="custom-input" autocomplete="off">
+                        <button type="button" id="btnCustomAction" class="btn-execute" title="发送指令给 Agent 执行">执行</button>
                     </div>
                 </div>
+
                 <div class="console-section attack-section">
                     <div class="console-label attack-section-header">
-                        🔴 攻击场景（注入测试）
+                        <span>攻击场景（注入测试）</span>
                         <span class="attack-hint">关闭防御后执行可观察注入效果</span>
                     </div>
                     <div class="attack-scenario-buttons" id="attackScenarioButtons">
                         <p class="hint">加载中...</p>
                     </div>
                 </div>
-                <div class="console-feedback" id="consoleFeedback" style="display:none;"></div>
-            </div>
+
+                <div class="console-feedback" id="consoleFeedback" role="status" aria-live="polite" hidden></div>
+            </section>
 
             <!-- 统计面板 -->
-            <div class="card stats-card">
-                <h3>📊 统计概览</h3>
+            <section class="card stats-card" aria-label="统计概览">
+                <header class="card-heading">
+                    <h3>统计概览</h3>
+                </header>
                 <div class="stats-grid">
                     <div class="stat-item">
                         <span class="stat-value" id="statNodes">0</span>
@@ -117,38 +138,42 @@
                     </div>
                     <div class="stat-item">
                         <span class="stat-value" id="statBlocks">0</span>
-                        <span class="stat-label">风险卡片</span>
+                        <span class="stat-label">风险事件</span>
                     </div>
                 </div>
-            </div>
+            </section>
 
             <!-- 风险卡片面板 -->
-            <div class="card risk-card-panel">
-                <h3>🚨 风险卡片</h3>
+            <section class="card risk-card-panel" aria-label="风险事件">
+                <header class="card-heading">
+                    <h3>风险事件</h3>
+                </header>
                 <div id="riskCards">
                     <p class="hint">暂无风险事件</p>
                 </div>
-            </div>
-        </div>
+            </section>
+        </aside>
     </div>
 
     <!-- 底部：事件时间线 -->
-    <div class="timeline-panel">
-        <div class="panel-header">
-            <h3>📋 事件时间线</h3>
+    <section class="timeline-panel" aria-label="事件时间线">
+        <header class="panel-header">
+            <h3>事件时间线</h3>
             <div class="timeline-controls">
-                <button id="btnClearTimeline">🗑️ 清空</button>
+                <button type="button" id="btnClearTimeline">清空</button>
             </div>
-        </div>
+        </header>
         <div class="timeline-container" id="timelineEvents">
             <div class="timeline-empty">等待事件数据...</div>
         </div>
-    </div>
+    </section>
 
     <!-- 节点详情弹窗 -->
-    <div id="nodeModal" class="modal">
+    <div id="nodeModal" class="modal" role="dialog" aria-modal="true" aria-label="节点详情弹窗">
         <div class="modal-content">
-            <span class="modal-close">&times;</span>
+            <button type="button" class="modal-close" aria-label="关闭弹窗">
+                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+            </button>
             <div id="modalBody"></div>
         </div>
     </div>
@@ -161,6 +186,5 @@
     <script src="js/trace-panel.js"></script>
     <script src="js/console.js"></script>
     <script src="js/main.js"></script>
-
 </body>
 </html>

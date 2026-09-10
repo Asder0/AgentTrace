@@ -134,17 +134,15 @@ const TIMELINE = {
                 <div class="timeline-event timeline-event-llm">
                     <div class="timeline-event-header">
                         <span class="timeline-time">${time}</span>
-                        <span class="timeline-icon">🧠</span>
                         <span class="timeline-title">LLM 思考</span>
                     </div>
-                    ${response ? `<div class="timeline-thought">💭 ${response}</div>` : ''}
-                    ${prompt ? `<div class="timeline-prompt">💬 指令: ${prompt}</div>` : ''}
+                    ${response ? `<div class="timeline-thought">${response}</div>` : ''}
+                    ${prompt ? `<div class="timeline-prompt">指令: ${prompt}</div>` : ''}
                 </div>`;
         }
 
         // 工具调用（含被阻断的风险事件）
         const isRisk = e.type === 'risk';
-        const icon = isRisk ? '🚨' : '🔧';
         const tool = this._escape(e.tool_intent || '未知工具');
         const app = e.target_app ? this._escape(e.target_app) : '';
         const outputs = this._escape(this._truncate(e.outputs, 400));
@@ -158,15 +156,14 @@ const TIMELINE = {
         }
 
         return `
-            <div class="timeline-event ${isRisk ? 'timeline-event-risk' : 'timeline-event-tool'}">
-                <div class="timeline-event-header">
-                    <span class="timeline-time">${time}</span>
-                    <span class="timeline-icon">${icon}</span>
-                    <span class="timeline-title">工具调用: ${tool}${app ? `（${app}）` : ''}</span>
-                    ${statusBadge}
-                </div>
-                ${blockReason ? `<div class="timeline-block">🚫 ${blockReason}</div>` : ''}
-                ${outputs ? `<div class="timeline-result">📤 结果: ${outputs}</div>` : ''}
+                <div class="timeline-event ${isRisk ? 'timeline-event-risk' : 'timeline-event-tool'}">
+                    <div class="timeline-event-header">
+                        <span class="timeline-time">${time}</span>
+                        <span class="timeline-title">工具调用: ${tool}${app ? `（${app}）` : ''}</span>
+                        ${statusBadge}
+                    </div>
+                ${blockReason ? `<div class="timeline-block">${blockReason}</div>` : ''}
+                ${outputs ? `<div class="timeline-result">结果: ${outputs}</div>` : ''}
             </div>`;
     }
 };

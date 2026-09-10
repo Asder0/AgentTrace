@@ -10,7 +10,6 @@
  * - 拖拽、缩放、平移
  * - 悬停高亮路径
  * - 点击查看详情
- * - 数据流动画（粒子效果）
  */
 
 const GRAPH = {
@@ -26,10 +25,6 @@ const GRAPH = {
 
     // 节点 ID → 节点对象的 Map，确保引用一致性
     nodeMap: new Map(),
-
-    // 粒子动画
-    particles: [],
-    particleAnimId: null,
 
     // 行号映射（node id → 迭代行下标），用于行间不连线过滤
     _nodeRow: new Map(),
@@ -47,11 +42,11 @@ const GRAPH = {
             'DomainData': 20,
         },
         nodeColors: {
-            'AIAgent': '#4A90D9',
-            'AIModelInvocation': '#2ECC71',
-            'AgentTool': '#E67E22',
-            'Prompt': '#F1C40F',
-            'DomainData': '#9B59B6',
+            'AIAgent': '#4f8cff',
+            'AIModelInvocation': '#3fb950',
+            'AgentTool': '#d4862b',
+            'Prompt': '#d29922',
+            'DomainData': '#a371f7',
         },
         nodeShapes: {
             'AIAgent': 'circle',
@@ -61,16 +56,16 @@ const GRAPH = {
             'DomainData': 'ellipse',
         },
         linkColors: {
-            'belongsTo': '#4A90D9',
-            'informed': '#2ECC71',
-            'used': '#E67E22',
-            'produces': '#9B59B6',
-            'wasDerivedFrom': '#E74C3C',
+            'belongsTo': '#4f8cff',
+            'informed': '#3fb950',
+            'used': '#d4862b',
+            'produces': '#a371f7',
+            'wasDerivedFrom': '#f85149',
             // 旧版兼容（保留但不再使用）
-            'wasAssociatedWith': '#4A90D9',
-            'wasInformedBy': '#2ECC71',
-            'wasGeneratedBy': '#9B59B6',
-            'wasAttributedTo': '#F1C40F',
+            'wasAssociatedWith': '#4f8cff',
+            'wasInformedBy': '#3fb950',
+            'wasGeneratedBy': '#a371f7',
+            'wasAttributedTo': '#d29922',
         },
         // 关系的中文标签
         relationLabels: {
@@ -163,22 +158,6 @@ const GRAPH = {
                 .attr('fill', this.config.linkColors[type] || '#5a6a7a');
         });
 
-        // 敏感数据发光滤镜
-        const filter = this.defs.append('filter')
-            .attr('id', 'glow')
-            .attr('x', '-50%')
-            .attr('y', '-50%')
-            .attr('width', '200%')
-            .attr('height', '200%');
-        filter.append('feGaussianBlur')
-            .attr('stdDeviation', '3')
-            .attr('result', 'blur');
-        filter.append('feMerge')
-            .selectAll('feMergeNode')
-            .data(['blur', 'SourceGraphic'])
-            .enter()
-            .append('feMergeNode')
-            .attr('in', d => d);
     },
 
     /**
@@ -227,7 +206,7 @@ const GRAPH = {
         this.nodes = newNodes;
         this.links = newLinks;
 
-        console.log(`📊 图谱数据: ${this.nodes.length} 节点, ${this.links.length} 边`);
+        console.log(`[graph] ${this.nodes.length} 节点, ${this.links.length} 边`);
     },
 
     /**
@@ -332,23 +311,17 @@ const GRAPH = {
                 })
             );
 
-        // 节点形状
+        // 节点形状：节点类型通过形状与颜色编码
         nodeEnter.each(function(d) {
             const el = d3.select(this);
             const r = self.config.nodeRadius[d.type] || 16;
-            const color = self.config.nodeColors[d.type] || '#666';
-
-            // 敏感数据发光效果
-            const useGlow = d.is_sensitive;
+            const color = self.config.nodeColors[d.type] || '#6e7b8a';
 
             switch (self.config.nodeShapes[d.type]) {
                 case 'diamond':
                     el.append('polygon')
                         .attr('points', `0,${-r} ${r},0 0,${r} ${-r},0`)
-                        .attr('fill', color)
-                        .attr('stroke', '#fff')
-                        .attr('stroke-width', 2)
-                        .attr('filter', useGlow ? 'url(#glow)' : null);
+                        .attr('fill', color);
                     break;
                 case 'rect':
                     el.append('rect')
@@ -357,10 +330,7 @@ const GRAPH = {
                         .attr('width', r * 2.4)
                         .attr('height', r * 1.6)
                         .attr('rx', 4)
-                        .attr('fill', color)
-                        .attr('stroke', '#fff')
-                        .attr('stroke-width', 2)
-                        .attr('filter', useGlow ? 'url(#glow)' : null);
+                        .attr('fill', color);
                     break;
                 case 'roundRect':
                     el.append('rect')
@@ -369,75 +339,30 @@ const GRAPH = {
                         .attr('width', r * 2.8)
                         .attr('height', r * 1.4)
                         .attr('rx', r * 0.7)
-                        .attr('fill', color)
-                        .attr('stroke', '#fff')
-                        .attr('stroke-width', 2)
-                        .attr('filter', useGlow ? 'url(#glow)' : null);
+                        .attr('fill', color);
                     break;
                 case 'ellipse':
                     el.append('ellipse')
                         .attr('rx', r * 1.3)
                         .attr('ry', r * 0.9)
-                        .attr('fill', color)
-                        .attr('stroke', '#fff')
-                        .attr('stroke-width', 2)
-                        .attr('filter', useGlow ? 'url(#glow)' : null);
+                        .attr('fill', color);
                     break;
                 default: // circle
                     el.append('circle')
                         .attr('r', r)
-                        .attr('fill', color)
-                        .attr('stroke', '#fff')
-                        .attr('stroke-width', 2)
-                        .attr('filter', useGlow ? 'url(#glow)' : null);
-            }
-
-            // 敏感数据标记（🔒 图标）
-            if (d.is_sensitive) {
-                el.append('text')
-                    .attr('text-anchor', 'middle')
-                    .attr('dy', -r - 8)
-                    .attr('font-size', '16')
-                    .text('🔒');
+                        .attr('fill', color);
             }
         });
 
-        // 节点标签（输出结果节点不显示文字，只显示图标）
+        // 节点标签
         nodeEnter.append('text')
             .attr('dy', d => {
                 const r = self.config.nodeRadius[d.type] || 16;
                 return r + 16;
             })
             .attr('text-anchor', 'middle')
-            .text(d => {
-                // 输出结果节点不显示文字
-                if (d.type === 'DomainData' && d.operation === 'output') {
-                    return '';
-                }
-                const label = d.label || d.id;
-                return label;
-            })
+            .text(d => d.type === 'DomainData' && d.operation === 'output' ? '' : (d.label || d.id))
             .attr('class', d => self.config.showLabels ? 'node-label' : 'label-hidden');
-
-        // 节点图标（emoji 表示类型）
-        nodeEnter.append('text')
-            .attr('text-anchor', 'middle')
-            .attr('dy', 5)
-            .attr('font-size', d => {
-                const r = self.config.nodeRadius[d.type] || 16;
-                return Math.max(12, r * 0.8);
-            })
-            .attr('class', 'node-icon')
-            .text(d => {
-                const icons = {
-                    'AIAgent': '🤖',
-                    'AIModelInvocation': '🧠',
-                    'AgentTool': '🔧',
-                    'Prompt': '💬',
-                    'DomainData': '📦',
-                };
-                return icons[d.type] || '❓';
-            });
 
         // 合并
         const nodeMerged = nodeEnter.merge(node);
@@ -508,8 +433,6 @@ const GRAPH = {
             .attr('x', d => (d.source && d.target) ? (d.source.x + d.target.x) / 2 : 0)
             .attr('y', d => (d.source && d.target) ? (d.source.y + d.target.y) / 2 : 0);
 
-        // 启动粒子动画
-        this._startParticleAnimation();
     },
 
     /**
@@ -666,85 +589,6 @@ const GRAPH = {
     },
 
     /**
-     * 启动粒子流动画
-     */
-    _startParticleAnimation() {
-        // 停止旧动画
-        if (this.particleAnimId) {
-            cancelAnimationFrame(this.particleAnimId);
-        }
-
-        // 清除旧粒子
-        this.g.selectAll('.particle').remove();
-        this.particles = [];
-
-        // 为每条可见边创建粒子
-        const links = this._renderLinks || [];
-        links.forEach((link, i) => {
-            if (link.source && link.target) {
-                this.particles.push({
-                    link: link,
-                    progress: Math.random(),
-                    speed: 0.002 + Math.random() * 0.003,
-                    linkIndex: i,
-                    reverse: false,
-                });
-            }
-        });
-
-        if (this.particles.length === 0) return;
-
-        // 创建粒子元素
-        this.g.selectAll('.particle')
-            .data(this.particles)
-            .enter()
-            .append('circle')
-            .attr('class', 'particle')
-            .attr('r', 3)
-            .attr('fill', d => {
-                const colors = {
-                    'belongsTo': '#4A90D9',
-                    'informed': '#2ECC71',
-                    'used': '#E67E22',
-                    'produces': '#9B59B6',
-                    'wasDerivedFrom': '#E74C3C',
-                    'wasAssociatedWith': '#4A90D9',
-                    'wasInformedBy': '#2ECC71',
-                    'wasGeneratedBy': '#9B59B6',
-                    'wasAttributedTo': '#F1C40F',
-                };
-                return colors[d.link.relation] || '#5a6a7a';
-            })
-            .attr('opacity', 0.6);
-
-        // 动画循环
-        const animate = () => {
-            const particles = this.g.selectAll('.particle');
-
-            this.particles.forEach((p, i) => {
-                p.progress += p.speed;
-                if (p.progress > 1) p.progress = 0;
-
-                const source = p.link.source;
-                const target = p.link.target;
-
-                if (source && target && source.x != null && target.x != null) {
-                    const x = source.x + (target.x - source.x) * p.progress;
-                    const y = source.y + (target.y - source.y) * p.progress;
-
-                    particles.filter((d, idx) => idx === i)
-                        .attr('cx', x)
-                        .attr('cy', y);
-                }
-            });
-
-            this.particleAnimId = requestAnimationFrame(animate);
-        };
-
-        animate();
-    },
-
-    /**
      * 高亮节点的关联路径
      */
     highlightPath(d) {
@@ -797,19 +641,19 @@ const GRAPH = {
         if (!panel || !body) return;
 
         const typeLabels = {
-            'AIAgent': '🤖 AI 智能体',
-            'AIModelInvocation': '🧠 LLM 推理',
-            'AgentTool': '🔧 工具调用',
-            'Prompt': '💬 提示内容',
-            'DomainData': '📦 数据实体',
+            'AIAgent': 'AI 智能体',
+            'AIModelInvocation': 'LLM 推理',
+            'AgentTool': '工具调用',
+            'Prompt': '提示内容',
+            'DomainData': '数据实体',
         };
 
         // 角色标签映射（根据 operation 字段）
         const roleLabels = {
-            'input': { icon: '📥', label: '输入参数', color: 'var(--accent-blue)' },
-            'output': { icon: '📤', label: '输出结果', color: 'var(--accent-green)' },
-            'created': { icon: '📝', label: '环境变更 - 创建', color: 'var(--accent-orange)' },
-            'updated': { icon: '📝', label: '环境变更 - 更新', color: 'var(--accent-yellow)' },
+            'input': { label: '输入参数', color: 'var(--accent-blue)' },
+            'output': { label: '输出结果', color: 'var(--accent-green)' },
+            'created': { label: '环境变更 - 创建', color: 'var(--accent-orange)' },
+            'updated': { label: '环境变更 - 更新', color: 'var(--accent-yellow)' },
         };
 
         let html = `
@@ -821,29 +665,20 @@ const GRAPH = {
 
         // DomainData 节点显示角色
         if (d.type === 'DomainData' && d.operation) {
-            const role = roleLabels[d.operation] || { icon: '📦', label: '数据', color: 'var(--text-primary)' };
+            const role = roleLabels[d.operation] || { label: '数据', color: 'var(--text-primary)' };
             html += `
                 <div class="detail-field">
                     <span class="label">角色</span>
-                    <div class="value" style="color:${role.color};font-weight:600;">${role.icon} ${role.label}</div>
+                    <div class="value" style="color:${role.color};font-weight:600;">${role.label}</div>
                 </div>
             `;
 
             // 环境变更节点显示实体类型
             if ((d.operation === 'created' || d.operation === 'updated') && d.entity_type) {
-                const typeIcons = {
-                    'email': '📧',
-                    'file': '📄',
-                    'contact': '👤',
-                    'transaction': '💰',
-                    'calendar_event': '📅',
-                    'travel_booking': '✈️',
-                };
-                const typeIcon = typeIcons[d.entity_type] || '📦';
                 html += `
                     <div class="detail-field">
                         <span class="label">实体类型</span>
-                        <div class="value">${typeIcon} ${d.entity_type}</div>
+                        <div class="value">${d.entity_type}</div>
                     </div>
                 `;
             }
@@ -860,7 +695,7 @@ const GRAPH = {
                     html += `
                         <div class="detail-field">
                             <span class="label">来源工具</span>
-                            <div class="value" style="font-size:12px;">🔧 ${sourceLabel}</div>
+                            <div class="value">${sourceLabel}</div>
                         </div>
                     `;
                 }
@@ -881,10 +716,10 @@ const GRAPH = {
             html += `
                 <div class="detail-field">
                     <span class="label">操作摘要</span>
-                    <div class="value" style="font-size:12px;line-height:1.8;">
-                        ${inEdges.length > 0 ? `📥 读取 ${inEdges.length} 个输入` : '📥 无输入'}
+                    <div class="value">
+                        ${inEdges.length > 0 ? `读取 ${inEdges.length} 个输入` : '无输入'}
                         <br>
-                        ${outEdges.length > 0 ? `📤 产出 ${outEdges.length} 个输出` : '📤 无输出'}
+                        ${outEdges.length > 0 ? `产出 ${outEdges.length} 个输出` : '无输出'}
                     </div>
                 </div>
             `;
@@ -900,11 +735,11 @@ const GRAPH = {
                 html += `
                     <div class="detail-field">
                         <span class="label">触发的操作</span>
-                        <div class="value" style="font-size:12px;">
+                        <div class="value">
                             ${toolEdges.map(e => {
                                 const target = e.target;
                                 const targetLabel = target.label || target.id || 'unknown';
-                                return `<span style="display:inline-block;background:var(--bg-card);padding:2px 6px;border-radius:3px;margin:2px;">🔧 ${targetLabel}</span>`;
+                                return `<span class="tool-chip">${targetLabel}</span>`;
                             }).join(' ')}
                         </div>
                     </div>
@@ -935,7 +770,7 @@ const GRAPH = {
             html += `
                 <div class="detail-field">
                     <span class="label">敏感数据</span>
-                    <div class="value" style="color:var(--accent-red);font-weight:600;">🔒 包含敏感信息</div>
+                    <div class="value" style="color:var(--accent-red);font-weight:600;">包含敏感信息</div>
                 </div>
             `;
         }
@@ -944,7 +779,7 @@ const GRAPH = {
             html += `
                 <div class="detail-field">
                     <span class="label">阻断状态</span>
-                    <div class="value blocked">🚫 已阻断</div>
+                    <div class="value blocked">已阻断</div>
                 </div>
                 <div class="detail-field">
                     <span class="label">阻断原因</span>
@@ -1000,9 +835,9 @@ const GRAPH = {
         });
 
         if (inEdges.length > 0 || outEdges.length > 0) {
-            html += `<div class="detail-field" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border-color);">
+            html += `<div class="detail-field detail-divider">
                 <span class="label">关联边</span>
-                <div class="value" style="font-size:11px;line-height:1.8;">`;
+                <div class="value edge-list">`;
 
             if (inEdges.length > 0) {
                 html += inEdges.map(e => {
@@ -1091,91 +926,49 @@ const GRAPH = {
      * 清理资源
      */
     destroy() {
-        if (this.particleAnimId) {
-            cancelAnimationFrame(this.particleAnimId);
-            this.particleAnimId = null;
-        }
         if (this.simulation) {
             this.simulation.stop();
         }
     },
 
     /**
-     * 闪烁高亮指定节点（用于追踪步骤点击定位）
+     * 定位并短暂高亮指定节点（用于追踪步骤点击定位）
      */
     flashNode(nodeId) {
         if (!nodeId) return;
 
-        // 查找节点
         const node = this.nodes.find(n => n.id === nodeId);
         if (!node) {
             console.warn(`[flashNode] 未找到节点: ${nodeId}`);
             return;
         }
 
-        // 1. 将视图居中到该节点
+        // 将视图居中到该节点
         const transform = d3.zoomIdentity
             .translate(this.config.width / 2, this.config.height / 2)
             .scale(1.5)
             .translate(-node.x, -node.y);
 
-        this.svg.transition().duration(500).call(
+        this.svg.transition().duration(400).call(
             d3.zoom().transform,
             transform
         );
 
-        // 2. 找到该节点的 SVG 元素并应用闪烁动画
-        const nodeEl = this.g.selectAll('.node')
-            .filter(n => n.id === nodeId);
+        // 形状元素短暂描边高亮
+        const shapeEl = this.g.selectAll('.node')
+            .filter(n => n.id === nodeId)
+            .select('circle, polygon, rect, ellipse');
 
-        if (nodeEl.empty()) return;
+        if (!shapeEl.empty()) {
+            shapeEl
+                .transition().duration(120)
+                .attr('stroke', '#f85149')
+                .attr('stroke-width', 4)
+                .transition().delay(650).duration(350)
+                .attr('stroke', '#0d1117')
+                .attr('stroke-width', 1.5);
+        }
 
-        // 获取节点的形状元素
-        const shapeEl = nodeEl.select('circle, polygon, rect, ellipse');
-
-        // 保存原始样式
-        const origStroke = shapeEl.attr('stroke') || '#fff';
-        const origStrokeWidth = shapeEl.attr('stroke-width') || 2;
-        const origFilter = shapeEl.attr('filter') || null;
-
-        // 闪烁动画：放大 + 红色边框脉冲 3 次
-        let flashCount = 0;
-        const maxFlashes = 6; // 3 次完整闪烁（亮→暗→亮）
-
-        const flashInterval = setInterval(() => {
-            flashCount++;
-
-            if (flashCount % 2 === 1) {
-                // 亮起：红色边框 + 放大
-                shapeEl
-                    .attr('stroke', '#E74C3C')
-                    .attr('stroke-width', 6);
-                nodeEl.selectAll('.node-icon, .node-label')
-                    .style('font-size', d => {
-                        const r = GRAPH.config.nodeRadius[d.type] || 16;
-                        return `${Math.max(14, r * 0.9)}px`;
-                    });
-            } else {
-                // 熄灭：恢复原始样式
-                shapeEl
-                    .attr('stroke', origStroke)
-                    .attr('stroke-width', origStrokeWidth);
-                nodeEl.selectAll('.node-icon, .node-label')
-                    .style('font-size', null);
-            }
-
-            if (flashCount >= maxFlashes) {
-                clearInterval(flashInterval);
-                // 最终恢复
-                shapeEl
-                    .attr('stroke', origStroke)
-                    .attr('stroke-width', origStrokeWidth);
-                nodeEl.selectAll('.node-icon, .node-label')
-                    .style('font-size', null);
-            }
-        }, 300);
-
-        // 3. 在节点详情面板显示该节点信息
         this.showNodeDetail(node);
     }
 };

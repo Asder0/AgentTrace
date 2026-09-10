@@ -655,7 +655,6 @@ def _to_timeline_event(event: dict) -> dict:
     item = {
         'time': _format_timestamp(event.get('timestamp', 0)),
         'type': 'risk' if is_risk else ('llm' if event_type == 'llm_interaction' else 'tool'),
-        'icon': '🚨' if is_risk else ('🧠' if event_type == 'llm_interaction' else '🔧'),
         'content': _format_event_content(event),
         'safe': not is_risk,
         'ring': _infer_ring(event.get('block_reason', '')) if is_risk else None,
@@ -945,7 +944,6 @@ def _build_trace_steps_from_messages(
             "step": 1,
             "name": "用户输入",
             "status": "completed",
-            "icon": "📝",
             "detail": f"用户输入指令: \"{prompt[:80]}{'...' if len(prompt) > 80 else ''}\"",
             "timestamp": _format_timestamp(now),
         },
@@ -953,7 +951,6 @@ def _build_trace_steps_from_messages(
             "step": 2,
             "name": "API 请求",
             "status": "completed",
-            "icon": "📡",
             "detail": f"POST /api/execute/custom -> {{prompt: \"{prompt[:50]}{'...' if len(prompt) > 50 else ''}\"}}",
             "timestamp": _format_timestamp(now + 0.1),
         },
@@ -961,7 +958,6 @@ def _build_trace_steps_from_messages(
             "step": 3,
             "name": "后端接收",
             "status": "completed",
-            "icon": "⚙️",
             "detail": f"后端接收请求，将通过 AgentPipeline 调用真实 LLM 自主决策",
             "timestamp": _format_timestamp(now + 0.2),
         },
@@ -1086,7 +1082,6 @@ def _build_trace_steps_from_messages(
                 "step": step_num,
                 "name": "LLM 推理",
                 "status": "completed",
-                "icon": "🧠",
                 "detail": f"LLM 决策: 调用 [{tool_names}] | 推理: \"{content[:80]}{'...' if len(content) > 80 else ''}\"",
                 "timestamp": _format_timestamp(now + 0.3),
             }
@@ -1115,7 +1110,6 @@ def _build_trace_steps_from_messages(
                 "step": step_num,
                 "name": f"工具调用: {tool_name}",
                 "status": status,
-                "icon": "🔧",
                 "detail": detail,
                 "timestamp": _format_timestamp(now + 0.4),
             }
@@ -1148,7 +1142,6 @@ def _build_trace_steps_from_messages(
                         "step": step_num,
                         "name": "LLM 推理",
                         "status": "completed",
-                        "icon": "🧠",
                         "detail": f"LLM 决策: 调用 [{tool_names}] | 推理: \"{llm_response[:80]}{'...' if len(llm_response) > 80 else ''}\"",
                         "timestamp": _format_timestamp(now + 0.3),
                     }
@@ -1160,7 +1153,6 @@ def _build_trace_steps_from_messages(
                     "step": step_num,
                     "name": "LLM 推理",
                     "status": "completed",
-                    "icon": "🧠",
                     "detail": "LLM 分析指令并决定调用哪些工具...",
                     "timestamp": _format_timestamp(now + 0.3),
                 }
@@ -1172,7 +1164,6 @@ def _build_trace_steps_from_messages(
                 "step": step_num,
                 "name": "LLM 推理",
                 "status": "completed",
-                "icon": "🧠",
                 "detail": "LLM 分析指令并决定调用哪些工具...",
                 "timestamp": _format_timestamp(now + 0.3),
             }
@@ -1186,7 +1177,6 @@ def _build_trace_steps_from_messages(
             "step": step_num,
             "name": "防御系统阻断",
             "status": "blocked",
-            "icon": "🚫",
             "detail": f"[{_get_ring_title(_infer_ring(block_reason))}] {block_reason}",
             "timestamp": _format_timestamp(now + 0.45),
         }
@@ -1208,7 +1198,6 @@ def _build_trace_steps_from_messages(
         "step": step_num,
         "name": "图谱更新",
         "status": "completed",
-        "icon": "🌐",
         "detail": f"工具调用结果已记录到 PROV 知识图谱（共 {total_tools} 个工具调用事件）",
         "timestamp": _format_timestamp(now + 0.5),
     }
@@ -1232,12 +1221,10 @@ def api_get_scenarios():
     scenarios = []
     for key, scenario in MOCK_SCENARIOS.items():
         suite = scenario.get('suite', 'workspace')
-        suite_icon = '📋' if suite == 'workspace' else '🏦'
         cross_app = scenario.get('cross_app', False)
-        cross_app_label = ' 🔀跨APP' if cross_app else ''
         scenarios.append({
             'id': key,
-            'name': f"{suite_icon} {key} ({suite}){cross_app_label}",
+            'name': f"{key} ({suite})",
             'description': scenario['description'],
             'is_risk': False,
             'is_sensitive': False,
@@ -1644,9 +1631,7 @@ def _get_scenario_name(action: str) -> str:
     """
     scenario = MOCK_SCENARIOS.get(action)
     if scenario:
-        suite = scenario.get('suite', 'workspace')
-        suite_icon = '📋' if suite == 'workspace' else '🏦'
-        return f"{suite_icon} {action}"
+        return action
     return action
 
 

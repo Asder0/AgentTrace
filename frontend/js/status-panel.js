@@ -36,37 +36,37 @@ const STATUS_PANEL = {
         panel.id = 'statusPanel';
         panel.innerHTML = `
             <div class="status-panel-header" id="statusPanelHeader">
-                <h3>🩺 系统状态</h3>
+                <h3>系统状态</h3>
                 <span class="status-panel-toggle" id="statusPanelToggle">▼</span>
             </div>
             <div class="status-panel-body" id="statusPanelBody">
                 <!-- 系统概览 -->
                 <div class="status-overview">
                     <div class="status-overview-item">
-                        <span class="status-overview-dot" id="statusDotCapture">⚪</span>
+                        <span class="status-overview-dot" id="statusDotCapture"></span>
                         <span>Capture</span>
                     </div>
                     <div class="status-overview-item">
-                        <span class="status-overview-dot" id="statusDotModeling">⚪</span>
+                        <span class="status-overview-dot" id="statusDotModeling"></span>
                         <span>Modeling</span>
                     </div>
                     <div class="status-overview-item">
-                        <span class="status-overview-dot" id="statusDotAnalysis">⚪</span>
+                        <span class="status-overview-dot" id="statusDotAnalysis"></span>
                         <span>Analysis</span>
                     </div>
                     <div class="status-overview-item">
-                        <span class="status-overview-dot" id="statusDotVisualization">⚪</span>
+                        <span class="status-overview-dot" id="statusDotVisualization"></span>
                         <span>Visualization</span>
                     </div>
                     <div class="status-overview-item">
-                        <span class="status-overview-dot" id="statusDotExecution">⚪</span>
+                        <span class="status-overview-dot" id="statusDotExecution"></span>
                         <span>Execution</span>
                     </div>
                 </div>
 
                 <!-- LLM 模式 -->
                 <div class="status-section">
-                    <div class="status-section-title">🤖 LLM 模式</div>
+                    <div class="status-section-title">LLM 模式</div>
                     <div class="status-info-row">
                         <span class="status-info-label">模式</span>
                         <span class="status-info-value" id="statusLLMMode">加载中...</span>
@@ -83,7 +83,7 @@ const STATUS_PANEL = {
 
                 <!-- 防御机制 -->
                 <div class="status-section">
-                    <div class="status-section-title">🛡️ 防御机制</div>
+                    <div class="status-section-title">防御机制</div>
                     <div class="status-info-row">
                         <span class="status-info-label">状态</span>
                         <span class="status-info-value" id="statusDefenseMode">加载中...</span>
@@ -92,7 +92,7 @@ const STATUS_PANEL = {
 
                 <!-- 图谱统计 -->
                 <div class="status-section">
-                    <div class="status-section-title">🌐 图谱统计</div>
+                    <div class="status-section-title">图谱统计</div>
                     <div class="status-info-row">
                         <span class="status-info-label">节点数</span>
                         <span class="status-info-value" id="statusGraphNodes">0</span>
@@ -105,14 +105,14 @@ const STATUS_PANEL = {
 
                 <!-- 功能清单 -->
                 <div class="status-section">
-                    <div class="status-section-title">📋 功能清单</div>
+                    <div class="status-section-title">功能清单</div>
                     <div class="status-features" id="statusFeatures">
                         <p class="hint">加载中...</p>
                     </div>
                 </div>
 
                 <!-- 刷新按钮 -->
-                <button class="status-refresh-btn" id="statusRefreshBtn">🔄 刷新状态</button>
+                <button class="status-refresh-btn" id="statusRefreshBtn" type="button">刷新状态</button>
             </div>
         `;
 
@@ -202,7 +202,7 @@ const STATUS_PANEL = {
             const dot = document.getElementById(dotId);
             if (dot && status.layers && status.layers[layer]) {
                 const layerStatus = status.layers[layer].status;
-                dot.textContent = layerStatus ? '🟢' : '🔴';
+                dot.className = `status-overview-dot ${layerStatus ? 'ok' : 'fail'}`;
                 dot.title = layerStatus ? `${layer}: 正常运行` : `${layer}: 异常`;
             }
         }
@@ -213,13 +213,13 @@ const STATUS_PANEL = {
             const isReal = status.llm_mode === 'real';
             const isConfigured = status.llm_config?.has_api_key;
             if (isReal && isConfigured) {
-                modeEl.textContent = '🟢 真实 LLM（已配置）';
+                modeEl.textContent = '真实 LLM（已配置）';
                 modeEl.className = 'status-info-value status-ok';
             } else if (isReal && !isConfigured) {
-                modeEl.textContent = '🟡 真实 LLM（未配置 API Key）';
+                modeEl.textContent = '真实 LLM（未配置 API Key）';
                 modeEl.className = 'status-info-value status-warn';
             } else {
-                modeEl.textContent = '🔴 未配置';
+                modeEl.textContent = '未配置';
                 modeEl.className = 'status-info-value status-fail';
             }
         }
@@ -239,13 +239,13 @@ const STATUS_PANEL = {
         if (defenseEl) {
             const defenseEnabled = status.defense_enabled;
             if (defenseEnabled === true) {
-                defenseEl.textContent = '🟢 已启用';
+                defenseEl.textContent = '已启用';
                 defenseEl.className = 'status-info-value status-ok';
             } else if (defenseEnabled === false) {
-                defenseEl.textContent = '🔴 已关闭';
+                defenseEl.textContent = '已关闭';
                 defenseEl.className = 'status-info-value status-warn';
             } else {
-                defenseEl.textContent = '⚪ 未知';
+                defenseEl.textContent = '未知';
                 defenseEl.className = 'status-info-value';
             }
         }
@@ -288,11 +288,10 @@ const STATUS_PANEL = {
             
             html += `<div class="status-feature-layer">${layer}</div>`;
             for (const f of grouped[layer]) {
-                const statusIcon = f.status ? '✅' : '❌';
                 const statusClass = f.status ? 'feature-ok' : 'feature-fail';
                 html += `
                     <div class="status-feature-item ${statusClass}">
-                        <span class="status-feature-icon">${statusIcon}</span>
+                        <span class="status-feature-icon"></span>
                         <span class="status-feature-name">${f.name}</span>
                     </div>
                 `;

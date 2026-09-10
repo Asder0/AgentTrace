@@ -64,7 +64,7 @@ const APP = {
      * 应用初始化
      */
     async init() {
-        console.log('🛡️ AgentDojo 数据流追踪可视化平台启动中...');
+        console.log('[app] AgentDojo 数据流追踪控制台启动中...');
         
         // 显示加载状态
         this._showLoading();
@@ -105,9 +105,9 @@ const APP = {
             // 启动定时刷新（每 5 秒检查新数据）
             this._startPolling();
             
-            console.log('✅ 可视化平台启动完成');
+            console.log('[app] 可视化平台启动完成');
         } catch (err) {
-            console.error('❌ 应用启动失败:', err);
+            console.error('[app] 应用启动失败:', err);
             this._showError('应用启动失败，请检查后端服务是否正常运行。');
             Store.set('loading', false);
             Store.set('error', err.message);
@@ -152,10 +152,10 @@ const APP = {
         const errorEl = document.createElement('div');
         errorEl.className = 'error-overlay';
         errorEl.innerHTML = `
-            <div class="error-icon">⚠️</div>
             <div class="error-text">${message}</div>
-            <button class="error-retry" onclick="APP.init()">🔄 重试</button>
+            <button type="button" class="error-retry">重试</button>
         `;
+        errorEl.querySelector('.error-retry').addEventListener('click', () => APP.init());
         container.appendChild(errorEl);
     },
 
@@ -167,8 +167,12 @@ const APP = {
         tabs.forEach(tab => {
             tab.addEventListener('click', () => {
                 // 切换标签激活状态
-                tabs.forEach(t => t.classList.remove('active'));
+                tabs.forEach(t => {
+                    t.classList.remove('active');
+                    t.removeAttribute('aria-current');
+                });
                 tab.classList.add('active');
+                tab.setAttribute('aria-current', 'page');
                 
                 // 切换视图模式
                 const tabName = tab.dataset.tab;
@@ -219,7 +223,8 @@ const APP = {
         
         // 触发窗口大小变化事件，让 D3 重新计算布局
         window.dispatchEvent(new Event('resize'));
-        var hp = document.getElementById('historyListPanel'); if (tabName!=='history'&&hp)hp.style.display='none';
+        const historyPanel = document.getElementById('historyListPanel');
+        if (tabName !== 'history' && historyPanel) historyPanel.classList.remove('visible');
         if (tabName === 'history') this._loadHistoryList();
         if (tabName === 'audit') this._renderAuditExport();
     },
@@ -228,29 +233,63 @@ const APP = {
      * 初始化节点详情弹窗
      */
     async _loadHistoryList() {
-        var data = await API.getTraces();
-        var panel = document.getElementById('historyListPanel');
+        const data = await API.getTraces();
+        let panel = document.getElementById('historyListPanel');
+
         if (!panel) {
-            panel = document.createElement('div'); panel.id = 'historyListPanel';
-            panel.style.cssText = 'position:absolute;top:50px;left:16px;right:16px;bottom:16px;overflow-y:auto;z-index:10;background:var(--bg-secondary);border-radius:8px;padding:16px;display:none';
-            document.querySelector('.graph-panel').style.position = 'relative';
-            document.querySelector('.graph-panel').appendChild(panel);
+            panel = document.createElement('div');
+            panel.id = 'historyListPanel';
+            panel.className = 'history-list';
+            const graphPanel = document.querySelector('.graph-panel');
+            if (graphPanel) graphPanel.appendChild(panel);
         }
-        if (!data||!data.traces||!data.traces.length) {
-            panel.innerHTML = '<div style=\"color:var(--text-muted);padding:20px;text-align:center\">暂无历史记录，执行指令后出现</div>';
+
+        panel.innerHTML = '';
+
+        const header = document.createElement('div');
+        header.className = 'history-title';
+        header.textContent = `历史记录 (${data ? data.total : 0})`;
+        panel.appendChild(header);
+
+        if (!data || !Array.isArray(data.traces) || data.traces.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'history-empty';
+            empty.textContent = '暂无历史记录，执行指令后出现';
+            panel.appendChild(empty);
         } else {
-                        var h='<h4>历史记录('+data.total+')</h4>';
-            for (var i=0;i<data.traces.length;i++) {
-                var t=data.traces[i],ic=t.blocked?'🚫':'✅';
-                h+='<div style="cursor:pointer;padding:8px;margin:4px 0;background:var(--bg-card);border-radius:4px;border-left:3px solid '+(t.blocked?'var(--accent-red)':'var(--accent-green)')+'" onclick="APP._replayTrace(\''+t.trace_id+'\')">'+ic+' '+(t.prompt||'')+'<br><small style="color:var(--text-secondary)">'+t.timestamp+' | '+t.app_name+' | '+t.total_steps+'步'+(t.blocked?' | 阻断':'')+'</small></div>';
+            for (const trace of data.traces) {
+                const item = document.createElement('button');
+                item.type = 'button';
+                item.className = `history-item ${trace.blocked ? 'history-item-blocked' : 'history-item-ok'}`;
+                item.dataset.traceId = trace.trace_id;
+
+                const title = document.createElement('span');
+                title.className = 'history-item-title';
+                title.textContent = trace.prompt || trace.trace_id;
+
+                const meta = document.createElement('span');
+                meta.className = 'history-item-meta';
+                meta.textContent = [
+                    trace.timestamp,
+                    trace.app_name,
+                    trace.total_steps ? `${trace.total_steps} 步` : '',
+                    trace.blocked ? '已阻断' : ''
+                ].filter(Boolean).join(' | ');
+
+                item.append(title, meta);
+                panel.appendChild(item);
             }
-            panel.innerHTML=h;
+
+            panel.querySelectorAll('.history-item').forEach((el) => {
+                el.addEventListener('click', () => this._replayTrace(el.dataset.traceId));
+            });
         }
-        panel.style.display='block';
+
+        panel.classList.add('visible');
     },
     async _replayTrace(tid) {
         var d=await API.getTrace(tid); if(!d){alert('加载失败');return;}
-        var p=document.getElementById('historyListPanel'); if(p)p.style.display='none';
+        const listPanel=document.getElementById('historyListPanel'); if(listPanel)listPanel.classList.remove('visible');
         if(d.graph&&d.graph.nodes&&d.graph.nodes.length){GRAPH.setData(d.graph.nodes,d.graph.links);GRAPH.render();}
         else if(d.graph&&d.graph.nodes){GRAPH.setData([],[]);GRAPH.render();}
         else {this._showHistoryHint('该历史记录未保存拓扑快照（旧版记录），仅显示流转步骤');GRAPH.setData([],[]);GRAPH.render();}
@@ -259,21 +298,65 @@ const APP = {
         var t=document.querySelector('.navbar-tabs .tab[data-tab="monitor"]'); if(t)t.click();
     },
     _showHistoryHint(msg) {
-        var g=document.querySelector('.graph-panel'); if(!g)return;
-        var el=document.createElement('div');
-        el.style.cssText='position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:30;background:var(--bg-card);color:var(--text-secondary);padding:8px 16px;border-radius:6px;font-size:12px;border:1px solid var(--accent-blue)';
-        el.textContent=msg;
+        const g = document.querySelector('.graph-panel');
+        if (!g) return;
+        const el = document.createElement('div');
+        el.className = 'graph-hint';
+        el.textContent = msg;
         g.appendChild(el);
-        setTimeout(function(){el.remove()},4000);
+        setTimeout(() => el.remove(), 4000);
     },
     _renderAuditExport() {
-        var p=document.getElementById('auditExportPanel');
-        if(!p){
-            p=document.createElement('div');p.id='auditExportPanel';
-            p.style.cssText='margin:12px 0;padding:12px;background:var(--bg-card);border-radius:8px;text-align:center';
-            var r=document.querySelector('.risk-card-panel'); if(r)r.insertBefore(p,r.firstChild);
+        let p = document.getElementById('auditExportPanel');
+        const riskPanel = document.querySelector('.risk-card-panel');
+        if (!riskPanel) return;
+
+        if (!p) {
+            p = document.createElement('div');
+            p.id = 'auditExportPanel';
+            p.className = 'audit-export';
+            riskPanel.insertBefore(p, riskPanel.firstChild);
         }
-        p.innerHTML='<button onclick="API.getTraces().then(function(d){var t=d.traces&&d.traces[0];if(t)API.getTrace(t.trace_id).then(function(f){var b=new Blob([JSON.stringify(f,null,2)]);var a=document.createElement(\'a\');a.href=URL.createObjectURL(b);a.download=t.trace_id+\'.json\';a.click()})})" style="background:var(--accent-blue);color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;margin-right:8px">导出最新 Trace</button><span style="font-size:12px;color:var(--text-secondary)">审计模式</span>';
+
+        p.innerHTML = '';
+        const exportBtn = document.createElement('button');
+        exportBtn.type = 'button';
+        exportBtn.className = 'btn-execute';
+        exportBtn.textContent = '导出最新 Trace';
+        exportBtn.addEventListener('click', () => this._exportLatestTrace());
+
+        const label = document.createElement('span');
+        label.className = 'audit-export-label';
+        label.textContent = '审计模式';
+
+        p.append(exportBtn, label);
+    },
+
+    async _exportLatestTrace() {
+        try {
+            const data = await API.getTraces();
+            const latest = data && Array.isArray(data.traces) && data.traces.length > 0
+                ? data.traces[0]
+                : null;
+            if (!latest) {
+                alert('暂无可导出的历史记录');
+                return;
+            }
+            const trace = await API.getTrace(latest.trace_id);
+            if (!trace) {
+                alert('Trace 数据加载失败');
+                return;
+            }
+            const blob = new Blob([JSON.stringify(trace, null, 2)], { type: 'application/json' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = `${latest.trace_id}.json`;
+            link.click();
+            URL.revokeObjectURL(link.href);
+        } catch (err) {
+            console.error('[app] 导出 Trace 失败:', err);
+            alert('导出失败，请稍后重试');
+        }
     },
 
     _initModal() {
@@ -311,7 +394,14 @@ const APP = {
         if (minimizeBtn) {
             minimizeBtn.addEventListener('click', () => {
                 panel.classList.toggle('minimized');
-                minimizeBtn.textContent = panel.classList.contains('minimized') ? '□' : '─';
+                minimizeBtn.setAttribute(
+                    'aria-label',
+                    panel.classList.contains('minimized') ? '展开' : '最小化'
+                );
+                minimizeBtn.setAttribute(
+                    'title',
+                    panel.classList.contains('minimized') ? '展开' : '最小化'
+                );
             });
         }
         
@@ -365,11 +455,8 @@ const APP = {
         const consoleCard = document.querySelector('.console-card');
         if (consoleCard) {
             const resetBtn = document.createElement('button');
-            resetBtn.className = 'btn-execute';
-            resetBtn.style.marginTop = '8px';
-            resetBtn.style.width = '100%';
-            resetBtn.style.background = 'var(--accent-red)';
-            resetBtn.textContent = '🗑️ 重置所有数据';
+            resetBtn.className = 'btn-execute btn-danger btn-block';
+            resetBtn.textContent = '重置所有数据';
             resetBtn.addEventListener('click', async () => {
                 if (confirm('确定要重置所有数据吗？')) {
                     await API.resetData();
@@ -400,23 +487,23 @@ const APP = {
         }
         
         const typeLabels = {
-            'AIAgent': '🤖 AI 智能体',
-            'AIModelInvocation': '🧠 LLM 推理',
-            'AgentTool': '🔧 工具调用',
-            'Prompt': '💬 提示内容',
-            'DomainData': '📦 数据实体',
+            'AIAgent': 'AI 智能体',
+            'AIModelInvocation': 'LLM 推理',
+            'AgentTool': '工具调用',
+            'Prompt': '提示内容',
+            'DomainData': '数据实体',
         };
 
         // 角色标签映射
         const roleLabels = {
-            'input': { icon: '📥', label: '输入参数', color: 'var(--accent-blue)' },
-            'output': { icon: '📤', label: '输出结果', color: 'var(--accent-green)' },
-            'created': { icon: '📝', label: '环境变更 - 创建', color: 'var(--accent-orange)' },
-            'updated': { icon: '📝', label: '环境变更 - 更新', color: 'var(--accent-yellow)' },
+            'input': { label: '输入参数', color: 'var(--accent-blue)' },
+            'output': { label: '输出结果', color: 'var(--accent-green)' },
+            'created': { label: '环境变更 - 创建', color: 'var(--accent-orange)' },
+            'updated': { label: '环境变更 - 更新', color: 'var(--accent-yellow)' },
         };
 
         let html = `
-            <h2 style="margin-bottom:16px;font-size:18px;">
+            <h2>
                 ${typeLabels[nodeDetail.type] || nodeDetail.type}: ${nodeDetail.label || nodeDetail.id}
             </h2>
             <div class="detail-field">
@@ -431,11 +518,11 @@ const APP = {
 
         // DomainData 显示角色
         if (nodeDetail.type === 'DomainData' && nodeDetail.operation) {
-            const role = roleLabels[nodeDetail.operation] || { icon: '📦', label: '数据', color: 'var(--text-primary)' };
+            const role = roleLabels[nodeDetail.operation] || { label: '数据', color: 'var(--text-primary)' };
             html += `
                 <div class="detail-field">
                     <span class="label">角色</span>
-                    <div class="value" style="color:${role.color};font-weight:600;">${role.icon} ${role.label}</div>
+                    <div class="value" style="color:${role.color};font-weight:600;">${role.label}</div>
                 </div>
             `;
         }
@@ -463,7 +550,7 @@ const APP = {
             html += `
                 <div class="detail-field">
                     <span class="label">敏感数据</span>
-                    <div class="value" style="color:var(--accent-red);font-weight:600;">🔒 包含敏感信息</div>
+                    <div class="value" style="color:var(--accent-red);font-weight:600;">包含敏感信息</div>
                 </div>
             `;
         }
@@ -472,7 +559,7 @@ const APP = {
             html += `
                 <div class="detail-field">
                     <span class="label">阻断状态</span>
-                    <div class="value blocked">🚫 已阻断</div>
+                    <div class="value blocked">已阻断</div>
                 </div>
                 <div class="detail-field">
                     <span class="label">阻断原因</span>
@@ -485,7 +572,7 @@ const APP = {
             html += `
                 <div class="detail-field">
                     <span class="label">输入参数</span>
-                    <div class="value" style="font-family:monospace;font-size:11px;">${nodeDetail.inputs}</div>
+                    <div class="value detail-value-long">${nodeDetail.inputs}</div>
                 </div>
             `;
         }
@@ -503,7 +590,7 @@ const APP = {
             html += `
                 <div class="detail-field">
                     <span class="label">Prompt</span>
-                    <div class="value" style="font-family:monospace;font-size:11px;background:var(--bg-card);padding:8px;border-radius:4px;">
+                    <div class="value detail-value-long">
                         ${nodeDetail.prompt.substring(0, 200)}${nodeDetail.prompt.length > 200 ? '...' : ''}
                     </div>
                 </div>
@@ -514,7 +601,7 @@ const APP = {
             html += `
                 <div class="detail-field">
                     <span class="label">LLM 响应</span>
-                    <div class="value" style="font-family:monospace;font-size:11px;background:var(--bg-card);padding:8px;border-radius:4px;">
+                    <div class="value detail-value-long">
                         ${nodeDetail.response.substring(0, 200)}${nodeDetail.response.length > 200 ? '...' : ''}
                     </div>
                 </div>
@@ -544,7 +631,7 @@ const APP = {
                     
                     // 增量更新检测：只在新数据有变化时更新
                     if (newNodeCount !== oldNodeCount || newEdgeCount !== oldEdgeCount) {
-                        console.log(`📊 检测到新数据: +${newNodeCount - oldNodeCount} 节点, +${newEdgeCount - oldEdgeCount} 边`);
+                        console.log(`[graph] 检测到新数据: +${newNodeCount - oldNodeCount} 节点, +${newEdgeCount - oldEdgeCount} 边`);
                         
                         // 使用 setData 确保引用一致性
                         GRAPH.setData(data.graph.nodes, data.graph.links);

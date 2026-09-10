@@ -37,21 +37,20 @@ const TRACE_PANEL = {
         panel.id = 'tracePanel';
         panel.innerHTML = `
             <div class="trace-panel-header">
-                <h3>🔍 指令流转追踪</h3>
-                <span class="trace-panel-subtitle">追踪指令的完整生命周期 · 点击步骤查看节点详情</span>
+                <h3>指令流转追踪</h3>
+                <span class="trace-panel-subtitle">追踪指令的完整生命周期，点击步骤定位节点</span>
             </div>
             
             <!-- 追踪步骤 -->
             <div class="trace-steps" id="traceSteps">
                 <div class="trace-step trace-step-empty">
-                    <span class="trace-step-icon">💡</span>
                     <span class="trace-step-text">执行指令后将在此显示完整的流转追踪</span>
                 </div>
             </div>
 
             <!-- 数据流完整性 -->
             <div class="trace-section" id="traceDataflowSection" style="display:none;">
-                <div class="trace-section-title">📊 数据流完整性</div>
+                <div class="trace-section-title">数据流完整性</div>
                 <div class="trace-dataflow" id="traceDataflow">
                     <div class="trace-dataflow-item">
                         <span class="trace-dataflow-label">调用流</span>
@@ -114,30 +113,33 @@ const TRACE_PANEL = {
 
         let html = '';
         for (const step of steps) {
+            const stepName = this._escape(step.name || '未知步骤');
+            const stepDetail = this._escape(step.detail || '');
+            const stepTime = this._escape(step.timestamp || '');
             const statusClass = step.status === 'completed' ? 'trace-step-completed' 
                 : step.status === 'pending' ? 'trace-step-pending'
                 : step.status === 'blocked' ? 'trace-step-blocked'
                 : 'trace-step-error';
             
-            const statusIcon = step.status === 'completed' ? '✅'
-                : step.status === 'pending' ? '⏳'
-                : step.status === 'blocked' ? '🚫'
-                : '❌';
+            const statusText = step.status === 'completed' ? '完成'
+                : step.status === 'pending' ? '等待'
+                : step.status === 'blocked' ? '已阻断'
+                : '失败';
 
             // 工具调用步骤添加 data-node-id 属性，用于点击定位图谱节点
-            const nodeIdAttr = step.nodeId ? ` data-node-id="${step.nodeId}"` : '';
+            const safeNodeId = String(step.nodeId || '').replace(/"/g, '&quot;');
+            const nodeIdAttr = safeNodeId ? ` data-node-id="${safeNodeId}"` : '';
             // 工具调用步骤添加可点击样式
             const clickableClass = step.nodeId ? ' trace-step-clickable' : '';
 
             html += `
                 <div class="trace-step ${statusClass}${clickableClass}"${nodeIdAttr}>
                     <div class="trace-step-header">
-                        <span class="trace-step-icon">${step.icon}</span>
-                        <span class="trace-step-name">${step.name}</span>
-                        <span class="trace-step-status">${statusIcon}</span>
+                        <span class="trace-step-name">${stepName}</span>
+                        <span class="trace-step-status">${statusText}</span>
                     </div>
-                    <div class="trace-step-detail">${step.detail}</div>
-                    <div class="trace-step-time">${step.timestamp || ''}</div>
+                    <div class="trace-step-detail">${stepDetail}</div>
+                    <div class="trace-step-time">${stepTime}</div>
                 </div>
             `;
         }
@@ -154,6 +156,18 @@ const TRACE_PANEL = {
                 if (node && GRAPH.showNodeDetail) GRAPH.showNodeDetail(node);
             });
         });
+    },
+
+    /**
+     * HTML 转义，防止后端文本破坏结构
+     */
+    _escape(text) {
+        return String(text == null ? '' : text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     },
 
     /**
@@ -192,7 +206,7 @@ const TRACE_PANEL = {
             if (!existingBlockedLabel) {
                 const label = document.createElement('div');
                 label.className = 'trace-blocked-label';
-                label.innerHTML = '🚫 执行已被防御系统阻断';
+                label.textContent = '执行已被防御系统阻断';
                 section.insertBefore(label, section.querySelector('.trace-dataflow'));
             }
         } else {
@@ -205,14 +219,8 @@ const TRACE_PANEL = {
         const callFlowPctEl = document.getElementById('traceCallFlowPct');
         if (callFlowFill) {
             callFlowFill.style.width = callFlowPct + '%';
-            if (isBlocked) {
-                // 阻断时显示红色进度条
-                callFlowFill.style.background = 'linear-gradient(90deg, var(--accent-red), #c0392b)';
-            } else {
-                callFlowFill.style.background = callFlowPct === 100 
-                    ? 'linear-gradient(90deg, var(--accent-green), #27ae60)' 
-                    : 'linear-gradient(90deg, var(--accent-orange), var(--accent-yellow))';
-            }
+            callFlowFill.className = 'trace-dataflow-fill '
+                + (isBlocked ? 'fill-danger' : (callFlowPct === 100 ? 'fill-ok' : 'fill-warn'));
         }
         if (callFlowPctEl) callFlowPctEl.textContent = callFlowPct + '%';
 
@@ -220,14 +228,8 @@ const TRACE_PANEL = {
         const dataFlowPctEl = document.getElementById('traceDataFlowPct');
         if (dataFlowFill) {
             dataFlowFill.style.width = dataFlowPct + '%';
-            if (isBlocked) {
-                // 阻断时显示红色进度条
-                dataFlowFill.style.background = 'linear-gradient(90deg, var(--accent-red), #c0392b)';
-            } else {
-                dataFlowFill.style.background = dataFlowPct === 100 
-                    ? 'linear-gradient(90deg, var(--accent-green), #27ae60)' 
-                    : 'linear-gradient(90deg, var(--accent-orange), var(--accent-yellow))';
-            }
+            dataFlowFill.className = 'trace-dataflow-fill '
+                + (isBlocked ? 'fill-danger' : (dataFlowPct === 100 ? 'fill-ok' : 'fill-warn'));
         }
         if (dataFlowPctEl) dataFlowPctEl.textContent = dataFlowPct + '%';
     },
@@ -242,7 +244,6 @@ const TRACE_PANEL = {
         container.innerHTML = `
             <div class="trace-step trace-step-error">
                 <div class="trace-step-header">
-                    <span class="trace-step-icon">❌</span>
                     <span class="trace-step-name">追踪失败</span>
                 </div>
                 <div class="trace-step-detail">${message}</div>
@@ -261,7 +262,6 @@ const TRACE_PANEL = {
         if (container) {
             container.innerHTML = `
                 <div class="trace-step trace-step-empty">
-                    <span class="trace-step-icon">💡</span>
                     <span class="trace-step-text">执行指令后将在此显示完整的流转追踪</span>
                 </div>
             `;
