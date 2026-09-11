@@ -35,10 +35,12 @@ const RISK_PANEL = {
             const cards = await API.getRiskCards();
             if (Array.isArray(cards)) {
                 this.render(cards);
+                return cards;
             }
         } catch (err) {
             console.error('加载风险卡片失败:', err);
         }
+        return this.riskCards;
     },
 
     /**

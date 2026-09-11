@@ -61,6 +61,16 @@ const CONSOLE = {
     },
 
     /**
+     * 执行真实操作前退出历史回放状态，
+     * 避免回放快照与新的实时执行结果混在一起。
+     */
+    _leaveReplay() {
+        if (typeof APP !== 'undefined' && typeof APP.exitReplay === 'function') {
+            APP.exitReplay({ reload: false });
+        }
+    },
+
+    /**
      * 加载预设场景列表
      */
     async loadScenarios() {
@@ -123,6 +133,7 @@ const CONSOLE = {
         if (this._isExecuting) return;
         
         this._isExecuting = true;
+        this._leaveReplay();
         this._showFeedback('正在执行操作（真实 LLM 自主决策）...', 'info');
         
         // 发布场景执行事件（触发追踪面板）
@@ -142,7 +153,7 @@ const CONSOLE = {
                 GRAPH.setData(result.graph.nodes, result.graph.links);
                 GRAPH.render();
                 const riskCardCount = result.risk_cards?.length || 0;
-                GRAPH.updateStats(result.summary, riskCardCount);
+                GRAPH.updateStats(result.summary, riskCardCount, result.events?.length);
             } else {
                 // 后端可能没有返回 graph 数据，强制重新加载
                 await GRAPH.loadData();
@@ -224,6 +235,7 @@ const CONSOLE = {
         }
         
         this._isExecuting = true;
+        this._leaveReplay();
         this._showFeedback('正在执行自定义指令（真实 LLM 自主决策）...', 'info');
         
         try {
@@ -246,7 +258,7 @@ const CONSOLE = {
                 GRAPH.setData(result.graph.nodes, result.graph.links);
                 GRAPH.render();
                 const riskCardCount = result.risk_cards?.length || 0;
-                GRAPH.updateStats(result.summary, riskCardCount);
+                GRAPH.updateStats(result.summary, riskCardCount, result.events?.length);
             } else {
                 // 后端可能没有返回 graph 数据，强制重新加载
                 await GRAPH.loadData();
@@ -926,6 +938,7 @@ const CONSOLE = {
         if (this._isExecuting) return;
         
         this._isExecuting = true;
+        this._leaveReplay();
         this._showFeedback(`正在执行攻击场景：${scenario.attack_name} (${scenario.user_task_id} + ${scenario.injection_task_id})...`, 'info');
         
         try {
@@ -948,7 +961,7 @@ const CONSOLE = {
                 GRAPH.setData(result.graph.nodes, result.graph.links);
                 GRAPH.render();
                 const riskCardCount = result.risk_cards?.length || 0;
-                GRAPH.updateStats(result.summary, riskCardCount);
+                GRAPH.updateStats(result.summary, riskCardCount, result.events?.length);
             } else {
                 await GRAPH.loadData();
             }

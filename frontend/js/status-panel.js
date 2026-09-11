@@ -250,19 +250,31 @@ const STATUS_PANEL = {
             }
         }
 
-        // 更新图谱统计
+        // 更新图谱统计（历史回放期间由回放数据接管，避免被实时轮询覆盖）
+        const replaying = typeof Store !== 'undefined' && Store.get('replaying');
         const nodesEl = document.getElementById('statusGraphNodes');
-        if (nodesEl && status.graph_stats) {
+        if (!replaying && nodesEl && status.graph_stats) {
             nodesEl.textContent = status.graph_stats.nodes || 0;
         }
 
         const edgesEl = document.getElementById('statusGraphEdges');
-        if (edgesEl && status.graph_stats) {
+        if (!replaying && edgesEl && status.graph_stats) {
             edgesEl.textContent = status.graph_stats.edges || 0;
         }
 
         // 更新功能清单
         this._updateFeatures(status.features);
+    },
+
+    /**
+     * 使用指定图谱规模刷新状态面板（用于历史回放）
+     */
+    setGraphStats(nodeCount, edgeCount) {
+        const nodesEl = document.getElementById('statusGraphNodes');
+        if (nodesEl) nodesEl.textContent = Number(nodeCount) || 0;
+
+        const edgesEl = document.getElementById('statusGraphEdges');
+        if (edgesEl) edgesEl.textContent = Number(edgeCount) || 0;
     },
 
     /**

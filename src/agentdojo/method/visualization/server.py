@@ -882,9 +882,13 @@ def _execute_with_real_llm(
         'actual_tools': actual_tools,
         'actual_apps': list(actual_apps),
         'graph_summary': summary,
+        'risk_cards': risk_cards,
         'steps': trace_steps,
         'events': events,
         'defense_audit': defense_audit,
+        'blocked': blocked,
+        'block_reason': block_reason,
+        'total_steps': len(trace_steps),
     }
     _save_trace_to_file(trace_record)
 

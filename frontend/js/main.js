@@ -21,6 +21,7 @@ const Store = {
         lastNodeCount: 0,
         lastEdgeCount: 0,
         isPolling: false,
+        replaying: false,
     },
     
     _listeners: {},
@@ -195,8 +196,12 @@ const APP = {
                 graphPanel.style.display = 'flex';
                 sidePanel.style.display = 'flex';
                 timelinePanel.style.display = 'flex';
-                document.getElementById('statusText').textContent = '实时';
-                document.querySelector('.status-dot').className = 'status-dot live';
+                if (Store.get('replaying')) {
+                    this.exitReplay();
+                } else {
+                    document.getElementById('statusText').textContent = '实时';
+                    document.querySelector('.status-dot').className = 'status-dot live';
+                }
                 break;
                 
             case 'history':
@@ -204,8 +209,9 @@ const APP = {
                 graphPanel.style.display = 'flex';
                 sidePanel.style.display = 'flex';
                 timelinePanel.style.display = 'flex';
-                document.getElementById('statusText').textContent = '回放';
-                this._loadHistoryList();
+                if (!Store.get('replaying')) {
+                    document.getElementById('statusText').textContent = '回放';
+                }
                 document.querySelector('.status-dot').className = 'status-dot';
                 break;
                 
@@ -288,15 +294,162 @@ const APP = {
         panel.classList.add('visible');
     },
     async _replayTrace(tid) {
-        var d=await API.getTrace(tid); if(!d){alert('加载失败');return;}
-        const listPanel=document.getElementById('historyListPanel'); if(listPanel)listPanel.classList.remove('visible');
-        if(d.graph&&d.graph.nodes&&d.graph.nodes.length){GRAPH.setData(d.graph.nodes,d.graph.links);GRAPH.render();}
-        else if(d.graph&&d.graph.nodes){GRAPH.setData([],[]);GRAPH.render();}
-        else {this._showHistoryHint('该历史记录未保存拓扑快照（旧版记录），仅显示流转步骤');GRAPH.setData([],[]);GRAPH.render();}
-        if(d.events&&d.events.length){TIMELINE.setEvents(d.events);}else{TIMELINE.clear();}
-        if(d.steps&&d.steps.length)TRACE_PANEL._renderTrace(d);
-        var t=document.querySelector('.navbar-tabs .tab[data-tab="monitor"]'); if(t)t.click();
+        let trace;
+        try {
+            trace = await API.getTrace(tid);
+        } catch (err) {
+            console.error('[app] 加载历史记录失败:', err);
+        }
+        if (!trace) {
+            alert('历史记录加载失败');
+            return;
+        }
+
+        const listPanel = document.getElementById('historyListPanel');
+        if (listPanel) listPanel.classList.remove('visible');
+
+        // 1. 拓扑图
+        const graph = trace.graph && Array.isArray(trace.graph.nodes)
+            ? trace.graph
+            : null;
+        const nodes = graph ? graph.nodes : [];
+        const links = graph ? (graph.links || []) : [];
+        if (!graph) {
+            this._showHistoryHint('该历史记录未保存拓扑快照（旧版记录），仅显示事件与流转步骤');
+        }
+        GRAPH.setData(nodes, links);
+        GRAPH.render();
+
+        // 2. 事件时间线
+        const events = Array.isArray(trace.events) ? trace.events : [];
+        if (events.length > 0) {
+            TIMELINE.setEvents(events);
+        } else {
+            TIMELINE.clear();
+        }
+
+        // 3. 指令流转追踪
+        if (Array.isArray(trace.steps) && trace.steps.length > 0) {
+            TRACE_PANEL._renderTrace(trace);
+        } else {
+            TRACE_PANEL.clear();
+        }
+
+        // 4. 风险卡片与统计概览（使用历史快照，而不是实时数据）
+        const riskCards = this._buildReplayRiskCards(trace);
+        RISK_PANEL.render(riskCards);
+
+        const summary = trace.graph_summary || {};
+        const nodeCount = Number.isFinite(summary.total_nodes) ? summary.total_nodes : nodes.length;
+        const edgeCount = Number.isFinite(summary.total_edges) ? summary.total_edges : links.length;
+        GRAPH.updateStats(
+            { total_nodes: nodeCount, total_edges: edgeCount },
+            riskCards.length,
+            events.length
+        );
+        STATUS_PANEL.setGraphStats(nodeCount, edgeCount);
+        Store.set('lastNodeCount', nodeCount);
+        Store.set('lastEdgeCount', edgeCount);
+
+        // 5. 进入回放模式：暂停实时轮询，避免快照被覆盖
+        this._enterReplayMode(trace);
     },
+
+    /**
+     * 从历史记录中恢复风险卡片。
+     * 新版记录直接带有 risk_cards；旧版记录退化为从风险事件推导。
+     */
+    _buildReplayRiskCards(trace) {
+        if (Array.isArray(trace.risk_cards) && trace.risk_cards.length > 0) {
+            return trace.risk_cards;
+        }
+
+        const events = Array.isArray(trace.events) ? trace.events : [];
+        const riskEvents = events.filter(e => e && e.type === 'risk');
+        if (riskEvents.length === 0) return [];
+
+        const ringTitles = {
+            0: 'Ring 0: 安全事件',
+            1: 'Ring 1: 提示注入检测',
+            2: 'Ring 2: 意图一致性检查',
+            3: 'Ring 3: 数据过度暴露缓解',
+        };
+        const actions = { 0: '阻断', 1: '阻断', 2: '阻断', 3: '脱敏' };
+
+        return riskEvents.map((event) => {
+            const ring = Number.isFinite(event.ring) ? event.ring : 0;
+            const title = ringTitles[ring] || `Ring ${ring}: 安全事件`;
+            const detail = event.block_reason || event.content || '检测到风险事件';
+            return {
+                ring,
+                title,
+                detail,
+                agent: event.agent_id || 'unknown',
+                action: event.tool_intent || 'unknown',
+                app: event.target_app || 'unknown',
+                defense_ring: title,
+                defense_action: actions[ring] || '阻断',
+                defense_detail: detail,
+                defense_effect: '已由防御系统处理',
+            };
+        });
+    },
+
+    /**
+     * 进入历史回放状态
+     */
+    _enterReplayMode(trace) {
+        Store.set('replaying', true);
+
+        const statusText = document.getElementById('statusText');
+        if (statusText) {
+            statusText.textContent = trace.timestamp ? `回放 ${trace.timestamp}` : '回放';
+        }
+
+        const dot = document.querySelector('.status-dot');
+        if (dot) {
+            dot.className = 'status-dot';
+            dot.title = '正在查看历史记录，点击“实时监控”返回实时数据';
+        }
+    },
+
+    /**
+     * 退出历史回放，恢复实时数据（默认重新加载实时快照）
+     */
+    exitReplay(options = {}) {
+        const { reload = true } = options;
+        if (!Store.get('replaying')) return;
+
+        Store.set('replaying', false);
+        TIMELINE.clear();
+        TRACE_PANEL.clear();
+
+        const statusText = document.getElementById('statusText');
+        if (statusText) statusText.textContent = '实时';
+
+        const dot = document.querySelector('.status-dot');
+        if (dot) {
+            dot.className = 'status-dot live';
+            dot.removeAttribute('title');
+        }
+
+        if (reload) {
+            this._reloadLiveData();
+        }
+    },
+
+    /**
+     * 重新加载实时图谱、统计与状态
+     */
+    async _reloadLiveData() {
+        try {
+            await GRAPH.loadData();
+            STATUS_PANEL.refresh();
+        } catch (err) {
+            console.error('[app] 恢复实时数据失败:', err);
+        }
+    },
+
     _showHistoryHint(msg) {
         const g = document.querySelector('.graph-panel');
         if (!g) return;
@@ -459,6 +612,7 @@ const APP = {
             resetBtn.textContent = '重置所有数据';
             resetBtn.addEventListener('click', async () => {
                 if (confirm('确定要重置所有数据吗？')) {
+                    if (Store.get('replaying')) this.exitReplay({ reload: false });
                     await API.resetData();
                     await GRAPH.loadData();
                     TIMELINE.clear();
@@ -622,6 +776,9 @@ const APP = {
         // 每 5 秒检查一次新数据
         setInterval(async () => {
             try {
+                // 历史回放期间暂停实时增量刷新，避免覆盖回放快照
+                if (Store.get('replaying')) return;
+
                 const data = await API.getGraphData();
                 if (data && data.graph) {
                     const newNodeCount = data.graph.nodes.length;
@@ -636,7 +793,6 @@ const APP = {
                         // 使用 setData 确保引用一致性
                         GRAPH.setData(data.graph.nodes, data.graph.links);
                         GRAPH.render();
-                        GRAPH.updateStats(data.summary);
                         
                         Store.set('lastNodeCount', newNodeCount);
                         Store.set('lastEdgeCount', newEdgeCount);
@@ -645,7 +801,12 @@ const APP = {
                             TIMELINE.loadEvents(data.events);
                         }
                         
-                        RISK_PANEL.loadRiskCards();
+                        const riskCards = await RISK_PANEL.loadRiskCards();
+                        GRAPH.updateStats(
+                            data.summary,
+                            Array.isArray(riskCards) ? riskCards.length : 0,
+                            Array.isArray(data.events) ? data.events.length : undefined
+                        );
                     }
                 }
             } catch (err) {

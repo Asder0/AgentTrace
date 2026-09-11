@@ -173,13 +173,18 @@ const GRAPH = {
 
             this.setData(data.graph.nodes, data.graph.links);
             this.render();
-            this.updateStats(data.summary);
 
             // 加载风险卡片
-            RISK_PANEL.loadRiskCards();
+            const riskCards = await RISK_PANEL.loadRiskCards();
 
             // 加载事件时间线
             TIMELINE.loadEvents(data.events);
+
+            this.updateStats(
+                data.summary,
+                Array.isArray(riskCards) ? riskCards.length : 0,
+                Array.isArray(data.events) ? data.events.length : undefined
+            );
 
         } catch (err) {
             console.error('加载图谱数据失败:', err);
@@ -882,18 +887,21 @@ const GRAPH = {
     /**
      * 更新统计面板
      */
-    updateStats(summary, riskCardCount) {
+    updateStats(summary, riskCardCount, eventCount) {
         if (!summary) return;
 
         document.getElementById('statNodes').textContent = summary.total_nodes || 0;
         document.getElementById('statEdges').textContent = summary.total_edges || 0;
 
         const blocksEl = document.getElementById('statBlocks');
-        const count = riskCardCount || 0;
+        const count = typeof riskCardCount === 'number' ? riskCardCount : 0;
         blocksEl.textContent = count;
         blocksEl.className = count > 0 ? 'stat-value warning' : 'stat-value';
 
-        document.getElementById('statEvents').textContent = (summary.total_nodes || 0) + (summary.total_edges || 0);
+        const eventsEl = document.getElementById('statEvents');
+        eventsEl.textContent = typeof eventCount === 'number'
+            ? eventCount
+            : (summary.total_nodes || 0) + (summary.total_edges || 0);
     },
 
     /**
