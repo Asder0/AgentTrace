@@ -68,6 +68,10 @@ const CONSOLE = {
         if (typeof APP !== 'undefined' && typeof APP.exitReplay === 'function') {
             APP.exitReplay({ reload: false });
         }
+        // 新的实时执行会重新下发步骤，先清除上一次的步骤信息，避免错配
+        if (typeof TIMELINE !== 'undefined' && typeof TIMELINE.clearTraceSteps === 'function') {
+            TIMELINE.clearTraceSteps();
+        }
     },
 
     /**
@@ -99,6 +103,9 @@ const CONSOLE = {
                 if (scenario.cross_app) {
                     btn.classList.add('cross-app');
                 }
+                if (scenario.cross_module) {
+                    btn.classList.add('cross-module');
+                }
                 
                 btn.dataset.action = scenario.id;
                 btn.title = this._cleanDisplayText(scenario.description);
@@ -108,9 +115,10 @@ const CONSOLE = {
                 if (scenario.is_risk) badges += '<span class="badge badge-risk">风险</span>';
                 if (scenario.is_sensitive) badges += '<span class="badge badge-sensitive">敏感</span>';
                 if (scenario.cross_app) badges += '<span class="badge badge-cross">跨APP</span>';
+                if (scenario.cross_module) badges += '<span class="badge badge-module">跨模块</span>';
                 
-                const scenarioLabel = (scenario.id && scenario.suite)
-                    ? `${scenario.id} (${scenario.suite})`
+                const scenarioLabel = (scenario.task_id && scenario.suite)
+                    ? `${scenario.task_id} (${scenario.suite})`
                     : this._cleanDisplayText(scenario.name);
                 btn.innerHTML = `${scenarioLabel} ${badges}`;
                 
@@ -150,7 +158,7 @@ const CONSOLE = {
             
             // 更新图谱 - 优先使用返回的 graph 数据，否则强制从后端重新加载
             if (result.graph && result.graph.nodes && result.graph.nodes.length > 0) {
-                GRAPH.setData(result.graph.nodes, result.graph.links);
+                GRAPH.setData(result.graph.nodes, result.graph.links, { suite: result.suite || null });
                 GRAPH.render();
                 const riskCardCount = result.risk_cards?.length || 0;
                 GRAPH.updateStats(result.summary, riskCardCount, result.events?.length);
@@ -255,7 +263,7 @@ const CONSOLE = {
             
             // 更新图谱 - 优先使用返回的 graph 数据，否则强制从后端重新加载
             if (result.graph && result.graph.nodes && result.graph.nodes.length > 0) {
-                GRAPH.setData(result.graph.nodes, result.graph.links);
+                GRAPH.setData(result.graph.nodes, result.graph.links, { suite: result.suite || null });
                 GRAPH.render();
                 const riskCardCount = result.risk_cards?.length || 0;
                 GRAPH.updateStats(result.summary, riskCardCount, result.events?.length);
@@ -334,6 +342,7 @@ const CONSOLE = {
         feedback.className = `console-feedback ${type || 'info'}`;
         feedback.textContent = message;
         feedback.hidden = false;
+        if (typeof STORAGE_VIEW !== 'undefined') STORAGE_VIEW.notifyDataChanged();
 
         // 自动隐藏（错误和警告保留更长时间）
         const duration = type === 'error' ? 8000 : type === 'warning' ? 6000 : 4000;
@@ -726,8 +735,10 @@ const CONSOLE = {
                     <div class="attack-selector-row">
                         <label class="attack-selector-label">套件</label>
                         <select id="attackSuiteSelect" class="attack-selector-select">
-                            <option value="workspace">Workspace</option>
-                            <option value="banking">Banking</option>
+                            <option value="workspace">办公 Workspace</option>
+                            <option value="banking">银行 Banking</option>
+                            <option value="slack">通讯 Slack</option>
+                            <option value="travel">旅行 Travel</option>
                         </select>
                     </div>
                     <div class="attack-selector-row">
@@ -808,7 +819,7 @@ const CONSOLE = {
                     btn.className = 'scenario-btn attack-btn';
                     btn.dataset.scenarioId = scenario.id;
                     btn.title = this._cleanDisplayText(scenario.description);
-                    btn.textContent = `${scenario.user_task_id} + ${scenario.injection_task_id}`;
+                    btn.textContent = `${scenario.user_task_label || scenario.user_task_id} + ${scenario.injection_task_label || scenario.injection_task_id}`;
                     btn.addEventListener('click', () => this._executeAttackScenario(scenario));
                     
                     body.appendChild(btn);
@@ -855,7 +866,7 @@ const CONSOLE = {
             .forEach(t => {
                 const opt = document.createElement('option');
                 opt.value = t.id;
-                opt.textContent = `${t.id}: ${t.prompt.substring(0, 60)}...`;
+                opt.textContent = `${t.task_id || t.id}: ${t.prompt.substring(0, 60)}...`;
                 opt.title = t.prompt;
                 userTaskSelect.appendChild(opt);
             });
@@ -867,7 +878,7 @@ const CONSOLE = {
             .forEach(t => {
                 const opt = document.createElement('option');
                 opt.value = t.id;
-                opt.textContent = `${t.id}: ${t.goal.substring(0, 60)}...`;
+                opt.textContent = `${t.task_id || t.id}: ${t.goal.substring(0, 60)}...`;
                 opt.title = t.goal;
                 injTaskSelect.appendChild(opt);
             });
@@ -922,6 +933,8 @@ const CONSOLE = {
             suite: suite,
             user_task_id: userTaskId,
             injection_task_id: injTaskId,
+            user_task_label: utInfo?.task_id || userTaskId,
+            injection_task_label: injInfo?.task_id || injTaskId,
             user_task_prompt: utInfo?.prompt || '',
             injection_goal: injInfo?.goal || '',
             name: `自定义: ${userTaskId} + ${injTaskId}`,
@@ -939,7 +952,7 @@ const CONSOLE = {
         
         this._isExecuting = true;
         this._leaveReplay();
-        this._showFeedback(`正在执行攻击场景：${scenario.attack_name} (${scenario.user_task_id} + ${scenario.injection_task_id})...`, 'info');
+        this._showFeedback(`正在执行攻击场景：${scenario.attack_name} (${scenario.user_task_label || scenario.user_task_id} + ${scenario.injection_task_label || scenario.injection_task_id})...`, 'info');
         
         try {
             const params = {
@@ -958,7 +971,7 @@ const CONSOLE = {
             
             // 更新图谱
             if (result.graph && result.graph.nodes && result.graph.nodes.length > 0) {
-                GRAPH.setData(result.graph.nodes, result.graph.links);
+                GRAPH.setData(result.graph.nodes, result.graph.links, { suite: result.suite || null });
                 GRAPH.render();
                 const riskCardCount = result.risk_cards?.length || 0;
                 GRAPH.updateStats(result.summary, riskCardCount, result.events?.length);
@@ -984,7 +997,7 @@ const CONSOLE = {
             if (result.steps && result.steps.length > 0) {
                 TRACE_PANEL._renderTrace({
                     trace_id: result.trace_id || scenario.id,
-                    command: `${scenario.attack_name}: ${scenario.user_task_id} + ${scenario.injection_task_id}`,
+                    command: `${scenario.attack_name}: ${scenario.user_task_label || scenario.user_task_id} + ${scenario.injection_task_label || scenario.injection_task_id}`,
                     llm_mode: 'real',
                     steps: result.steps,
                     total_steps: result.steps.length,

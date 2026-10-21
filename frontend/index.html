@@ -24,6 +24,7 @@
             <button type="button" class="tab active" data-tab="monitor" aria-current="page">实时监控</button>
             <button type="button" class="tab" data-tab="history">历史回放</button>
             <button type="button" class="tab" data-tab="audit">风险审计</button>
+            <button type="button" class="tab" data-tab="storage">存储视图</button>
         </nav>
 
         <div class="navbar-status" role="status">
@@ -44,20 +45,42 @@
                         <input type="checkbox" id="chkShowLabels" checked>
                         <span>显示标签</span>
                     </label>
+                    <label class="control-checkbox">
+                        <input type="checkbox" id="chkShowBelongsTo" checked>
+                        <span>显示归属边</span>
+                    </label>
                 </div>
             </header>
+
+            <!-- APP 调用流程（按执行顺序） -->
+            <div class="app-flow" id="appFlow" aria-label="APP 调用顺序" hidden></div>
 
             <div id="graph-container">
                 <svg id="graph-svg" role="img" aria-label="数据流拓扑图"></svg>
 
-                <!-- 节点类型图例 -->
+                <!-- 图例：节点类型与关系 -->
                 <div class="legend" aria-label="图例">
-                    <div class="legend-item"><span class="legend-color legend-agent"></span><span>AIAgent</span></div>
-                    <div class="legend-item"><span class="legend-color legend-llm"></span><span>AIModelInvocation</span></div>
-                    <div class="legend-item"><span class="legend-color legend-tool"></span><span>AgentTool</span></div>
-                    <div class="legend-item"><span class="legend-color legend-prompt"></span><span>Prompt</span></div>
-                    <div class="legend-item"><span class="legend-color legend-data"></span><span>DomainData</span></div>
-                    <div class="legend-item"><span class="legend-color legend-risk"></span><span>异常/阻断节点</span></div>
+                    <div class="legend-group">
+                        <div class="legend-group-title">节点</div>
+                        <div class="legend-grid">
+                            <div class="legend-item"><span class="legend-color legend-agent"></span><span>智能体</span></div>
+                            <div class="legend-item"><span class="legend-color legend-llm"></span><span>LLM 推理</span></div>
+                            <div class="legend-item"><span class="legend-color legend-tool"></span><span>工具调用</span></div>
+                            <div class="legend-item"><span class="legend-color legend-prompt"></span><span>用户提示</span></div>
+                            <div class="legend-item"><span class="legend-color legend-data"></span><span>数据实体</span></div>
+                            <div class="legend-item"><span class="legend-color legend-risk"></span><span>异常 / 阻断</span></div>
+                        </div>
+                    </div>
+                    <div class="legend-group">
+                        <div class="legend-group-title">关系</div>
+                        <div class="legend-grid">
+                            <div class="legend-item"><span class="legend-line legend-line-flow"></span><span>调用 / 数据流</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-produce"></span><span>产出</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-belong"></span><span>归属</span></div>
+                            <div class="legend-item"><span class="legend-hop"></span><span>跨 APP 切换点</span></div>
+                        </div>
+                    </div>
+                    <div class="legend-note">APP 域 = AgentDojo 四个 task suite（银行 / 办公 / 通讯 / 旅行）；file_reader、user_account、email 等为 suite 内部工具模块，展示在节点详情中</div>
                 </div>
 
                 <!-- 节点详情浮动面板 -->
@@ -155,16 +178,86 @@
         </aside>
     </div>
 
-    <!-- 底部：事件时间线 -->
-    <section class="timeline-panel" aria-label="事件时间线">
-        <header class="panel-header">
-            <h3>事件时间线</h3>
+    <!-- 底部：执行时间线 -->
+    <section class="timeline-panel" aria-label="执行时间线">
+        <div class="timeline-resizer" id="timelineResizer" role="separator" aria-orientation="horizontal"
+             aria-label="拖动调整执行时间线高度" tabindex="0"
+             title="拖动调整高度，双击恢复默认"></div>
+        <header class="panel-header timeline-header">
+            <div class="timeline-heading">
+                <h3>执行时间线</h3>
+                <span class="timeline-count" id="timelineCount">0 条</span>
+                <div class="timeline-flow" id="timelineFlow" hidden></div>
+            </div>
             <div class="timeline-controls">
+                <div class="timeline-filters" id="timelineFilters" role="group" aria-label="事件筛选">
+                    <button type="button" class="timeline-filter active" data-filter="all" data-label="全部" aria-pressed="true">全部 0</button>
+                    <button type="button" class="timeline-filter" data-filter="phase" data-label="阶段" aria-pressed="false">阶段 0</button>
+                    <button type="button" class="timeline-filter" data-filter="llm" data-label="LLM" aria-pressed="false">LLM 0</button>
+                    <button type="button" class="timeline-filter" data-filter="tool" data-label="工具" aria-pressed="false">工具 0</button>
+                    <button type="button" class="timeline-filter" data-filter="risk" data-label="风险" aria-pressed="false">风险 0</button>
+                </div>
+                <button type="button" id="btnToggleTimeline">收起</button>
                 <button type="button" id="btnClearTimeline">清空</button>
             </div>
         </header>
         <div class="timeline-container" id="timelineEvents">
             <div class="timeline-empty">等待事件数据...</div>
+        </div>
+    </section>
+
+    <!-- 存储视图：从存储/环境数据角度观察各 suite 数据及其变化 -->
+    <section id="storageView" class="storage-view" aria-label="存储视图" hidden>
+        <header class="storage-toolbar">
+            <div class="storage-suite-tabs" id="storageSuiteTabs" role="tablist" aria-label="Suite 选择"></div>
+            <div class="storage-actions">
+                <div class="storage-mode" id="storageMode" role="group" aria-label="快照模式">
+                    <button type="button" class="storage-mode-btn active" data-mode="current">当前状态</button>
+                    <button type="button" class="storage-mode-btn" data-mode="initial">初始状态</button>
+                </div>
+                <label class="control-checkbox">
+                    <input type="checkbox" id="storageOnlyChanges">
+                    <span>仅显示变化</span>
+                </label>
+                <label class="control-checkbox">
+                    <input type="checkbox" id="storageAutoRefresh" checked>
+                    <span>自动刷新</span>
+                </label>
+                <input type="search" id="storageSearch" class="storage-search" placeholder="搜索路径或值...">
+                <button type="button" id="storageRefreshBtn">刷新</button>
+            </div>
+        </header>
+
+        <div class="storage-body">
+            <aside class="storage-sidebar">
+                <div class="storage-sidebar-section">
+                    <div class="storage-sidebar-title">Suite 概览</div>
+                    <div id="storageSuiteList" class="storage-suite-list"></div>
+                </div>
+                <div class="storage-sidebar-section">
+                    <div class="storage-sidebar-title">
+                        变更摘要
+                        <span class="storage-change-count" id="storageChangeCount">0</span>
+                    </div>
+                    <div id="storageChangeList" class="storage-change-list"></div>
+                </div>
+            </aside>
+
+            <div class="storage-main">
+                <div class="storage-main-header">
+                    <div id="storageBreadcrumb" class="storage-breadcrumb">选择左侧 suite 查看数据</div>
+                    <div id="storageStatus" class="storage-status"></div>
+                </div>
+                <div id="storageTree" class="storage-tree"></div>
+            </div>
+
+            <aside class="storage-detail" id="storageDetail" hidden>
+                <div class="storage-detail-header">
+                    <span class="storage-detail-title" id="storageDetailTitle">变更详情</span>
+                    <button type="button" class="storage-detail-close" id="storageDetailClose" aria-label="关闭">✕</button>
+                </div>
+                <div class="storage-detail-body" id="storageDetailBody"></div>
+            </aside>
         </div>
     </section>
 
@@ -185,6 +278,7 @@
     <script src="js/status-panel.js"></script>
     <script src="js/trace-panel.js"></script>
     <script src="js/console.js"></script>
+    <script src="js/storage-view.js"></script>
     <script src="js/main.js"></script>
 </body>
 </html>

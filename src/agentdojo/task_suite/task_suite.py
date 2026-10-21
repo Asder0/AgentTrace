@@ -79,12 +79,12 @@ def model_output_from_messages(
 def read_suite_file(suite_name: str, file: str, suite_data_path: Path | None) -> str:
     if suite_data_path is not None:
         path = suite_data_path / file
-        with path.open() as f:
+        with path.open(encoding="utf-8") as f:
             data_yaml = yaml.load(f, ImportLoader)
         return yaml.dump(data_yaml, default_flow_style=False)
     package_files = importlib.resources.files("agentdojo")
     path = package_files / "data" / "suites" / suite_name / file
-    with importlib.resources.as_file(path) as p, p.open() as f:
+    with importlib.resources.as_file(path) as p, p.open(encoding="utf-8") as f:
         # Load into yaml to resolve imports
         data_yaml = yaml.load(f, ImportLoader)
     # dump back to string to pass to include injections later

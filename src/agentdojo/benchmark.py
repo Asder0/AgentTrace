@@ -407,7 +407,7 @@ def load_task_results(
     logdir: Path,
 ) -> TaskResults:
     path = logdir / pipeline_name / suite_name / user_task / attack_name / f"{injection_task}.json"
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         res_dict = json.load(f)
 
     # Check if the result is in the old format (without content blocks)

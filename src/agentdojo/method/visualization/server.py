@@ -50,6 +50,7 @@ from agentdojo.types import get_text_content_as_str
 
 
 from .mock_apps import (
+    build_injected_environment,
     get_runtime_and_env,
     reset_all_environments,
     MOCK_SCENARIOS,
@@ -58,8 +59,71 @@ from .mock_apps import (
     get_attack_scenarios,
     AVAILABLE_ATTACK_TYPES,
 )
+from .app_domains import (
+    APP_DOMAINS,
+    SYSTEM_APP,
+    domain_for_module,
+    domain_for_tool,
+    infer_suite,
+    normalize_graph_nodes,
+)
+from .storage_view import get_suite_storage, list_suite_storage
 
 app = Flask(__name__)
+
+
+def _tool_app_map(runtime: Any, suite: Optional[str] = None) -> dict:
+    """获取 工具名 → APP 域 映射（APP 域 = task suite）。"""
+    if runtime is not None and hasattr(runtime, "tool_app_map"):
+        try:
+            return runtime.tool_app_map()
+        except Exception:
+            pass
+
+    functions = getattr(runtime, "functions", None) or {}
+    mapping: dict = {}
+    for name in functions:
+        domain = domain_for_tool(name, suite if suite in APP_DOMAINS else None)
+        if domain:
+            mapping[name] = domain
+    return mapping
+
+
+def _canonical_app(raw_app: str = "", tool_name: str = "", suite: Optional[str] = None) -> str:
+    """把模块名或工具名转换为 AgentDojo APP 域（banking/workspace/slack/travel/system）。"""
+    domain = domain_for_tool(tool_name, suite) or domain_for_module(raw_app, suite)
+    return domain or (raw_app or "unknown")
+
+
+def _normalize_graph_data(
+    graph_data: Optional[dict],
+    suite: Optional[str] = None,
+    runtime: Any = None,
+) -> dict:
+    """原地规范化图谱节点的 APP 域，并返回 工具名 → APP 域 映射。"""
+    if not graph_data:
+        return {}
+    tool_app = _tool_app_map(runtime, suite if suite in APP_DOMAINS else None)
+    normalize_graph_nodes(
+        graph_data.get("nodes") or [],
+        graph_data.get("links") or [],
+        suite=suite if suite in APP_DOMAINS else None,
+        tool_app=tool_app,
+    )
+    return tool_app
+
+
+def _current_suite() -> Optional[str]:
+    """当前上下文所属 suite：优先最近一次执行，其次从图谱节点推断。"""
+    if _last_execution_suite in APP_DOMAINS:
+        return _last_execution_suite
+    try:
+        nodes = (get_graph_data() or {}).get("nodes") or []
+        return infer_suite(nodes)
+    except Exception:
+        return None
+
+
 CORS(app)
 
 # ============================================================
@@ -73,6 +137,7 @@ _llm_config = {
 }
 
 _pipeline_cache = {}
+_last_execution_suite: Optional[str] = None
 
 
 def _get_llm_config() -> dict:
@@ -99,8 +164,9 @@ def _build_pipeline(app_name: str) -> Any:
     
     如果 LLM 未配置（无 API Key），返回 None。
     
-    支持 "unified" 模式：合并 workspace + banking 的所有工具，
-    让 LLM 可以自由调用任意 APP 的工具，实现真正的跨 APP 执行。
+    支持 "unified" 模式：合并四个 suite 的所有工具，
+    让 LLM 可以自由调用任意 APP 的工具，实现真正的跨 APP 执行
+    （覆盖 workspace / banking / slack / travel 四个 suite）。
     """
     cache_key = f"{app_name}_{_llm_config['provider']}_{_llm_config['model']}"
     if cache_key in _pipeline_cache:
@@ -302,11 +368,14 @@ def api_get_graph():
     try:
         graph_data = get_graph_data()
         summary = get_graph_summary()
+        suite = _last_execution_suite or infer_suite(graph_data.get('nodes') or [])
+        _normalize_graph_data(graph_data, suite=suite)
         ctx = TrackingContext()
+        suite = _current_suite()
         events = []
         for event in ctx.events:
-            events.append(_to_timeline_event(event))
-        return jsonify({'graph': graph_data, 'summary': summary, 'events': events})
+            events.append(_to_timeline_event(event, suite))
+        return jsonify({'graph': graph_data, 'summary': summary, 'events': events, 'suite': suite})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -314,62 +383,7 @@ def api_get_graph():
 @app.route('/api/risk-cards', methods=['GET'])
 def api_get_risk_cards():
     try:
-        ctx = TrackingContext()
-        risk_cards = []
-        for event in ctx.events:
-            block_reason = event.get('block_reason', '')
-            if block_reason:
-                ring = _infer_ring(block_reason)
-                
-                # 从 defense_diagnostics 中提取结构化防御诊断信息
-                defense_diag = event.get('defense_diagnostics', {})
-                before_diag = defense_diag.get('before', {})
-                after_diag = defense_diag.get('after', {})
-                
-                # 构建防御环节详情
-                defense_ring = _get_ring_title(ring)
-                defense_action = "阻断"  # 默认动作
-                
-                # 根据触发的 Ring 确定防御动作和效果
-                if ring == 1:
-                    ring1_info = after_diag.get('ring_1', {})
-                    safety_score = ring1_info.get('safety_score', 0)
-                    detection_method = ring1_info.get('detection_method', 'unknown')
-                    defense_action = "阻断"
-                    defense_detail = f"检测到提示注入 | 安全评分: {safety_score:.2f} | 检测方式: {detection_method}"
-                    defense_effect = f"阻止了注入内容通过 {event.get('tool_intent', 'unknown')} 传播给 LLM"
-                elif ring == 2:
-                    ring2_info = before_diag.get('ring_2', {})
-                    similarity_score = ring2_info.get('similarity_score', 0)
-                    similarity_method = ring2_info.get('similarity_method', 'unknown')
-                    user_intent = ring2_info.get('user_intent', '')
-                    defense_action = "阻断"
-                    defense_detail = f"意图一致性检查未通过 | 相似度: {similarity_score:.2f} | 检测方式: {similarity_method}"
-                    defense_effect = f"检测到工具调用 {event.get('tool_intent', 'unknown')} 的参数可能受注入内容影响，与用户原始意图不符"
-                elif ring == 3:
-                    ring3_info = after_diag.get('ring_3', {})
-                    redacted = ring3_info.get('redacted', False)
-                    items_found = ring3_info.get('sensitive_items_found', 0)
-                    defense_action = "脱敏"
-                    defense_detail = f"检测到 {items_found} 个敏感数据项 | 已脱敏: {'是' if redacted else '否'}"
-                    defense_effect = f"对工具输出中的敏感信息进行了脱敏处理"
-                else:
-                    defense_detail = block_reason
-                    defense_effect = "未知防御效果"
-                
-                risk_cards.append({
-                    'ring': ring,
-                    'title': _get_ring_title(ring),
-                    'detail': block_reason,
-                    'agent': event.get('agent_id', 'unknown'),
-                    'action': event.get('tool_intent', 'unknown'),
-                    'app': event.get('target_app', 'unknown'),
-                    # 新增防御诊断详情字段
-                    'defense_ring': defense_ring,
-                    'defense_action': defense_action,
-                    'defense_detail': defense_detail,
-                    'defense_effect': defense_effect,
-                })
+        risk_cards = _build_risk_cards_from_events(TrackingContext().events, _current_suite())
         return jsonify(risk_cards)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -379,9 +393,10 @@ def api_get_risk_cards():
 def api_get_events():
     try:
         ctx = TrackingContext()
+        suite = _current_suite()
         events = []
         for event in ctx.events:
-            events.append(_to_timeline_event(event))
+            events.append(_to_timeline_event(event, suite))
         return jsonify(events)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -633,7 +648,7 @@ def _format_timestamp(timestamp: float) -> str:
     return dt.strftime('%H:%M:%S')
 
 
-def _format_event_content(event: dict) -> str:
+def _format_event_content(event: dict, suite: Optional[str] = None) -> str:
     event_type = event.get('type', '')
     block_reason = event.get('block_reason', '')
     if block_reason:
@@ -642,20 +657,20 @@ def _format_event_content(event: dict) -> str:
         prompt = event.get('prompt', '')
         return f'LLM 推理: {prompt[:50]}{"..." if len(prompt) > 50 else ""}'
     tool_intent = event.get('tool_intent', '')
-    target_app = event.get('target_app', '')
+    target_app = _canonical_app(event.get('target_app', ''), tool_intent, suite)
     if tool_intent:
         return f'工具调用: {tool_intent} ({target_app})'
     return '未知事件'
 
 
-def _to_timeline_event(event: dict) -> dict:
+def _to_timeline_event(event: dict, suite: Optional[str] = None) -> dict:
     """将原始 ctx 事件转换为时间线展示事件（含详细字段，供前端富展示）。"""
     event_type = event.get('type', '')
     is_risk = bool(event.get('block_reason'))
     item = {
         'time': _format_timestamp(event.get('timestamp', 0)),
         'type': 'risk' if is_risk else ('llm' if event_type == 'llm_interaction' else 'tool'),
-        'content': _format_event_content(event),
+        'content': _format_event_content(event, suite),
         'safe': not is_risk,
         'ring': _infer_ring(event.get('block_reason', '')) if is_risk else None,
     }
@@ -664,8 +679,9 @@ def _to_timeline_event(event: dict) -> dict:
         item['response'] = event.get('response', '')
         item['agent_id'] = event.get('agent_id', '')
     elif event_type in ('api_call_start', 'api_call_end'):
+        tool_intent = event.get('tool_intent', '')
         item['tool_intent'] = event.get('tool_intent', '')
-        item['target_app'] = event.get('target_app', '')
+        item['target_app'] = _canonical_app(event.get('target_app', ''), tool_intent, suite)
         item['status'] = event.get('status', '')
         item['outputs'] = event.get('outputs', '')
         item['block_reason'] = event.get('block_reason', '')
@@ -692,12 +708,76 @@ def _get_ring_title(ring: int) -> str:
     return titles.get(ring, f'Ring {ring}: 安全事件')
 
 
+def _build_risk_cards_from_events(events: list, suite: Optional[str] = None) -> list:
+    """从 TrackingContext 事件构建风险卡片（含防御诊断详情）。"""
+    risk_cards = []
+    for event in events:
+        block_reason = event.get('block_reason', '')
+        if not block_reason:
+            continue
+
+        ring = _infer_ring(block_reason)
+        defense_diag = event.get('defense_diagnostics', {}) or {}
+        before_diag = defense_diag.get('before', {}) or {}
+        after_diag = defense_diag.get('after', {}) or {}
+
+        defense_ring = _get_ring_title(ring)
+        defense_action = '阻断'
+
+        if ring == 1:
+            ring1_info = after_diag.get('ring_1', {}) or {}
+            safety_score = ring1_info.get('safety_score', 0) or 0
+            detection_method = ring1_info.get('detection_method', 'unknown')
+            defense_detail = f"检测到提示注入 | 安全评分: {safety_score:.2f} | 检测方式: {detection_method}"
+            defense_effect = f"阻止了注入内容通过 {event.get('tool_intent', 'unknown')} 传播给 LLM"
+        elif ring == 2:
+            ring2_info = before_diag.get('ring_2', {}) or {}
+            similarity_score = ring2_info.get('similarity_score', 0) or 0
+            similarity_method = ring2_info.get('similarity_method', 'unknown')
+            defense_detail = f"意图一致性检查未通过 | 相似度: {similarity_score:.2f} | 检测方式: {similarity_method}"
+            defense_effect = (
+                f"检测到工具调用 {event.get('tool_intent', 'unknown')} 的参数"
+                "可能受注入内容影响，与用户原始意图不符"
+            )
+        elif ring == 3:
+            ring3_info = after_diag.get('ring_3', {}) or {}
+            redacted = ring3_info.get('redacted', False)
+            items_found = ring3_info.get('sensitive_items_found', 0)
+            defense_action = '脱敏'
+            defense_detail = f"检测到 {items_found} 个敏感数据项 | 已脱敏: {'是' if redacted else '否'}"
+            defense_effect = "对工具输出中的敏感信息进行了脱敏处理"
+        else:
+            defense_detail = block_reason
+            defense_effect = '未知防御效果'
+
+        risk_cards.append({
+            'ring': ring,
+            'title': _get_ring_title(ring),
+            'detail': block_reason,
+            'agent': event.get('agent_id', 'unknown'),
+            'action': event.get('tool_intent', 'unknown'),
+            'app': _canonical_app(
+                event.get('target_app', 'unknown'),
+                event.get('tool_intent', ''),
+                suite,
+            ),
+            'defense_ring': defense_ring,
+            'defense_action': defense_action,
+            'defense_detail': defense_detail,
+            'defense_effect': defense_effect,
+        })
+    return risk_cards
+
+
 # ============================================================
 # 执行 API - 通过 AgentPipeline 真实调用 LLM + FunctionsRuntime
 # ============================================================
 
 def _reset_graph_and_context():
     """重置图谱和追踪上下文，确保新任务的调用链不会与旧任务混淆。"""
+    global _last_execution_suite
+    _last_execution_suite = None
+
     kg = KnowledgeGraph()
     kg.G.clear()
     kg.G.add_node(kg.agent_node, type="AIAgent", label="AgentDojo Agent")
@@ -715,8 +795,8 @@ def _execute_action_with_pipeline(action: str) -> Dict[str, Any]:
     预设场景只提供 prompt 文本，不预设任何工具调用。
     LLM 将根据可用工具列表自主决策调用哪些工具。
     
-    关键改进：使用 "unified" 模式，合并 workspace + banking 的所有工具，
-    让 LLM 可以自由调用任意 APP 的工具，实现真正的跨 APP 执行。
+    预设场景按其所属 suite 执行（workspace / banking / slack / travel），
+    保证工具与环境数据来自同一个 APP；自定义指令仍可使用 unified 模式跨 APP。
     
     每次执行前自动重置图谱和上下文，确保不同任务的调用链不会混淆。
     """
@@ -725,6 +805,8 @@ def _execute_action_with_pipeline(action: str) -> Dict[str, Any]:
         return {"error": f"未知操作: {action}"}
 
     prompt = mock_scenario["prompt"]
+    scenario_suite = mock_scenario.get("suite", "workspace")
+    app_name = scenario_suite if scenario_suite in APP_DOMAINS else "unified"
 
     # 自动重置，确保新任务的调用链独立
     _reset_graph_and_context()
@@ -739,8 +821,9 @@ def _execute_action_with_pipeline(action: str) -> Dict[str, Any]:
         return {"error": "LLM 未配置，请先设置 API Key"}
 
     try:
-        # 使用 "unified" 模式：合并 workspace + banking 的所有工具
-        return _execute_with_real_llm(prompt, ctx, now, agent_id, app_name="unified")
+        return _execute_with_real_llm(
+            prompt, ctx, now, agent_id, app_name=app_name, endpoint="/api/execute"
+        )
     except Exception as e:
         print(f"⚠️ 真实 LLM 执行失败: {e}")
         return {"error": f"LLM 执行失败: {str(e)}"}
@@ -751,12 +834,13 @@ def _execute_with_real_llm(
     prompt: str,
     ctx: TrackingContext, now: float, agent_id: str,
     app_name: str = 'workspace',
+    endpoint: str = '/api/execute',
 ) -> Dict[str, Any]:
     """
     通过 AgentPipeline 让 LLM 自主决策工具调用。
     
-    根据 app_name 选择对应的 runtime（workspace 或 banking）。
-    如果指定 app_name 的 pipeline 构建失败，尝试另一个。
+    根据 app_name 选择对应的 runtime（四个 suite 或 unified）。
+    如果指定 app_name 的 pipeline 构建失败，尝试另一个 suite。
     
     执行后：
     1. 将 LLM 推理和工具调用记录到 PROV 知识图谱
@@ -791,6 +875,12 @@ def _execute_with_real_llm(
     graph_data = get_graph_data()
     summary = get_graph_summary()
 
+    # 统一节点 APP 域：unified 模式按工具注册表路由，单 suite 模式直接使用 suite 名
+    execution_suite = app_name if app_name in APP_DOMAINS else None
+    global _last_execution_suite
+    _last_execution_suite = execution_suite
+    tool_app = _normalize_graph_data(graph_data, suite=execution_suite, runtime=runtime)
+
     # 从图谱中推断实际调用的 APP
     actual_apps = set()
     for node in graph_data.get('nodes', []):
@@ -814,32 +904,29 @@ def _execute_with_real_llm(
 
     events = []
     for event in ctx.events:
-        events.append(_to_timeline_event(event))
+        events.append(_to_timeline_event(event, execution_suite))
 
-    risk_cards = []
-    for event in ctx.events:
-        block_reason = event.get('block_reason', '')
-        if block_reason:
-            ring = _infer_ring(block_reason)
-            risk_cards.append({
-                'ring': ring,
-                'title': _get_ring_title(ring),
-                'detail': block_reason,
-                'agent': event.get('agent_id', 'unknown'),
-                'action': event.get('tool_intent', 'unknown'),
-                'app': event.get('target_app', 'unknown'),
-            })
+    risk_cards = _build_risk_cards_from_events(ctx.events, execution_suite)
 
     # 从实际执行结果（messages）构建追踪信息
     # 直接从 pipeline.query 返回的 messages 中提取 LLM 调用和工具调用
     trace_id = f"trace_{uuid.uuid4().hex[:8]}"
-    trace_steps = _build_trace_steps_from_messages(prompt, messages, now, blocked=blocked, block_reason=block_reason, ctx=ctx)
+    trace_steps = _build_trace_steps_from_messages(
+        prompt, messages, now,
+        blocked=blocked, block_reason=block_reason, ctx=ctx,
+        endpoint=endpoint,
+    )
 
     # 从 messages 中提取实际调用的工具
     actual_tools = []
     for msg in messages:
         if msg["role"] == "tool" and msg.get("tool_call"):
             tool_name = msg["tool_call"].function
+            if tool_name and tool_name not in actual_tools:
+                actual_tools.append(tool_name)
+    if not actual_tools:
+        for event in ctx.events:
+            tool_name = event.get('tool_intent')
             if tool_name and tool_name not in actual_tools:
                 actual_tools.append(tool_name)
 
@@ -852,7 +939,10 @@ def _execute_with_real_llm(
         if event.get('type') == 'api_call_end' and event.get('defense_diagnostics'):
             defense_audit.append({
                 'tool_intent': event.get('tool_intent', 'unknown'),
-                'target_app': event.get('target_app', 'unknown'),
+                'target_app': _canonical_app(
+                    event.get('target_app', 'unknown'),
+                    event.get('tool_intent', ''),
+                ),
                 'status': event.get('status', 'unknown'),
                 'defense_diagnostics': event.get('defense_diagnostics'),
             })
@@ -882,6 +972,9 @@ def _execute_with_real_llm(
         'actual_tools': actual_tools,
         'actual_apps': list(actual_apps),
         'graph_summary': summary,
+        'suite': execution_suite,
+        'tool_apps': tool_app,
+        'graph': graph_data,
         'risk_cards': risk_cards,
         'steps': trace_steps,
         'events': events,
@@ -895,6 +988,7 @@ def _execute_with_real_llm(
     return {
         'graph': graph_data,
         'summary': summary,
+        'suite': execution_suite,
         'events': events,
         'risk_cards': risk_cards,
         'action': f"LLM自主决策: {', '.join(actual_tools) if actual_tools else '未知'}",
@@ -919,7 +1013,15 @@ def _save_trace_to_file(trace_record: Dict[str, Any]):
         os.makedirs(traces_dir, exist_ok=True)
         trace_id = trace_record.get('trace_id', 'unknown')
         filename = os.path.join(traces_dir, f'{trace_id}.json')
-        trace_record['graph'] = get_graph_data()
+        if not trace_record.get('graph'):
+            trace_record['graph'] = get_graph_data()
+        graph = trace_record.get('graph') or {}
+        normalize_graph_nodes(
+            graph.get('nodes') or [],
+            graph.get('links') or [],
+            suite=trace_record.get('suite'),
+            tool_app=trace_record.get('tool_apps'),
+        )
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(trace_record, f, ensure_ascii=False, indent=2, default=str)
         _save_trace_to_memory(trace_record)
@@ -932,6 +1034,7 @@ def _build_trace_steps_from_messages(
     prompt: str, messages: list, now: float,
     blocked: bool = False, block_reason: str = "",
     ctx: Optional[TrackingContext] = None,
+    endpoint: str = "/api/execute",
 ) -> list:
     """
     从 pipeline.query 返回的 messages 中提取 LLM 调用和工具调用信息，
@@ -955,7 +1058,7 @@ def _build_trace_steps_from_messages(
             "step": 2,
             "name": "API 请求",
             "status": "completed",
-            "detail": f"POST /api/execute/custom -> {{prompt: \"{prompt[:50]}{'...' if len(prompt) > 50 else ''}\"}}",
+            "detail": f"POST {endpoint} -> {{prompt: \"{prompt[:50]}{'...' if len(prompt) > 50 else ''}\"}}",
             "timestamp": _format_timestamp(now + 0.1),
         },
         {
@@ -1132,21 +1235,41 @@ def _build_trace_steps_from_messages(
             # 被阻断时，从 ctx.events 中提取 LLM 推理内容
             llm_events = [e for e in ctx.events if e.get('type') == 'llm_interaction']
             if llm_events:
-                for le in llm_events:
-                    llm_prompt = le.get('prompt', '')
+                import re as _re
+
+                sorted_llms = sorted(llm_events, key=lambda e: e.get('timestamp', 0))
+                tool_events = sorted(
+                    [e for e in ctx.events if e.get('tool_intent')],
+                    key=lambda e: e.get('timestamp', 0),
+                )
+
+                for index, le in enumerate(sorted_llms):
                     llm_response = le.get('response', '')
-                    # 从 LLM 响应中提取工具调用信息
-                    tool_names = "未知"
-                    if llm_response:
-                        import re as _re
-                        tc_match = _re.search(r'<function=(\w+)>', llm_response)
-                        if tc_match:
-                            tool_names = tc_match.group(1)
+                    llm_ts = le.get('timestamp', 0)
+                    next_ts = (
+                        sorted_llms[index + 1].get('timestamp', float('inf'))
+                        if index + 1 < len(sorted_llms)
+                        else float('inf')
+                    )
+
+                    # 优先按时间窗口从工具事件推断本次推理实际调用的工具
+                    tool_names_list = []
+                    for tool_event in tool_events:
+                        tool_ts = tool_event.get('timestamp', 0)
+                        if llm_ts <= tool_ts < next_ts:
+                            name = tool_event.get('tool_intent')
+                            if name and name not in tool_names_list:
+                                tool_names_list.append(name)
+                    if not tool_names_list and llm_response:
+                        tool_names_list = _re.findall(r'<function=(\w+)>', llm_response)
+
+                    tool_names = ", ".join(tool_names_list) if tool_names_list else "无工具调用"
+                    reasoning = llm_response or "（无文本推理）"
                     llm_step = {
                         "step": step_num,
                         "name": "LLM 推理",
                         "status": "completed",
-                        "detail": f"LLM 决策: 调用 [{tool_names}] | 推理: \"{llm_response[:80]}{'...' if len(llm_response) > 80 else ''}\"",
+                        "detail": f"LLM 决策: 调用 [{tool_names}] | 推理: \"{reasoning[:80]}{'...' if len(reasoning) > 80 else ''}\"",
                         "timestamp": _format_timestamp(now + 0.3),
                     }
                     _with_node(llm_step, _next_invocation(), "AIModelInvocation")
@@ -1220,19 +1343,22 @@ def api_get_scenarios():
     """获取可用场景列表。
     
     场景从原版 agentdojo TaskSuite 动态加载，
-    包含 workspace 和 banking 的所有 user_tasks。
+    包含四个 suite（workspace / banking / slack / travel）的所有 user_tasks。
     """
     scenarios = []
     for key, scenario in MOCK_SCENARIOS.items():
         suite = scenario.get('suite', 'workspace')
         cross_app = scenario.get('cross_app', False)
+        cross_module = scenario.get('cross_module', False)
         scenarios.append({
             'id': key,
-            'name': f"{key} ({suite})",
+            'task_id': scenario.get('task_id', key),
+            'name': f"{scenario.get('task_id', key)} ({suite})",
             'description': scenario['description'],
             'is_risk': False,
             'is_sensitive': False,
             'cross_app': cross_app,
+            'cross_module': cross_module,
             'suite': suite,
         })
     return jsonify(scenarios)
@@ -1260,10 +1386,12 @@ def api_get_attack_user_tasks():
         for task_id, info in user_tasks.items():
             result.append({
                 "id": task_id,
+                "task_id": info.get("task_id", task_id),
                 "suite": info.get("suite", "workspace"),
                 "prompt": info["prompt"],
                 "description": info["description"],
                 "cross_app": info.get("cross_app", False),
+                "cross_module": info.get("cross_module", False),
             })
         return jsonify(result)
     except Exception as e:
@@ -1282,6 +1410,7 @@ def api_get_attack_injection_tasks():
         for task_id, info in injection_tasks.items():
             result.append({
                 "id": task_id,
+                "task_id": info.get("task_id", task_id),
                 "suite": info.get("suite", "workspace"),
                 "goal": info["goal"],
                 "description": info["description"],
@@ -1342,8 +1471,10 @@ def api_execute_attack():
         user_tasks = get_original_user_tasks()
         injection_tasks = get_original_injection_tasks()
         
-        ut_info = user_tasks.get(user_task_id)
-        inj_info = injection_tasks.get(injection_task_id)
+        ut_info = user_tasks.get(user_task_id) or user_tasks.get(f"{suite_name}::{user_task_id}")
+        inj_info = injection_tasks.get(injection_task_id) or injection_tasks.get(
+            f"{suite_name}::{injection_task_id}"
+        )
         
         if not ut_info:
             return jsonify({'error': f'未知 user_task: {user_task_id}'}), 400
@@ -1457,59 +1588,14 @@ def _execute_with_injected_env(
     # 重置环境，确保干净状态
     reset_all_environments()
     
-    # 获取对应 suite 的 runtime 和 env
-    app_name = suite_name  # workspace 或 banking
-    pipeline, runtime, env = _build_pipeline(app_name)
+    # 获取对应 suite 的 runtime，并按原版注入向量构建攻击环境
+    app_name = suite_name
+    pipeline, runtime, _ = _build_pipeline(app_name)
     if pipeline is None:
-        # 尝试 unified 模式
-        pipeline, runtime, env = _build_pipeline("unified")
-        if pipeline is None:
-            raise ValueError("Pipeline 构建失败，请检查 LLM 配置")
-    
-    # 注入：将 injection_string 注入到环境数据中
-    # 对于 workspace，注入到日历事件的描述中
-    # 对于 banking，注入到文件内容中
-    if suite_name == "workspace":
-        # 在日历事件的描述中追加注入字符串
-        # 这样当 LLM 查询日历时会看到注入指令
-        if hasattr(env, 'workspace') and env.workspace is not None:
-            target_env = env.workspace
-        else:
-            target_env = env
-        
-        if hasattr(target_env, 'calendar') and target_env.calendar is not None:
-            for event_id, event in target_env.calendar.events.items():
-                if hasattr(event, 'description') and event.description:
-                    event.description += f"\n\n{injection_string}"
-                    print(f"🔴 注入到日历事件 '{event.title}': {injection_string[:60]}...")
-                    break
-            else:
-                # 如果没有找到有描述的事件，注入到第一个事件
-                for event_id, event in target_env.calendar.events.items():
-                    event.description = (event.description or "") + f"\n\n{injection_string}"
-                    print(f"🔴 注入到日历事件 '{event.title}': {injection_string[:60]}...")
-                    break
-        
-        # 也注入到邮件中
-        if hasattr(target_env, 'inbox') and target_env.inbox is not None:
-            for email_id, email in target_env.inbox.emails.items():
-                if hasattr(email, 'body') and email.body:
-                    email.body += f"\n\n{injection_string}"
-                    print(f"🔴 注入到邮件 '{email.subject}': {injection_string[:60]}...")
-                    break
-    
-    elif suite_name == "banking":
-        if hasattr(env, 'banking') and env.banking is not None:
-            target_env = env.banking
-        else:
-            target_env = env
-        
-        # 注入到文件系统中
-        if hasattr(target_env, 'filesystem') and target_env.filesystem is not None:
-            for file_path, file_content in target_env.filesystem.files.items():
-                target_env.filesystem.files[file_path] = file_content + f"\n\n{injection_string}"
-                print(f"🔴 注入到文件 '{file_path}': {injection_string[:60]}...")
-                break
+        raise ValueError("Pipeline 构建失败，请检查 LLM 配置")
+
+    env = build_injected_environment(suite_name, injection_string)
+    print(f"[attack] 已按原版注入向量向 {suite_name} 注入攻击字符串")
     
     # 执行 prompt
     blocked = False
@@ -1526,7 +1612,14 @@ def _execute_with_injected_env(
     
     graph_data = get_graph_data()
     summary = get_graph_summary()
-    
+
+    execution_suite = app_name if app_name in APP_DOMAINS else (
+        suite_name if suite_name in APP_DOMAINS else None
+    )
+    global _last_execution_suite
+    _last_execution_suite = execution_suite
+    tool_app = _normalize_graph_data(graph_data, suite=execution_suite, runtime=runtime)
+
     # 从图谱中推断实际调用的 APP
     actual_apps = set()
     for node in graph_data.get('nodes', []):
@@ -1536,31 +1629,28 @@ def _execute_with_injected_env(
     
     events = []
     for event in ctx.events:
-        events.append(_to_timeline_event(event))
-    
-    risk_cards = []
-    for event in ctx.events:
-        block_reason = event.get('block_reason', '')
-        if block_reason:
-            ring = _infer_ring(block_reason)
-            risk_cards.append({
-                'ring': ring,
-                'title': _get_ring_title(ring),
-                'detail': block_reason,
-                'agent': event.get('agent_id', 'unknown'),
-                'action': event.get('tool_intent', 'unknown'),
-                'app': event.get('target_app', 'unknown'),
-            })
+        events.append(_to_timeline_event(event, execution_suite))
+
+    risk_cards = _build_risk_cards_from_events(ctx.events, execution_suite)
     
     # 从 messages 构建追踪步骤
     trace_id = f"trace_{uuid.uuid4().hex[:8]}"
-    trace_steps = _build_trace_steps_from_messages(prompt, messages, now, blocked=blocked, block_reason=block_reason, ctx=ctx)
+    trace_steps = _build_trace_steps_from_messages(
+        prompt, messages, now,
+        blocked=blocked, block_reason=block_reason, ctx=ctx,
+        endpoint="/api/execute/attack",
+    )
     
     # 从 messages 中提取实际调用的工具
     actual_tools = []
     for msg in messages:
         if msg["role"] == "tool" and msg.get("tool_call"):
             tool_name = msg["tool_call"].function
+            if tool_name and tool_name not in actual_tools:
+                actual_tools.append(tool_name)
+    if not actual_tools:
+        for event in ctx.events:
+            tool_name = event.get('tool_intent')
             if tool_name and tool_name not in actual_tools:
                 actual_tools.append(tool_name)
     
@@ -1570,7 +1660,10 @@ def _execute_with_injected_env(
         if event.get('type') == 'api_call_end' and event.get('defense_diagnostics'):
             defense_audit.append({
                 'tool_intent': event.get('tool_intent', 'unknown'),
-                'target_app': event.get('target_app', 'unknown'),
+                'target_app': _canonical_app(
+                    event.get('target_app', 'unknown'),
+                    event.get('tool_intent', ''),
+                ),
                 'status': event.get('status', 'unknown'),
                 'defense_diagnostics': event.get('defense_diagnostics'),
             })
@@ -1602,15 +1695,23 @@ def _execute_with_injected_env(
         'actual_tools': actual_tools,
         'actual_apps': list(actual_apps),
         'graph_summary': summary,
+        'suite': execution_suite,
+        'tool_apps': tool_app,
+        'graph': graph_data,
+        'risk_cards': risk_cards,
         'steps': trace_steps,
         'events': events,
         'defense_audit': defense_audit,
+        'blocked': blocked,
+        'block_reason': block_reason,
+        'total_steps': len(trace_steps),
     }
     _save_trace_to_file(trace_record)
     
     return {
         'graph': graph_data,
         'summary': summary,
+        'suite': execution_suite,
         'events': events,
         'risk_cards': risk_cards,
         'action': f"攻击场景: {', '.join(actual_tools) if actual_tools else '未知'}",
@@ -1679,8 +1780,12 @@ def api_execute_custom():
             return jsonify({'error': 'LLM 未配置，请先设置 API Key'}), 400
 
         try:
-            # 使用 "unified" 模式：合并 workspace + banking 的所有工具
-            return jsonify(_execute_with_real_llm(custom_prompt, ctx, now, agent_id, app_name="unified"))
+            # 使用 "unified" 模式：合并四个 suite 的所有工具
+            return jsonify(_execute_with_real_llm(
+                custom_prompt, ctx, now, agent_id,
+                app_name="unified",
+                endpoint="/api/execute/custom",
+            ))
         except Exception as e:
             print(f"⚠️ 真实 LLM 自定义执行失败: {e}")
             return jsonify({'error': f"LLM 执行失败: {str(e)}"}), 500
@@ -1719,6 +1824,35 @@ def api_reset():
             'status': 'reset_ok',
         })
 
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================
+# 存储视图 API —— 从“存储/环境数据”角度观察 suite 数据及其变化
+# ============================================================
+
+@app.route('/api/storage/suites', methods=['GET'])
+def api_storage_suites():
+    """列出四个 suite 的存储概要（当前状态 + 相对初始状态的变更数）。"""
+    try:
+        return jsonify({'suites': list_suite_storage()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/storage/suites/<suite_name>', methods=['GET'])
+def api_storage_suite(suite_name):
+    """获取指定 suite 的初始/当前快照与差异。
+
+    Query:
+        include: both | initial | current（默认 both）
+    """
+    include = request.args.get('include', 'both')
+    try:
+        return jsonify(get_suite_storage(suite_name, include))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

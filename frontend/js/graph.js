@@ -2,13 +2,11 @@
  * 拓扑图模块 - 使用 D3.js 渲染 PROV 知识图谱（结构化布局）
  *
  * 功能：
- * - 结构化固定布局：Prompt 节点在左、AIAgent 在中间、右侧按迭代顺序分行展示
- * - 每一行 = 一次 LLM 思考 → 工具调用 → 结果数据
- * - 行与行之间不连线（天然自上而下递进）
- * - 节点颜色/形状按类型编码
- * - 异常节点高亮（红色闪烁）
- * - 拖拽、缩放、平移
- * - 悬停高亮路径
+ * - 结构化布局：提示词 → 智能体 → 推理 → 输入数据 → 工具调用 → 输出数据
+ * - 卡片式节点：类型 / 标题 / 摘要分层展示
+ * - 列标题与迭代轮次（R1、R2…）引导
+ * - 关系分色、归属边可开关、悬停聚焦关联路径
+ * - 拖拽、缩放、平移、自适应画布
  * - 点击查看详情
  */
 
@@ -29,17 +27,45 @@ const GRAPH = {
     // 行号映射（node id → 迭代行下标），用于行间不连线过滤
     _nodeRow: new Map(),
 
+    // 当前图谱所属 suite（用于兼容旧 trace 的模块级 app 名）
+    _contextSuite: null,
+
     // 配置
     config: {
         width: 0,
         height: 0,
         showLabels: true,
-        nodeRadius: {
-            'AIAgent': 30,
-            'AIModelInvocation': 24,
-            'AgentTool': 22,
-            'Prompt': 18,
-            'DomainData': 20,
+        showBelongsTo: true,
+        maxCardWidth: 200,
+        typeLabels: {
+            'AIAgent': '智能体',
+            'AIModelInvocation': 'LLM 推理',
+            'AgentTool': '工具调用',
+            'Prompt': '用户提示',
+            'DomainData': '数据实体',
+        },
+        // APP 域 = 四个 TaskSuite（banking / workspace / slack / travel）
+        appColors: {
+            'system': '#6e7b8a',
+            'unified': '#6e7b8a',
+            'banking': '#3fb950',
+            'workspace': '#4f8cff',
+            'slack': '#a371f7',
+            'travel': '#e3b341',
+        },
+        appLabels: {
+            'system': '系统',
+            'unified': '统一',
+            'banking': '银行',
+            'workspace': '办公',
+            'slack': '通讯',
+            'travel': '旅行',
+        },
+        suiteLabels: {
+            'banking': '银行套件',
+            'workspace': '办公套件',
+            'slack': '通讯套件',
+            'travel': '旅行套件',
         },
         nodeColors: {
             'AIAgent': '#4f8cff',
@@ -47,13 +73,6 @@ const GRAPH = {
             'AgentTool': '#d4862b',
             'Prompt': '#d29922',
             'DomainData': '#a371f7',
-        },
-        nodeShapes: {
-            'AIAgent': 'circle',
-            'AIModelInvocation': 'diamond',
-            'AgentTool': 'rect',
-            'Prompt': 'roundRect',
-            'DomainData': 'ellipse',
         },
         linkColors: {
             'belongsTo': '#4f8cff',
@@ -98,13 +117,13 @@ const GRAPH = {
         this.defs = this.svg.append('defs');
         this._addDefs();
 
-        // 添加缩放行为
-        this.svg.call(d3.zoom()
+        // 添加缩放行为（保存实例，供重置/定位时复用）
+        this.zoomBehavior = d3.zoom()
             .scaleExtent([0.1, 4])
             .on('zoom', (event) => {
                 this.g && this.g.attr('transform', event.transform);
-            })
-        );
+            });
+        this.svg.call(this.zoomBehavior);
 
         this.g = this.svg.append('g');
 
@@ -134,6 +153,14 @@ const GRAPH = {
             this.config.showLabels = e.target.checked;
             this.updateLabels();
         });
+
+        const belongsToggle = document.getElementById('chkShowBelongsTo');
+        if (belongsToggle) {
+            belongsToggle.addEventListener('change', (e) => {
+                this.config.showBelongsTo = e.target.checked;
+                this.render();
+            });
+        }
     },
 
     /**
@@ -148,10 +175,10 @@ const GRAPH = {
             this.defs.append('marker')
                 .attr('id', `arrow-${type}`)
                 .attr('viewBox', '0 -5 10 10')
-                .attr('refX', 20)
+                .attr('refX', 10)
                 .attr('refY', 0)
-                .attr('markerWidth', 8)
-                .attr('markerHeight', 8)
+                .attr('markerWidth', 7)
+                .attr('markerHeight', 7)
                 .attr('orient', 'auto')
                 .append('path')
                 .attr('d', 'M0,-5L10,0L0,5')
@@ -171,7 +198,7 @@ const GRAPH = {
                 return;
             }
 
-            this.setData(data.graph.nodes, data.graph.links);
+            this.setData(data.graph.nodes, data.graph.links, { suite: data.suite || null });
             this.render();
 
             // 加载风险卡片
@@ -194,7 +221,9 @@ const GRAPH = {
     /**
      * 设置数据，确保节点引用一致性
      */
-    setData(newNodes, newLinks) {
+    setData(newNodes, newLinks, context = {}) {
+        this._contextSuite = context && context.suite ? context.suite : null;
+
         // 重建 nodeMap
         this.nodeMap = new Map();
         newNodes.forEach(n => this.nodeMap.set(n.id, n));
@@ -215,16 +244,586 @@ const GRAPH = {
     },
 
     /**
+     * 生成节点的卡片化展示信息（类型 / 标题 / 摘要 / 尺寸）。
+     */
+    _prepareNodeViews() {
+        const { nodes, links } = this;
+        const maxWidth = Math.max(96, Math.min(
+            this.config.maxCardWidth,
+            (this.config.width || 1200) * 0.17 - 12
+        ));
+        const thoughts = nodes.filter(n => n.type === 'AIModelInvocation');
+        const thoughtIndex = new Map(thoughts.map((n, i) => [n.id, i + 1]));
+        const producerByOutput = new Map();
+
+        const idOf = (value) => (value && typeof value === 'object') ? value.id : value;
+
+        links.forEach((link) => {
+            if (link.relation !== 'produces') return;
+            const source = this.nodeMap.get(idOf(link.source));
+            const target = this.nodeMap.get(idOf(link.target));
+            if (source && target && target.type === 'DomainData' && target.operation !== 'input') {
+                producerByOutput.set(target.id, source);
+            }
+        });
+
+        nodes.forEach((node) => {
+            const typeName = this.config.typeLabels[node.type] || node.type;
+            const color = this.config.nodeColors[node.type] || '#6e7b8a';
+            const canonicalApp = this._canonicalApp(node);
+            const appText = canonicalApp && canonicalApp !== 'unknown'
+                ? this._shortText(this._appLabel(canonicalApp), 8)
+                : '';
+            const appColor = this._appColor(canonicalApp);
+            const suite = node.suite || this._contextSuite || '';
+            const suiteLabel = this.config.suiteLabels[suite] || suite;
+            let title = node.label || node.id || typeName;
+            let subtitle = '';
+
+            if (node.type === 'AIAgent') {
+                title = node.label || 'AIAgent';
+                subtitle = '调度与决策中心';
+            } else if (node.type === 'Prompt') {
+                title = '用户指令';
+                subtitle = this._shortText(node.label || node.id || '', 40);
+            } else if (node.type === 'AIModelInvocation') {
+                title = `推理 #${thoughtIndex.get(node.id) || '?'}`;
+                const tools = links
+                    .filter(l => idOf(l.source) === node.id && l.relation === 'informed')
+                    .map(l => this.nodeMap.get(idOf(l.target)))
+                    .filter(n => n && n.type === 'AgentTool')
+                    .map(n => n.label || n.id);
+                subtitle = tools.length > 0
+                    ? tools.join(' · ')
+                    : this._shortText(node.label || '', 40);
+            } else if (node.type === 'AgentTool') {
+                title = node.label || node.id;
+                subtitle = node.module || node.app || '';
+            } else if (node.type === 'DomainData') {
+                if (node.operation === 'input') {
+                    title = '输入数据';
+                    subtitle = this._formatDataLabel(node.label) || node.entity_type || '调用参数';
+                } else if (node.operation === 'output') {
+                    title = '工具结果';
+                    const producer = producerByOutput.get(node.id);
+                    subtitle = producer
+                        ? `${producer.label || producer.id} 返回`
+                        : (node.entity_type || '执行输出');
+                } else {
+                    title = '数据实体';
+                    subtitle = this._formatDataLabel(node.label) || node.entity_type || '';
+                }
+            }
+
+            const charWidth = node.type === 'AgentTool' ? 5.8 : 6.4;
+            const longest = Math.max(title.length, subtitle.length);
+            const headWidth = typeName.length * 6.6 + (appText ? appText.length * 5.6 + 18 : 0) + 24;
+            const width = Math.max(96, Math.min(
+                maxWidth,
+                Math.round(Math.max(longest * charWidth + 34, headWidth))
+            ));
+            const titleChars = Math.max(8, Math.floor((width - 32) / charWidth));
+            const subtitleChars = Math.max(10, Math.floor((width - 32) / 5.4));
+            const viewTitle = this._shortText(title, titleChars);
+            const viewSubtitle = this._shortText(subtitle, subtitleChars);
+
+            node.__view = {
+                title: viewTitle,
+                subtitle: viewSubtitle,
+                full: node.label || node.id || title,
+                typeName,
+                color,
+                app: canonicalApp,
+                module: node.module || (node.app && node.app !== canonicalApp ? node.app : ''),
+                suite,
+                suiteLabel,
+                appText,
+                appColor,
+                width,
+                height: 46,
+            };
+        });
+    },
+
+    _shortText(text, max) {
+        const value = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+        return value.length > max ? `${value.slice(0, max)}…` : value;
+    },
+
+    _escapeHtml(text) {
+        return String(text == null ? '' : text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    },
+
+    /**
+     * 将 Python 字典形式的参数标签转换为易读文本。
+     */
+    _formatDataLabel(label) {
+        const text = String(label == null ? '' : label).trim();
+        if (!text) return '';
+        return this._shortText(
+            text.replace(/[{}'"]/g, '').replace(/:\s*/g, ': ').replace(/,\s*/g, ' · '),
+            40
+        );
+    },
+
+    _relationClass(relation) {
+        const map = {
+            'belongsTo': 'belongs-to',
+            'wasAssociatedWith': 'belongs-to',
+            'wasAttributedTo': 'belongs-to',
+            'informed': 'informed',
+            'wasInformedBy': 'informed',
+            'used': 'used',
+            'produces': 'produces',
+            'wasGeneratedBy': 'produces',
+            'wasDerivedFrom': 'derived',
+        };
+        return map[relation] || 'other';
+    },
+
+    _nodeClass(node) {
+        let cls = `node type-${String(node.type || 'unknown').toLowerCase()}`;
+        if (node.blocked) cls += ' abnormal';
+        if (node.is_sensitive) cls += ' sensitive';
+        if (!this.config.showLabels) cls += ' label-hidden';
+        return cls;
+    },
+
+    _linkGroupClass(link) {
+        let cls = `link-group link-${this._relationClass(link.relation)}`;
+        if (this._isContextLink(link)) cls += ' link-context';
+        if (this._isCrossAppLink(link)) cls += ' link-cross-app';
+        return cls;
+    },
+
+    /**
+     * APP 域配色：内置常用 APP，其余使用稳定哈希色。
+     */
+    _appColor(app) {
+        const key = String(app == null ? '' : app).trim();
+        if (!key || key === 'unknown') return '#6e7b8a';
+        if (this.config.appColors[key]) return this.config.appColors[key];
+
+        let hash = 0;
+        for (let i = 0; i < key.length; i++) {
+            hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+        }
+        return `hsl(${hash % 360}, 52%, 62%)`;
+    },
+
+    _appLabel(app) {
+        const key = String(app == null ? '' : app).trim();
+        return this.config.appLabels[key] || key || '未知';
+    },
+
+    /**
+     * 把旧的模块级 app 名（file_reader/email/calendar 等）兼容为 suite 级 APP 域。
+     */
+    _canonicalApp(node) {
+        const moduleName = String((node && node.module) || '').trim();
+        const raw = String((node && node.app) || '').trim();
+        const suites = ['system', 'banking', 'workspace', 'slack', 'travel'];
+        const moduleSuites = {
+            'system': ['system'],
+            'banking': ['banking'],
+            'banking_client': ['banking'],
+            'file_reader': ['banking'],
+            'user_account': ['banking'],
+            'email': ['workspace', 'travel'],
+            'email_client': ['workspace', 'travel'],
+            'calendar': ['workspace', 'travel'],
+            'calendar_client': ['workspace', 'travel'],
+            'cloud_drive': ['workspace'],
+            'cloud_drive_client': ['workspace'],
+            'slack': ['slack'],
+            'web': ['slack'],
+            'travel': ['travel'],
+            'travel_booking_client': ['travel'],
+        };
+        const contextSuite = String((node && node.suite) || this._contextSuite || '').trim();
+
+        const resolve = (key) => {
+            if (!key) return null;
+            if (suites.includes(key)) return key;
+            const owners = moduleSuites[key] || [];
+            if (contextSuite && owners.includes(contextSuite)) return contextSuite;
+            if (owners.length === 1) return owners[0];
+            if (owners.length > 1) return 'unified';
+            return null;
+        };
+
+        // 旧 trace 被 suite 级归一时会保留 module，优先使用 module
+        return resolve(moduleName) || resolve(raw) || raw || 'unknown';
+    },
+
+    /**
+     * 判断一条因果边是否跨越 APP（归属边只表示隶属关系，不计入跨 APP 调用）。
+     */
+    _isCrossAppLink(link) {
+        if (!link || !link.source || !link.target) return false;
+        if (link.relation === 'belongsTo'
+            || link.relation === 'wasAssociatedWith'
+            || link.relation === 'wasAttributedTo') {
+            return false;
+        }
+
+        const sourceApp = this._canonicalApp(link.source);
+        const targetApp = this._canonicalApp(link.target);
+        if (!sourceApp || !targetApp || sourceApp === 'unknown' || targetApp === 'unknown') {
+            return false;
+        }
+        // system（智能体/提示词）不属于四个业务 APP，system ↔ APP 不计跨 APP
+        if (sourceApp === 'system' || targetApp === 'system') {
+            return false;
+        }
+        return sourceApp !== targetApp;
+    },
+
+    /**
+     * 聚焦某个 APP 的全部节点与关联边。
+     */
+    _focusApp(app) {
+        const ids = new Set(
+            this.nodes.filter(n => this._canonicalApp(n) === app).map(n => n.id)
+        );
+
+        this.g.selectAll('.node')
+            .classed('dimmed', n => !ids.has(n.id))
+            .classed('focused', n => ids.has(n.id));
+
+        this.g.selectAll('.link-group')
+            .classed('dimmed', l => !(ids.has(l.source.id) || ids.has(l.target.id)))
+            .classed('highlighted', l => ids.has(l.source.id) || ids.has(l.target.id));
+
+        document.querySelectorAll('.app-flow-chip').forEach((chip) => {
+            chip.setAttribute('aria-pressed', chip.dataset.app === app ? 'true' : 'false');
+        });
+    },
+
+    /** Prompt → LLM 推理属于上下文传递，弱化显示 */
+    _isContextLink(link) {
+        return link
+            && link.relation === 'informed'
+            && link.source
+            && link.source.type === 'Prompt';
+    },
+
+    _linkMarker(link) {
+        if (!link || this._isContextLink(link)) return null;
+        if (link.relation === 'belongsTo' || link.relation === 'wasAssociatedWith' || link.relation === 'wasAttributedTo') {
+            return null;
+        }
+        return `url(#arrow-${link.relation})`;
+    },
+
+    _linkLabelText(link) {
+        const relation = this.config.relationLabels[link.relation] || link.relation;
+        return this._isCrossAppLink(link) ? `跨 APP · ${relation}` : relation;
+    },
+
+    /**
+     * 计算从节点中心指向目标方向时，卡片边界上的交点。
+     */
+    _boundaryPoint(from, to) {
+        const view = (from && from.__view) || { width: 96, height: 40 };
+        const dx = (to.x || 0) - (from.x || 0);
+        const dy = (to.y || 0) - (from.y || 0);
+        const hw = view.width / 2 || 48;
+        const hh = view.height / 2 || 20;
+        const scale = 1 / Math.max(Math.abs(dx) / hw, Math.abs(dy) / hh, 1e-6);
+        return {
+            x: (from.x || 0) + dx * scale,
+            y: (from.y || 0) + dy * scale,
+        };
+    },
+
+    /**
+     * 生成曲线路径，并记录标签位置。
+     */
+    _linkPath(link) {
+        if (!link.source || !link.target) return '';
+        const s = this._boundaryPoint(link.source, link.target);
+        const t = this._boundaryPoint(link.target, link.source);
+        const dx = t.x - s.x;
+        const dy = t.y - s.y;
+        const distance = Math.hypot(dx, dy) || 1;
+        const curvature = link.relation === 'belongsTo' ? 0.08 : (this._isContextLink(link) ? 0.06 : 0.12);
+        const cx = (s.x + t.x) / 2 - dy * curvature;
+        const cy = (s.y + t.y) / 2 + dx * curvature;
+
+        link.__labelPoint = {
+            x: (s.x + 2 * cx + t.x) / 4,
+            y: (s.y + 2 * cy + t.y) / 4,
+        };
+
+        return `M${s.x.toFixed(1)},${s.y.toFixed(1)} Q${cx.toFixed(1)},${cy.toFixed(1)} ${t.x.toFixed(1)},${t.y.toFixed(1)}`;
+    },
+
+    /**
+     * 统一刷新节点与边的位置。
+     */
+    _tick(linkSelection, nodeSelection) {
+        nodeSelection.attr('transform', d => `translate(${d.x || 0},${d.y || 0})`);
+
+        linkSelection.select('.link')
+            .attr('d', d => this._linkPath(d));
+
+        linkSelection.select('.link-label')
+            .attr('x', d => (d.__labelPoint ? d.__labelPoint.x : 0))
+            .attr('y', d => (d.__labelPoint ? d.__labelPoint.y : 0));
+
+        linkSelection.select('.link-app-hop')
+            .attr('cx', d => (d.__labelPoint ? d.__labelPoint.x : 0))
+            .attr('cy', d => (d.__labelPoint ? d.__labelPoint.y : -10));
+    },
+
+    /**
+     * 根据卡片信息刷新节点 DOM。
+     */
+    _updateNodeCard(selection, d) {
+        const view = d.__view || { width: 96, height: 46, title: d.id, subtitle: '', typeName: d.type, color: '#6e7b8a' };
+        const left = -view.width / 2;
+        const top = -view.height / 2;
+
+        selection.select('.node-card')
+            .attr('x', left)
+            .attr('y', top)
+            .attr('width', view.width)
+            .attr('height', view.height)
+            .attr('rx', 6);
+
+        selection.select('.node-accent')
+            .attr('x', left)
+            .attr('y', top)
+            .attr('width', 3)
+            .attr('height', view.height)
+            .attr('rx', 2)
+            .attr('fill', view.appColor || view.color);
+
+        selection.select('.node-type')
+            .attr('x', left + 12)
+            .attr('y', top + 15)
+            .attr('fill', view.color)
+            .text(view.typeName);
+
+        selection.select('.node-title')
+            .attr('x', left + 12)
+            .attr('y', top + 31)
+            .text(view.title);
+
+        selection.select('.node-subtitle')
+            .attr('x', left + 12)
+            .attr('y', top + 43)
+            .text(view.subtitle || '');
+
+        selection.select('.node-app')
+            .attr('x', left + view.width - 10)
+            .attr('y', top + 15)
+            .attr('text-anchor', 'end')
+            .attr('fill', view.appColor || '#6e7b8a')
+            .text(view.appText || '');
+
+        selection.select('title')
+            .text(`${view.typeName}${view.appText ? ` · ${view.appText}` : ''}${view.module ? ` · 模块 ${view.module}` : ''} · ${view.full}`);
+    },
+
+    /**
+     * 绘制列标题与迭代行背景，让结构更易读。
+     */
+    _renderStageGuides() {
+        const layer = this.g.selectAll('.stage-layer').data([null]);
+        const layerEnter = layer.enter()
+            .insert('g', ':first-child')
+            .attr('class', 'stage-layer');
+        const stage = layerEnter.merge(layer);
+
+        const columns = this._columns || [];
+        const colLabels = stage.selectAll('.stage-col-label').data(columns, d => d.key);
+        colLabels.exit().remove();
+        colLabels.enter()
+            .append('text')
+            .attr('class', 'stage-col-label')
+            .merge(colLabels)
+            .attr('x', d => d.x)
+            .attr('y', 20)
+            .attr('text-anchor', 'middle')
+            .text(d => d.label);
+
+        const rows = this._rows || [];
+        const bands = stage.selectAll('.stage-row-band').data(rows, d => d.idx);
+        bands.exit().remove();
+        bands.enter()
+            .append('rect')
+            .attr('class', 'stage-row-band')
+            .merge(bands)
+            .attr('class', d => `stage-row-band${d.idx % 2 === 1 ? ' alt' : ''}`)
+            .attr('x', d => d.left)
+            .attr('y', d => d.top)
+            .attr('width', d => d.width)
+            .attr('height', d => d.height)
+            .attr('rx', 6);
+
+        const rowLabels = stage.selectAll('.stage-row-label').data(rows, d => d.idx);
+        rowLabels.exit().remove();
+        rowLabels.enter()
+            .append('text')
+            .attr('class', 'stage-row-label')
+            .merge(rowLabels)
+            .attr('x', d => d.left - 10)
+            .attr('y', d => d.y + 3)
+            .attr('text-anchor', 'end')
+            .text(d => `R${d.idx + 1}`);
+    },
+
+    /**
+     * 按执行顺序渲染 APP 调用流程条。
+     * 行顺序来自结构化布局，因此时间维度不会被 APP 分组打乱。
+     */
+    _renderAppFlow() {
+        const container = document.getElementById('appFlow');
+        if (!container) return;
+
+        const segments = [];
+
+        (this._rows || []).forEach((row) => {
+            const tool = row.tool;
+            const app = tool ? this._canonicalApp(tool) : '';
+            if (!app || app === 'system') return;
+
+            const last = segments[segments.length - 1];
+            if (last && last.app === app) {
+                last.count += 1;
+            } else {
+                segments.push({ app, count: 1 });
+            }
+        });
+
+        if (segments.length === 0) {
+            container.hidden = true;
+            container.innerHTML = '';
+            return;
+        }
+
+        container.hidden = false;
+        container.innerHTML = '';
+
+        const title = document.createElement('span');
+        title.className = 'app-flow-title';
+        title.textContent = 'APP 调用顺序';
+        container.appendChild(title);
+
+        segments.forEach((segment, index) => {
+            if (index > 0) {
+                const arrow = document.createElement('span');
+                arrow.className = 'app-flow-arrow';
+                arrow.setAttribute('aria-hidden', 'true');
+                arrow.textContent = '→';
+                container.appendChild(arrow);
+            }
+
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = 'app-flow-chip';
+            chip.dataset.app = segment.app;
+            chip.setAttribute('aria-pressed', 'false');
+            chip.title = `点击聚焦 ${segment.app} 的节点与关联边`;
+            chip.style.setProperty('--app-color', this._appColor(segment.app));
+
+            const dot = document.createElement('span');
+            dot.className = 'app-flow-dot';
+
+            const name = document.createElement('span');
+            name.className = 'app-flow-name';
+            name.textContent = this._appLabel(segment.app);
+
+            const count = document.createElement('span');
+            count.className = 'app-flow-count';
+            count.textContent = `×${segment.count}`;
+
+            chip.append(dot, name, count);
+            chip.addEventListener('click', () => {
+                if (chip.getAttribute('aria-pressed') === 'true') {
+                    this.clearHighlight();
+                } else {
+                    this._focusApp(segment.app);
+                }
+            });
+
+            container.appendChild(chip);
+        });
+
+        const handoffs = segments.length - 1;
+        if (handoffs > 0) {
+            const summary = document.createElement('span');
+            summary.className = 'app-flow-summary';
+            summary.textContent = `跨 APP 切换 ${handoffs} 次`;
+            container.appendChild(summary);
+        }
+    },
+
+    /**
+     * 悬停节点：聚焦关联节点与边，弱化其余元素。
+     */
+    _focusNode(node) {
+        const relatedNodes = new Set([node.id]);
+        const relatedLinks = new Set();
+
+        this.links.forEach((link) => {
+            const sourceId = link.source ? (link.source.id || link.source) : null;
+            const targetId = link.target ? (link.target.id || link.target) : null;
+            if (sourceId === node.id || targetId === node.id) {
+                relatedLinks.add(link);
+                relatedNodes.add(sourceId);
+                relatedNodes.add(targetId);
+            }
+        });
+
+        this.g.selectAll('.node')
+            .classed('dimmed', n => !relatedNodes.has(n.id))
+            .classed('focused', n => n.id === node.id);
+
+        this.g.selectAll('.link-group')
+            .classed('dimmed', l => !relatedLinks.has(l))
+            .classed('highlighted', l => relatedLinks.has(l));
+    },
+
+    /**
+     * 悬停边：只聚焦这条边及其两端节点。
+     */
+    _focusLink(link) {
+        const sourceId = link.source ? (link.source.id || link.source) : null;
+        const targetId = link.target ? (link.target.id || link.target) : null;
+
+        this.g.selectAll('.link-group')
+            .classed('dimmed', l => l !== link)
+            .classed('highlighted', l => l === link);
+
+        this.g.selectAll('.node')
+            .classed('dimmed', n => n.id !== sourceId && n.id !== targetId)
+            .classed('focused', n => n.id === sourceId || n.id === targetId);
+    },
+
+    /**
      * 渲染拓扑图（结构化布局，增量更新模式）
      */
     render() {
         const self = this;
         const { nodes } = this;
 
-        // 1. 结构化布局：Prompt 左 / AIAgent 中 / 右侧按迭代顺序分行
+        // 1. 生成节点卡片信息并计算结构化布局
+        this._prepareNodeViews();
         this._computeStructuredLayout();
 
-        // 2. 过滤行间连线（行与行之间不连线，天然自上而下递进）
+        // 2. 绘制列标题与迭代行背景
+        this._renderStageGuides();
+        this._renderAppFlow();
+
+        // 3. 过滤行间连线
         const links = this._visibleLinks();
         this._renderLinks = links;
 
@@ -234,69 +833,56 @@ const GRAPH = {
         const linkGroup = this.g.selectAll('.link-group')
             .data(links, d => `${d.source.id || d.source}→${d.target.id || d.target}:${d.relation}`);
 
-        // 退出：移除旧边
         linkGroup.exit()
             .transition()
-            .duration(300)
+            .duration(200)
             .style('opacity', 0)
             .remove();
 
-        // 新增：创建新边
         const linkEnter = linkGroup.enter()
             .append('g')
-            .attr('class', 'link-group')
+            .attr('class', d => this._linkGroupClass(d))
             .style('opacity', 0);
 
-        // 边线
-        linkEnter.append('line')
+        linkEnter.append('path')
             .attr('class', 'link')
-            .attr('stroke', d => self.config.linkColors[d.relation] || '#5a6a7a')
-            .attr('stroke-width', 1.5)
-            .attr('stroke-dasharray', d => d.relation === 'wasInformedBy' ? '5,3' : 'none')
-            .attr('marker-end', d => {
-                const arrowRelations = ['used', 'produces', 'wasDerivedFrom', 'informed', 'belongsTo',
-                                       // 旧版兼容
-                                       'wasGeneratedBy', 'wasInformedBy', 'wasAssociatedWith'];
-                if (arrowRelations.includes(d.relation)) {
-                    return `url(#arrow-${d.relation})`;
-                }
-                return null;
-            });
+            .attr('stroke', d => (this._relationClass(d.relation) === 'belongs-to'
+                ? '#6e7b8a'
+                : (self.config.linkColors[d.relation] || '#5a6a7a')));
 
-        // 边标签
         linkEnter.append('text')
             .attr('class', 'link-label')
-            .text(d => self.config.relationLabels[d.relation] || d.relation)
-            .attr('dy', -8);
+            .attr('text-anchor', 'middle')
+            .attr('dy', -7)
+            .text(d => this._linkLabelText(d));
 
-        // 合并
+        linkEnter.append('circle')
+            .attr('class', 'link-app-hop')
+            .attr('r', 3.5);
+
         const link = linkEnter.merge(linkGroup);
+        link.attr('class', d => this._linkGroupClass(d));
+        link.select('.link').attr('marker-end', d => this._linkMarker(d));
+        link.select('.link-label').text(d => this._linkLabelText(d));
+        link.select('.link-app-hop').attr('fill', d => this._appColor(d.target && d.target.app));
 
-        // 新边淡入
         linkEnter.transition()
-            .duration(500)
+            .duration(300)
             .style('opacity', 1);
 
         // --- 增量更新节点 ---
         const node = this.g.selectAll('.node')
             .data(nodes, d => d.id);
 
-        // 退出：移除旧节点
         node.exit()
             .transition()
-            .duration(300)
+            .duration(200)
             .style('opacity', 0)
             .remove();
 
-        // 新增：创建新节点
         const nodeEnter = node.enter()
             .append('g')
-            .attr('class', d => {
-                let cls = 'node';
-                if (d.blocked) cls += ' abnormal';
-                if (d.is_sensitive) cls += ' sensitive';
-                return cls;
-            })
+            .attr('class', d => this._nodeClass(d))
             .style('opacity', 0)
             .call(d3.drag()
                 .on('start', (event, d) => {
@@ -310,134 +896,58 @@ const GRAPH = {
                 })
                 .on('end', (event, d) => {
                     if (!event.active) self.simulation.alphaTarget(0);
-                    // 拖拽结束后固定在当前位置，直到下一次自动布局
                     d.fx = d.x;
                     d.fy = d.y;
                 })
             );
 
-        // 节点形状：节点类型通过形状与颜色编码
-        nodeEnter.each(function(d) {
-            const el = d3.select(this);
-            const r = self.config.nodeRadius[d.type] || 16;
-            const color = self.config.nodeColors[d.type] || '#6e7b8a';
+        nodeEnter.append('title');
+        nodeEnter.append('rect').attr('class', 'node-card');
+        nodeEnter.append('rect').attr('class', 'node-accent');
+        nodeEnter.append('text').attr('class', 'node-type');
+        nodeEnter.append('text').attr('class', 'node-app');
+        nodeEnter.append('text').attr('class', 'node-title');
+        nodeEnter.append('text').attr('class', 'node-subtitle');
 
-            switch (self.config.nodeShapes[d.type]) {
-                case 'diamond':
-                    el.append('polygon')
-                        .attr('points', `0,${-r} ${r},0 0,${r} ${-r},0`)
-                        .attr('fill', color);
-                    break;
-                case 'rect':
-                    el.append('rect')
-                        .attr('x', -r * 1.2)
-                        .attr('y', -r * 0.8)
-                        .attr('width', r * 2.4)
-                        .attr('height', r * 1.6)
-                        .attr('rx', 4)
-                        .attr('fill', color);
-                    break;
-                case 'roundRect':
-                    el.append('rect')
-                        .attr('x', -r * 1.4)
-                        .attr('y', -r * 0.7)
-                        .attr('width', r * 2.8)
-                        .attr('height', r * 1.4)
-                        .attr('rx', r * 0.7)
-                        .attr('fill', color);
-                    break;
-                case 'ellipse':
-                    el.append('ellipse')
-                        .attr('rx', r * 1.3)
-                        .attr('ry', r * 0.9)
-                        .attr('fill', color);
-                    break;
-                default: // circle
-                    el.append('circle')
-                        .attr('r', r)
-                        .attr('fill', color);
-            }
-        });
-
-        // 节点标签
-        nodeEnter.append('text')
-            .attr('dy', d => {
-                const r = self.config.nodeRadius[d.type] || 16;
-                return r + 16;
-            })
-            .attr('text-anchor', 'middle')
-            .text(d => d.type === 'DomainData' && d.operation === 'output' ? '' : (d.label || d.id))
-            .attr('class', d => self.config.showLabels ? 'node-label' : 'label-hidden');
-
-        // 合并
         const nodeMerged = nodeEnter.merge(node);
 
-        // 新节点淡入
-        nodeEnter.transition()
-            .duration(500)
-            .style('opacity', 1);
-
-        // 更新现有节点的类
-        nodeMerged.attr('class', d => {
-            let cls = 'node';
-            if (d.blocked) cls += ' abnormal';
-            if (d.is_sensitive) cls += ' sensitive';
-            return cls;
+        nodeMerged.attr('class', d => this._nodeClass(d));
+        nodeMerged.each(function (d) {
+            self._updateNodeCard(d3.select(this), d);
         });
 
+        nodeEnter.transition()
+            .duration(300)
+            .style('opacity', 1);
+
         // --- 交互事件 ---
-        // 悬停高亮路径
         nodeMerged.on('mouseenter', function(event, d) {
-            self.highlightPath(d);
+            self._focusNode(d);
         });
 
         nodeMerged.on('mouseleave', function() {
             self.clearHighlight();
         });
 
-        // 点击查看详情
         nodeMerged.on('click', function(event, d) {
             self.showNodeDetail(d);
         });
 
-        // 边悬停
         link.on('mouseenter', function(event, d) {
-            d3.select(this).select('.link').classed('highlighted', true);
+            self._focusLink(d);
         });
 
         link.on('mouseleave', function() {
-            d3.select(this).select('.link').classed('highlighted', false);
+            self.clearHighlight();
         });
 
-        // --- 力导向模拟的 tick 事件（节点位置已固定，主要支撑拖拽） ---
+        // --- 位置刷新（布局固定，tick 用于拖拽与曲线重算） ---
         this.simulation.on('tick', null);
         this.simulation.on('tick', () => {
-            // 更新边位置
-            link.select('.link')
-                .attr('x1', d => d.source ? d.source.x : 0)
-                .attr('y1', d => d.source ? d.source.y : 0)
-                .attr('x2', d => d.target ? d.target.x : 0)
-                .attr('y2', d => d.target ? d.target.y : 0);
-
-            link.select('.link-label')
-                .attr('x', d => (d.source && d.target) ? (d.source.x + d.target.x) / 2 : 0)
-                .attr('y', d => (d.source && d.target) ? (d.source.y + d.target.y) / 2 : 0);
-
-            // 更新节点位置
-            nodeMerged.attr('transform', d => `translate(${d.x || 0},${d.y || 0})`);
+            self._tick(link, nodeMerged);
         });
 
-        // 节点已由 fx/fy 固定，直接按布局位置渲染
-        nodeMerged.attr('transform', d => `translate(${d.x || 0},${d.y || 0})`);
-        link.select('.link')
-            .attr('x1', d => d.source ? d.source.x : 0)
-            .attr('y1', d => d.source ? d.source.y : 0)
-            .attr('x2', d => d.target ? d.target.x : 0)
-            .attr('y2', d => d.target ? d.target.y : 0);
-        link.select('.link-label')
-            .attr('x', d => (d.source && d.target) ? (d.source.x + d.target.x) / 2 : 0)
-            .attr('y', d => (d.source && d.target) ? (d.source.y + d.target.y) / 2 : 0);
-
+        this._tick(link, nodeMerged);
     },
 
     /**
@@ -456,6 +966,8 @@ const GRAPH = {
         const thoughts = nodes.filter(n => isType(n, 'AIModelInvocation'));
         const tools = nodes.filter(n => isType(n, 'AgentTool'));
         const dataNodes = nodes.filter(n => isType(n, 'DomainData'));
+        // 图谱节点按捕获顺序排列，可用于恢复工具的真实执行顺序
+        const nodeOrder = new Map(nodes.map((node, index) => [node.id, index]));
 
         // 收集工具对应的数据节点（输入 used / 输出 produces）
         const rowResultsFor = (tool) => {
@@ -465,7 +977,10 @@ const GRAPH = {
             const inputs = links
                 .filter(l => l.source && l.target && l.target.id === tool.id && l.relation === 'used' && isType(l.source, 'DomainData'))
                 .map(l => l.source);
-            return [...inputs, ...outputs];
+            return {
+                inputs: [...new Set(inputs)],
+                outputs: [...new Set(outputs)],
+            };
         };
 
         // 构建迭代行：思考 → 工具 → 结果
@@ -486,13 +1001,20 @@ const GRAPH = {
                         .filter(l => l.source && l.target && l.source.id === dataNode.id && l.relation === 'used' && isType(l.target, 'AgentTool'))
                         .map(l => l.target)
                 );
-            const rowTools = [...new Set([...directTools, ...viaDataTools])];
+            const rowTools = [...new Set([...directTools, ...viaDataTools])]
+                .sort((a, b) => (nodeOrder.get(a.id) ?? 0) - (nodeOrder.get(b.id) ?? 0));
             if (rowTools.length === 0) {
-                rows.push({ thought: thought, tool: null, results: [] });
+                rows.push({ thought, tool: null, inputs: [], outputs: [] });
             } else {
                 for (const tool of rowTools) {
                     usedTools.add(tool.id);
-                    rows.push({ thought: thought, tool: tool, results: rowResultsFor(tool) });
+                    const results = rowResultsFor(tool);
+                    rows.push({
+                        thought,
+                        tool,
+                        inputs: results.inputs,
+                        outputs: results.outputs,
+                    });
                 }
             }
         }
@@ -500,28 +1022,65 @@ const GRAPH = {
         // 没有关联思考的工具 → 单独成行
         for (const tool of tools) {
             if (usedTools.has(tool.id)) continue;
-            rows.push({ thought: null, tool: tool, results: rowResultsFor(tool) });
+            const results = rowResultsFor(tool);
+            rows.push({
+                thought: null,
+                tool,
+                inputs: results.inputs,
+                outputs: results.outputs,
+            });
         }
 
         // 兜底：没有任何行的数据节点
         const usedData = new Set();
-        rows.forEach(r => r.results.forEach(d => usedData.add(d.id)));
+        rows.forEach(r => {
+            r.inputs.forEach(d => usedData.add(d.id));
+            r.outputs.forEach(d => usedData.add(d.id));
+        });
         const leftoverData = dataNodes.filter(d => !usedData.has(d.id));
         if (rows.length === 0 && leftoverData.length > 0) {
-            rows.push({ thought: null, tool: null, results: leftoverData });
+            rows.push({ thought: null, tool: null, inputs: leftoverData, outputs: [] });
         }
 
-        // 列位置
-        const colPrompt = w * 0.10;
-        const colAgent = w * 0.30;
-        const colThought = w * 0.50;
+        // 列位置：提示词 → 智能体 → 推理 → 输入数据 → 工具 → 输出数据
+        const colPrompt = w * 0.08;
+        const colAgent = w * 0.24;
+        const colThought = w * 0.40;
+        const colInput = w * 0.56;
         const colTool = w * 0.72;
-        const colData = w * 0.92;
+        const colOutput = w * 0.88;
 
-        const centerY = h / 2;
+        this._columns = [
+            { key: 'prompt', x: colPrompt, label: '提示词' },
+            { key: 'agent', x: colAgent, label: '智能体' },
+            { key: 'thought', x: colThought, label: '推理' },
+            { key: 'input', x: colInput, label: '输入数据' },
+            { key: 'tool', x: colTool, label: '工具调用' },
+            { key: 'output', x: colOutput, label: '输出数据' },
+        ];
+
+        const topMargin = 64;
+        const bottomMargin = 24;
         const rowCount = Math.max(1, rows.length);
-        const rowGap = Math.min(150, Math.max(70, (h * 0.82) / rowCount));
-        const rowStart = centerY - (rowGap * (rowCount - 1)) / 2;
+        const usableHeight = Math.max(160, h - topMargin - bottomMargin);
+        const rowGap = Math.min(132, Math.max(64, usableHeight / rowCount));
+        const rowStart = topMargin + Math.max(0, (usableHeight - rowGap * (rowCount - 1)) / 2);
+        const centerY = topMargin + usableHeight / 2;
+
+        // 行背景与行号的几何信息
+        const bandLeft = colThought - 64;
+        this._rows = rows.map((row, idx) => ({
+            idx,
+            thought: row.thought,
+            tool: row.tool,
+            inputs: row.inputs,
+            outputs: row.outputs,
+            y: rowStart + idx * rowGap,
+            left: bandLeft,
+            top: rowStart + idx * rowGap - rowGap / 2 + 5,
+            width: Math.max(140, w - 14 - bandLeft),
+            height: Math.max(40, rowGap - 10),
+        }));
 
         // 行号映射（首次认领，避免同一节点被多个行覆盖归属）
         this._nodeRow = new Map();
@@ -530,7 +1089,8 @@ const GRAPH = {
         rows.forEach((row, idx) => {
             mark(row.thought, idx);
             mark(row.tool, idx);
-            row.results.forEach(d => mark(d, idx));
+            row.inputs.forEach(d => mark(d, idx));
+            row.outputs.forEach(d => mark(d, idx));
         });
 
         // Prompt 节点：左列
@@ -559,12 +1119,16 @@ const GRAPH = {
                 row.tool.fx = colTool; row.tool.fy = y;
             }
 
-            const results = row.results.filter(x => x && this._nodeRow.get(x.id) === idx);
-            results.forEach((d, k) => {
-                const offset = results.length === 1 ? 0 : (k - (results.length - 1) / 2) * 44;
-                d.x = colData; d.y = y + offset;
-                d.fx = colData; d.fy = y + offset;
-            });
+            const placeColumn = (list, x) => {
+                const claimed = list.filter(d => d && this._nodeRow.get(d.id) === idx);
+                claimed.forEach((d, k) => {
+                    const offset = claimed.length === 1 ? 0 : (k - (claimed.length - 1) / 2) * 54;
+                    d.x = x; d.y = y + offset;
+                    d.fx = x; d.fy = y + offset;
+                });
+            };
+            placeColumn(row.inputs, colInput);
+            placeColumn(row.outputs, colOutput);
         });
 
         // 兜底：未被布局的节点
@@ -581,14 +1145,14 @@ const GRAPH = {
      * 过滤行间连线：行与行之间不连线（天然自上而下递进）
      */
     _visibleLinks() {
-        const row = this._nodeRow || new Map();
         return this.links.filter(l => {
-            const s = l.source ? (l.source.id || l.source) : null;
-            const t = l.target ? (l.target.id || l.target) : null;
-            const rs = row.get(s);
-            const rt = row.get(t);
-            // 两个端点都在行内且行号不同 → 隐藏（行间不连线）
-            if (rs != null && rt != null && rs !== rt) return false;
+            // 归属边默认弱化显示，可按需关闭，减少中心区域的放射状连线
+            if (!this.config.showBelongsTo
+                && (l.relation === 'belongsTo'
+                    || l.relation === 'wasAssociatedWith'
+                    || l.relation === 'wasAttributedTo')) {
+                return false;
+            }
             return true;
         });
     },
@@ -597,40 +1161,22 @@ const GRAPH = {
      * 高亮节点的关联路径
      */
     highlightPath(d) {
-        const nodeId = d.id;
-
-        // 高亮所有关联边
-        this.g.selectAll('.link-group')
-            .filter(l => {
-                const sourceId = l.source ? (l.source.id || l.source) : null;
-                const targetId = l.target ? (l.target.id || l.target) : null;
-                return sourceId === nodeId || targetId === nodeId;
-            })
-            .select('.link')
-            .classed('highlighted', true);
-
-        // 高亮关联节点
-        this.g.selectAll('.node')
-            .filter(n => {
-                if (n.id === nodeId) return true;
-                return this.links.some(l => {
-                    const sourceId = l.source ? (l.source.id || l.source) : null;
-                    const targetId = l.target ? (l.target.id || l.target) : null;
-                    return (sourceId === nodeId && targetId === n.id) ||
-                           (targetId === nodeId && sourceId === n.id);
-                });
-            })
-            .select('circle, polygon, rect, ellipse')
-            .attr('stroke-width', 4);
+        this._focusNode(d);
     },
 
     /**
      * 清除高亮
      */
     clearHighlight() {
-        this.g.selectAll('.link-group').select('.link').classed('highlighted', false);
-        this.g.selectAll('.node').select('circle, polygon, rect, ellipse')
-            .attr('stroke-width', 2);
+        this.g.selectAll('.node')
+            .classed('dimmed', false)
+            .classed('focused', false);
+        this.g.selectAll('.link-group')
+            .classed('dimmed', false)
+            .classed('highlighted', false);
+        document.querySelectorAll('.app-flow-chip').forEach((chip) => {
+            chip.setAttribute('aria-pressed', 'false');
+        });
     },
 
     /**
@@ -763,12 +1309,22 @@ const GRAPH = {
         }
 
         if (d.app) {
+            const appDomain = this._canonicalApp(d);
+            const rawModule = d.module || (d.app !== appDomain ? d.app : '');
             html += `
                 <div class="detail-field">
-                    <span class="label">所属 APP</span>
-                    <div class="value">${d.app}</div>
+                    <span class="label">APP 域</span>
+                    <div class="value">${this._escapeHtml(this._appLabel(appDomain))}</div>
                 </div>
             `;
+            if (rawModule) {
+                html += `
+                    <div class="detail-field">
+                        <span class="label">工具模块</span>
+                        <div class="value">${this._escapeHtml(rawModule)}</div>
+                    </div>
+                `;
+            }
         }
 
         if (d.is_sensitive) {
@@ -908,18 +1464,52 @@ const GRAPH = {
      * 更新标签显示
      */
     updateLabels() {
-        this.g.selectAll('.node .node-label')
-            .attr('class', d => this.config.showLabels ? 'node-label' : 'label-hidden');
+        this.g.selectAll('.node')
+            .classed('label-hidden', !this.config.showLabels);
     },
 
     /**
-     * 重置视图
+     * 缩放至适合当前画布
      */
     resetView() {
-        this.svg.transition().duration(500).call(
-            d3.zoom().transform,
-            d3.zoomIdentity
+        if (!this.nodes.length) {
+            this.svg.transition().duration(300).call(
+                this.zoomBehavior.transform,
+                d3.zoomIdentity
+            );
+            return;
+        }
+
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+
+        this.nodes.forEach((node) => {
+            const view = node.__view || { width: 96, height: 46 };
+            minX = Math.min(minX, (node.x || 0) - view.width / 2);
+            maxX = Math.max(maxX, (node.x || 0) + view.width / 2);
+            minY = Math.min(minY, (node.y || 0) - view.height / 2);
+            maxY = Math.max(maxY, (node.y || 0) + view.height / 2);
+        });
+
+        const padding = 56;
+        const contentWidth = Math.max(1, maxX - minX);
+        const contentHeight = Math.max(1, maxY - minY);
+        const scale = Math.min(
+            1.6,
+            Math.max(0.25, Math.min(
+                (this.config.width - padding * 2) / contentWidth,
+                (this.config.height - padding * 2) / contentHeight
+            ))
         );
+        const centerX = (minX + maxX) / 2;
+        const centerY = (minY + maxY) / 2;
+        const transform = d3.zoomIdentity
+            .translate(this.config.width / 2 - scale * centerX, this.config.height / 2 - scale * centerY)
+            .scale(scale);
+
+        this.svg.transition().duration(400).call(this.zoomBehavior.transform, transform);
     },
 
     /**
@@ -958,24 +1548,14 @@ const GRAPH = {
             .translate(-node.x, -node.y);
 
         this.svg.transition().duration(400).call(
-            d3.zoom().transform,
+            this.zoomBehavior.transform,
             transform
         );
 
-        // 形状元素短暂描边高亮
-        const shapeEl = this.g.selectAll('.node')
-            .filter(n => n.id === nodeId)
-            .select('circle, polygon, rect, ellipse');
-
-        if (!shapeEl.empty()) {
-            shapeEl
-                .transition().duration(120)
-                .attr('stroke', '#f85149')
-                .attr('stroke-width', 4)
-                .transition().delay(650).duration(350)
-                .attr('stroke', '#0d1117')
-                .attr('stroke-width', 1.5);
-        }
+        // 短暂描边高亮
+        const nodeEl = this.g.selectAll('.node').filter(n => n.id === nodeId);
+        nodeEl.classed('flash', true);
+        setTimeout(() => nodeEl.classed('flash', false), 1100);
 
         this.showNodeDetail(node);
     }

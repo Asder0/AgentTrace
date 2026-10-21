@@ -238,7 +238,7 @@ class TraceLogger(Logger):
         if not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
         file = f"{directory}/{injection_task_id or 'none'}.json"
-        with open(file, "w") as f:
+        with open(file, "w", encoding="utf-8") as f:
             f.write(
                 json.dumps(
                     {

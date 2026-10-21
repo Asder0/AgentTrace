@@ -13,12 +13,14 @@ AgentTrace 在 AgentDojo 基准测试框架之上，通过 AOP 拦截器（Monke
 - **数据流追踪**：拦截 LLM 推理与工具调用，记录数据来源、去向与推理链路
 - **知识图谱建模**：基于 PROV-AGENT 模型（AIAgent / AIModelInvocation / AgentTool / Prompt / DomainData）
 - **可视化仪表盘**
-  - 结构化拓扑图：Prompt 在左、智能体居中、右侧按迭代顺序分行（思考 → 工具调用 → 结果）
-  - 事件时间线：LLM 思考内容与工具调用结果的完整历史
-  - 指令流转追踪：步骤级追踪，五类图谱节点均可点击查看详情
+  - 结构化拓扑图：卡片式节点，按“提示词 → 智能体 → 推理 → 输入数据 → 工具调用 → 输出数据”分列展示；节点带 APP 域标识，顶部 APP 流程条按执行顺序展示跨 APP 调用，支持点击聚焦
+  - 执行时间线：合并生命周期步骤与事件内容，展示完整 Prompt、LLM 推理、工具输出与阻断原因，支持拖拽调整高度并定位图谱节点
   - 风险卡片与防御审计
-  - 历史回放：每条记录保存当时的图谱快照与事件时间线
+  - 历史回放：每条记录保存当时的图谱快照与执行时间线
+  - 存储视图：按 suite 查看初始/当前环境数据（邮件、日历、云盘、银行账户、Slack、旅行），高亮 agent 执行造成的变更，支持搜索、仅显示变化与自动刷新
 - **多任务套件**：banking / workspace / slack / travel
+  - 图谱中的 APP 域即上述四个 task suite；file_reader / user_account / email / calendar 等是 suite 内部工具模块，作为模块信息展示；同一 suite 内的跨模块任务标记为“跨模块”
+  - 原版 benchmark 不含跨 APP 预设定任务（TaskCombinator 仅组合同一 suite 内的任务）；本项目提供 unified 模式与跨 APP 示例场景（如“读取未读邮件并查询银行余额”）
 
 ## 快速开始
 

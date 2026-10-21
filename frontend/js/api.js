@@ -306,7 +306,7 @@ const API = {
 
     /**
      * 获取所有可用的 user_tasks（用于攻击场景选择器）
-     * @returns {Promise<Array>} [{ id, suite, prompt, description, cross_app }]
+     * @returns {Promise<Array>} [{ id, suite, prompt, description, cross_app, cross_module }]
      */
     async getAttackUserTasks() {
         try {
@@ -369,6 +369,43 @@ const API = {
             return await response.json();
         } catch (err) {
             console.error('执行攻击场景失败:', err.message);
+            throw err;
+        }
+    },
+
+    // ============================================================
+    // 存储视图 API
+    // ============================================================
+
+    /**
+     * 获取四个 suite 的存储概要
+     * @returns {Promise<Object>} { suites: [...] }
+     */
+    async getStorageSuites() {
+        try {
+            const response = await fetch(`${this.BASE_URL}/storage/suites`);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return await response.json();
+        } catch (err) {
+            console.error('获取存储概要失败:', err.message);
+            throw err;
+        }
+    },
+
+    /**
+     * 获取指定 suite 的初始/当前快照与差异
+     * @param {string} suite
+     * @param {string} include - both | initial | current
+     * @returns {Promise<Object>}
+     */
+    async getStorageSuite(suite, include = 'both') {
+        try {
+            const url = `${this.BASE_URL}/storage/suites/${encodeURIComponent(suite)}?include=${encodeURIComponent(include)}`;
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return await response.json();
+        } catch (err) {
+            console.error('获取存储快照失败:', err.message);
             throw err;
         }
     },

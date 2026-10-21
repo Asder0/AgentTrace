@@ -66,53 +66,61 @@ const APP = {
      */
     async init() {
         console.log('[app] AgentDojo 数据流追踪控制台启动中...');
-        
+
         // 显示加载状态
         this._showLoading();
-        
-        try {
-            // 初始化各模块
-            GRAPH.init();
-            TIMELINE.init();
-            RISK_PANEL.init();
-            STATUS_PANEL.init();
-            TRACE_PANEL.init();
-            await CONSOLE.init();
 
-            
-            // 绑定导航标签切换
-            this._initTabs();
-            
-            // 绑定弹窗关闭
-            this._initModal();
-            
-            // 绑定重置按钮
-            this._initResetButton();
-            
-            // 初始化浮动面板交互
-            this._initFloatPanel();
-            
-            // 加载数据
+        // 各模块独立初始化，避免某个模块（例如 D3 加载失败）导致整个页面不可用
+        const failures = [];
+        const initModule = (name, fn) => {
+            try {
+                fn();
+            } catch (err) {
+                failures.push(name);
+                console.error(`[app] ${name} 初始化失败:`, err);
+            }
+        };
+
+        initModule('GRAPH', () => GRAPH.init());
+        initModule('TIMELINE', () => TIMELINE.init());
+        initModule('RISK_PANEL', () => RISK_PANEL.init());
+        initModule('STATUS_PANEL', () => STATUS_PANEL.init());
+        initModule('TRACE_PANEL', () => TRACE_PANEL.init());
+        initModule('STORAGE_VIEW', () => STORAGE_VIEW.init());
+
+        // 视图交互与模块无关，必须绑定
+        this._initTabs();
+        this._initModal();
+        this._initResetButton();
+        this._initFloatPanel();
+
+        try {
+            await CONSOLE.init();
+        } catch (err) {
+            failures.push('CONSOLE');
+            console.error('[app] CONSOLE 初始化失败:', err);
+        }
+
+        try {
             await GRAPH.loadData();
-            
-            // 更新状态
-            Store.set('loading', false);
             Store.set('lastNodeCount', GRAPH.nodes.length);
             Store.set('lastEdgeCount', GRAPH.links.length);
-            
-            // 隐藏加载状态
-            this._hideLoading();
-            
-            // 启动定时刷新（每 5 秒检查新数据）
-            this._startPolling();
-            
-            console.log('[app] 可视化平台启动完成');
         } catch (err) {
-            console.error('[app] 应用启动失败:', err);
-            this._showError('应用启动失败，请检查后端服务是否正常运行。');
-            Store.set('loading', false);
-            Store.set('error', err.message);
+            failures.push('GRAPH_DATA');
+            console.error('[app] 加载图谱数据失败:', err);
+            if (!GRAPH.simulation) {
+                this._showError('图谱数据加载失败：D3 或后端服务不可用，可视化图谱暂不可用。');
+            }
         }
+
+        Store.set('loading', false);
+        this._hideLoading();
+
+        if (GRAPH.simulation) {
+            this._startPolling();
+        }
+
+        console.log('[app] 可视化平台启动完成', failures.length > 0 ? `(部分模块失败: ${failures.join(', ')})` : '');
     },
 
     /**
@@ -189,7 +197,25 @@ const APP = {
         const graphPanel = document.querySelector('.graph-panel');
         const sidePanel = document.querySelector('.side-panel');
         const timelinePanel = document.querySelector('.timeline-panel');
-        
+        const mainContainer = document.querySelector('.main-container');
+        const storageView = document.getElementById('storageView');
+
+        if (tabName === 'storage') {
+            if (mainContainer) mainContainer.style.display = 'none';
+            if (timelinePanel) timelinePanel.style.display = 'none';
+            if (storageView) storageView.hidden = false;
+            document.getElementById('statusText').textContent = '存储';
+            document.querySelector('.status-dot').className = 'status-dot';
+            const hp = document.getElementById('historyListPanel');
+            if (hp) hp.classList.remove('visible');
+            if (typeof STORAGE_VIEW !== 'undefined') STORAGE_VIEW.activate();
+            return;
+        }
+
+        if (storageView) storageView.hidden = true;
+        if (typeof STORAGE_VIEW !== 'undefined') STORAGE_VIEW.deactivate();
+        if (mainContainer) mainContainer.style.display = 'flex';
+
         switch (tabName) {
             case 'monitor':
                 // 实时监控：显示所有面板
@@ -301,7 +327,7 @@ const APP = {
             console.error('[app] 加载历史记录失败:', err);
         }
         if (!trace) {
-            alert('历史记录加载失败');
+            this._showHistoryHint('历史记录加载失败，请刷新后重试');
             return;
         }
 
@@ -317,25 +343,14 @@ const APP = {
         if (!graph) {
             this._showHistoryHint('该历史记录未保存拓扑快照（旧版记录），仅显示事件与流转步骤');
         }
-        GRAPH.setData(nodes, links);
+        GRAPH.setData(nodes, links, { suite: this._resolveTraceSuite(trace) });
         GRAPH.render();
 
-        // 2. 事件时间线
+        // 2. 执行时间线（合并生命周期步骤与真实事件内容）
         const events = Array.isArray(trace.events) ? trace.events : [];
-        if (events.length > 0) {
-            TIMELINE.setEvents(events);
-        } else {
-            TIMELINE.clear();
-        }
+        TIMELINE.setTrace(trace, 'top');
 
-        // 3. 指令流转追踪
-        if (Array.isArray(trace.steps) && trace.steps.length > 0) {
-            TRACE_PANEL._renderTrace(trace);
-        } else {
-            TRACE_PANEL.clear();
-        }
-
-        // 4. 风险卡片与统计概览（使用历史快照，而不是实时数据）
+        // 3. 风险卡片与统计概览（使用历史快照，而不是实时数据）
         const riskCards = this._buildReplayRiskCards(trace);
         RISK_PANEL.render(riskCards);
 
@@ -351,8 +366,17 @@ const APP = {
         Store.set('lastNodeCount', nodeCount);
         Store.set('lastEdgeCount', edgeCount);
 
-        // 5. 进入回放模式：暂停实时轮询，避免快照被覆盖
+        // 4. 进入回放模式：暂停实时轮询，避免快照被覆盖
         this._enterReplayMode(trace);
+    },
+
+    /**
+     * 解析历史记录所属 suite（新版记录使用 suite 字段，旧记录退回 app_name）。
+     */
+    _resolveTraceSuite(trace) {
+        if (!trace) return null;
+        const suite = trace.suite || trace.app_name || '';
+        return ['banking', 'workspace', 'slack', 'travel'].includes(suite) ? suite : null;
     },
 
     /**
@@ -380,19 +404,45 @@ const APP = {
             const ring = Number.isFinite(event.ring) ? event.ring : 0;
             const title = ringTitles[ring] || `Ring ${ring}: 安全事件`;
             const detail = event.block_reason || event.content || '检测到风险事件';
+            const suite = this._resolveTraceSuite(trace);
             return {
                 ring,
                 title,
                 detail,
                 agent: event.agent_id || 'unknown',
                 action: event.tool_intent || 'unknown',
-                app: event.target_app || 'unknown',
+                app: this._canonicalAppName(event.target_app, suite) || 'unknown',
                 defense_ring: title,
                 defense_action: actions[ring] || '阻断',
                 defense_detail: detail,
                 defense_effect: '已由防御系统处理',
             };
         });
+    },
+
+    /**
+     * 兼容旧 trace 的模块级 APP 名。
+     */
+    _canonicalAppName(app, suite) {
+        const raw = String(app || '').trim();
+        if (!raw || raw === 'unknown') return raw || 'unknown';
+        if (['system', 'banking', 'workspace', 'slack', 'travel'].includes(raw)) return raw;
+
+        const moduleSuites = {
+            'banking': 'banking',
+            'banking_client': 'banking',
+            'file_reader': 'banking',
+            'user_account': 'banking',
+            'travel': 'travel',
+            'travel_booking_client': 'travel',
+        };
+        if (moduleSuites[raw]) return moduleSuites[raw];
+        if (['email', 'email_client', 'calendar', 'calendar_client'].includes(raw)) {
+            return suite || 'unified';
+        }
+        if (['cloud_drive', 'cloud_drive_client'].includes(raw)) return 'workspace';
+        if (['slack', 'web'].includes(raw)) return 'slack';
+        return raw;
     },
 
     /**
@@ -422,7 +472,6 @@ const APP = {
 
         Store.set('replaying', false);
         TIMELINE.clear();
-        TRACE_PANEL.clear();
 
         const statusText = document.getElementById('statusText');
         if (statusText) statusText.textContent = '实时';
@@ -621,6 +670,7 @@ const APP = {
                     Store.set('lastEdgeCount', 0);
                     // 重置后重新加载场景列表
                     await CONSOLE.loadScenarios();
+                    if (typeof STORAGE_VIEW !== 'undefined') STORAGE_VIEW.notifyDataChanged();
                 }
             });
             consoleCard.appendChild(resetBtn);
@@ -692,12 +742,28 @@ const APP = {
         }
 
         if (nodeDetail.app) {
+            const appLabels = {
+                'system': '系统',
+                'banking': '银行',
+                'workspace': '办公',
+                'slack': '通讯',
+                'travel': '旅行',
+                'unified': '统一',
+            };
             html += `
                 <div class="detail-field">
-                    <span class="label">所属 APP</span>
-                    <div class="value">${nodeDetail.app}</div>
+                    <span class="label">APP 域</span>
+                    <div class="value">${appLabels[nodeDetail.app] || nodeDetail.app}</div>
                 </div>
             `;
+            if (nodeDetail.module) {
+                html += `
+                    <div class="detail-field">
+                        <span class="label">工具模块</span>
+                        <div class="value">${nodeDetail.module}</div>
+                    </div>
+                `;
+            }
         }
 
         if (nodeDetail.is_sensitive) {
@@ -791,7 +857,7 @@ const APP = {
                         console.log(`[graph] 检测到新数据: +${newNodeCount - oldNodeCount} 节点, +${newEdgeCount - oldEdgeCount} 边`);
                         
                         // 使用 setData 确保引用一致性
-                        GRAPH.setData(data.graph.nodes, data.graph.links);
+                        GRAPH.setData(data.graph.nodes, data.graph.links, { suite: data.suite || null });
                         GRAPH.render();
                         
                         Store.set('lastNodeCount', newNodeCount);

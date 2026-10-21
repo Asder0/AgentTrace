@@ -53,7 +53,7 @@ DEFENSES = [
 def load_system_message(system_message_name: str | None) -> str:
     package_files = importlib.resources.files("agentdojo")
     path = package_files / "data" / "system_messages.yaml"
-    with importlib.resources.as_file(path) as p, p.open() as f:
+    with importlib.resources.as_file(path) as p, p.open(encoding="utf-8") as f:
         system_messages = yaml.safe_load(f)
     return system_messages.get(system_message_name, system_messages["default"])
 
