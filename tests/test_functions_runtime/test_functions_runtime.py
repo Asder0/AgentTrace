@@ -1,10 +1,24 @@
 import types
 from typing import Annotated
 
+import pytest
 from pydantic import BaseModel, Field
 
 from agentdojo.functions_runtime import Depends, EmptyEnv, FunctionCall, FunctionsRuntime, TaskEnvironment
 from agentdojo.strenum import StrEnum
+
+
+@pytest.fixture(autouse=True)
+def _disable_ring2_for_raw_runtime_tests():
+    """These tests exercise FunctionsRuntime, not Agent task authorization."""
+    from agentdojo.method.analysis.defense_config import (
+        reset_config,
+        set_method_enabled,
+    )
+
+    set_method_enabled("ring_2", "task_scope", False)
+    yield
+    reset_config()
 
 
 class ATestEnum(StrEnum):

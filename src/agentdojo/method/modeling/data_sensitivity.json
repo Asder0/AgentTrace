@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "default_level": "secret",
+  "apps": {
+    "workspace": {
+      "email": "confidential",
+      "email_contact": "confidential",
+      "cloud_drive_file": "confidential",
+      "calendar": "confidential",
+      "calendar_event": "confidential",
+      "current_date": "public",
+      "file": "confidential",
+      "filesystem": "confidential",
+      "user_account": "secret",
+      "inbox": "confidential",
+      "cloud_drive": "confidential"
+    },
+    "banking": {
+      "transaction": "secret",
+      "account": "secret",
+      "bank_account": "secret",
+      "file": "confidential",
+      "filesystem": "confidential",
+      "user_account": "secret"
+    },
+    "slack": {
+      "message": "confidential",
+      "channel": "internal",
+      "channel_member": "internal",
+      "slack_user": "internal",
+      "webpage": "internal",
+      "web": "internal",
+      "inbox": "confidential",
+      "slack": "internal"
+    },
+    "travel": {
+      "user": "secret",
+      "reservation": "confidential",
+      "email": "confidential",
+      "calendar_event": "confidential",
+      "calendar": "confidential",
+      "hotel": "internal",
+      "hotels": "internal",
+      "flight": "internal",
+      "flights": "internal",
+      "restaurant": "internal",
+      "restaurants": "internal",
+      "car_rental": "internal",
+      "car_rental_company": "internal",
+      "inbox": "confidential"
+    }
+  },
+  "environment_only_entities": {
+    "workspace": [
+      "inbox",
+      "calendar",
+      "cloud_drive",
+      "file",
+      "filesystem"
+    ],
+    "banking": [
+      "bank_account",
+      "filesystem"
+    ],
+    "slack": [
+      "web",
+      "slack",
+      "inbox"
+    ],
+    "travel": [
+      "calendar",
+      "hotels",
+      "flights",
+      "restaurants",
+      "car_rental",
+      "inbox"
+    ]
+  },
+  "entity_aliases": {
+    "workspace": {
+      "inbox": "email",
+      "calendar": "calendar_event",
+      "cloud_drive": "cloud_drive_file",
+      "file": "cloud_drive_file",
+      "filesystem": "cloud_drive_file"
+    },
+    "banking": {
+      "bank_account": "account",
+      "filesystem": "file"
+    },
+    "slack": {
+      "web": "webpage",
+      "slack": "message",
+      "inbox": "message"
+    },
+    "travel": {
+      "calendar": "calendar_event",
+      "hotels": "hotel",
+      "flights": "flight",
+      "restaurants": "restaurant",
+      "car_rental": "car_rental_company",
+      "inbox": "email"
+    }
+  },
+  "tool_output_entities": {
+    "get_unread_emails": "email",
+    "get_sent_emails": "email",
+    "get_received_emails": "email",
+    "get_draft_emails": "email",
+    "search_emails": "email",
+    "get_current_day": "current_date",
+    "search_calendar_events": "calendar_event",
+    "get_day_calendar_events": "calendar_event",
+    "create_calendar_event": "calendar_event",
+    "cancel_calendar_event": "calendar_event",
+    "reschedule_calendar_event": "calendar_event",
+    "add_calendar_event_participants": "calendar_event",
+    "send_email": "email",
+    "create_file": "cloud_drive_file",
+    "append_to_file": "cloud_drive_file",
+    "delete_file": "cloud_drive_file",
+    "delete_email": "email",
+    "share_file": "cloud_drive_file",
+    "get_webpage": "webpage",
+    "search_contacts_by_name": "email_contact",
+    "search_contacts_by_email": "email_contact",
+    "get_file_by_id": "cloud_drive_file",
+    "list_files": "cloud_drive_file",
+    "search_files": "cloud_drive_file",
+    "search_files_by_filename": "cloud_drive_file",
+    "read_file": "file",
+    "get_user_info": "user_account",
+    "update_user_info": "user_account",
+    "update_password": "user_account",
+    "send_money": "transaction",
+    "schedule_transaction": "transaction",
+    "update_scheduled_transaction": "transaction",
+    "get_balance": "account",
+    "get_iban": "account",
+    "get_most_recent_transactions": "transaction",
+    "get_scheduled_transactions": "transaction",
+    "get_channels": "channel",
+    "read_channel_messages": "message",
+    "read_inbox": "message",
+    "get_users_in_channel": "channel_member",
+    "add_user_to_channel": "channel_member",
+    "send_direct_message": "message",
+    "send_channel_message": "message",
+    "invite_user_to_slack": "slack_user",
+    "remove_user_from_slack": "slack_user",
+    "post_webpage": "webpage",
+    "get_user_information": "user",
+    "get_all_hotels_in_city": "hotel",
+    "get_hotels_prices": "hotel",
+    "get_hotels_address": "hotel",
+    "get_rating_reviews_for_hotels": "hotel",
+    "get_all_restaurants_in_city": "restaurant",
+    "get_restaurants_address": "restaurant",
+    "get_cuisine_type_for_restaurants": "restaurant",
+    "get_dietary_restrictions_for_all_restaurants": "restaurant",
+    "get_contact_information_for_restaurants": "restaurant",
+    "get_price_for_restaurants": "restaurant",
+    "check_restaurant_opening_hours": "restaurant",
+    "get_rating_reviews_for_restaurants": "restaurant",
+    "get_all_car_rental_companies_in_city": "car_rental_company",
+    "get_car_types_available": "car_rental_company",
+    "get_rating_reviews_for_car_rental": "car_rental_company",
+    "get_car_rental_address": "car_rental_company",
+    "get_car_fuel_options": "car_rental_company",
+    "get_car_price_per_day": "car_rental_company",
+    "get_flight_information": "flight",
+    "reserve_hotel": "reservation",
+    "reserve_restaurant": "reservation",
+    "reserve_car_rental": "reservation"
+  }
+}

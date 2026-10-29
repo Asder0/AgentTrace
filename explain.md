@@ -29,10 +29,9 @@ frontend/index.html - 主页面
 frontend/js/graph.js - D3.js 拓扑图
 frontend/js/timeline.js - 执行时间线（合并步骤与事件）
 frontend/js/risk-panel.js - 风险卡片面板
-frontend/js/trace-panel.js - 时间线兼容层（原指令流转追踪）
 frontend/js/status-panel.js - 系统状态面板
 frontend/js/console.js - 操作控制台
-frontend/js/storage-view.js - 存储视图（初始/当前环境快照与差异）
+frontend/js/storage-view.js - 环境变更（字段差异、敏感等级与完整快照）
 frontend/js/api.js - API 通信层
 frontend/css/style.css - 暗色主题样式
 
@@ -50,7 +49,7 @@ frontend/css/style.css - 暗色主题样式
 - 异常节点红色描边高亮
 - 边按关系分色并默认隐藏标签，悬停节点/边时聚焦关联路径、弱化其余元素
 - 跨 APP 的因果边带切换点标记，悬停时显示“跨 APP · 关系名”
-- 归属边默认弱化显示，可通过“显示归属边”开关控制
+- 默认展示主信息流，状态、风险证据和聚合分支按需展开
 - 拖拽/缩放/平移，重置视图自动适配画布
 
 ### 风险审计功能
@@ -59,19 +58,20 @@ frontend/css/style.css - 暗色主题样式
 - 阻断步骤标记与图谱节点定位
 - 时间线面板支持拖拽 / 方向键调整高度，双击恢复默认
 
-### 存储视图
-- 按 suite 展示环境数据：workspace（邮件/日历/云盘）、banking（银行账户/文件/用户账户）、slack（频道/私信/网页）、travel（酒店/餐厅/租车/航班/预订/邮箱）
-- 支持“当前状态 / 初始状态”切换，高亮相对初始状态的 added / removed / changed
-- 变更列表可定位到具体路径，详情面板展示变更前后的值
-- 支持搜索、仅显示变化、自动刷新；执行任务或重置数据后自动刷新
+### 环境变更
+- 默认按“实体 → 字段差异”展示环境变化，并标注人工配置的敏感等级
+- 变更详情并排展示变更前后值，支持从图谱节点和时间线工具步骤定位到对应变更
+- 支持按 APP、实体、字段、值或敏感等级搜索
+- 完整初始/当前快照保留为辅助视图，自动刷新默认关闭
+- 新 trace 保存任务基线和执行后快照，可在历史回放中恢复当次环境差异；旧 trace 会明确提示快照不可用
 
-## 三、多层防御分析系统（3-Ring + DOE）
+## 三、多层防御分析系统（4-Ring）
 
-src/agentdojo/method/analysis/pipeline.py 编排防御管道:
-- Ring 0: prompt_injection.py - Prompt 注入检测 (DeBERTa + 正则)
-- Ring 1: skillprobe_topology.py - 工具输出注入检测 (DeBERTa + 正则二次验证)
-- Ring 2: fides_ifc.py - 意图一致性检查 (Sentence-BERT)
-- Ring 3: agentraft_doe.py - DOE 数据脱敏 (NER + 正则)
+`src/agentdojo/method/analysis/pipeline.py` 编排防御管道：
+- Ring 0：本地多语言小模型分块检测直接提示注入；
+- Ring 1：工具输出分块扫描、隔离与不可信控制流提醒；
+- Ring 2：基于任务计划和工具元数据的动作、effect 与 APP 范围授权；
+- Ring 3：外发前只检查最终工具参数；敏感等级来自各 APP 原生实体的人工配置并取最高等级继承，接收方采用固定授权、受控派生和未授权三态判定。
 
 ## 四、知识图谱建模
 
@@ -96,7 +96,7 @@ tests/test_method_with_llm.py - 完整功能测试
 - test_capture_layer (Capture)
 - test_ring1_topology (Ring 1)
 - test_ring2_ifc (Ring 2)
-- test_ring3_doe (Ring 3)
+- test_ring3_flow (Ring 3)
 - test_modeling_layer (Modeling)
 - test_visualization_layer (Visualization)
 
@@ -115,7 +115,7 @@ tests/test_method_with_llm.py - 完整功能测试
 | 异常行为高亮 | 红色描边高亮 + 风险卡片 | 通过 |
 | 审计与回溯 | 时间线 + 追踪面板 | 通过 |
 | 至少 3 个 APP | 4 个 Task Suite（banking/workspace/slack/travel） | 通过 |
-| 敏感数据标记 | Ring 3 DOE | 通过 |
+| 敏感数据标记 | Ring 3 APP 原生实体标签与信息流继承 | 通过 |
 | 异常告警 | Ring 1 + 风险卡片 | 通过 |
 | 知识图谱 | graph_db.py (PROV + FSM) | 通过 |
 | 多层防御 | Ring 0-3 管道 | 通过 |

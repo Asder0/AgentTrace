@@ -7,7 +7,6 @@ Based on ARGUS user-space semantic extraction concepts.
 """
 
 import copy
-import difflib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +20,7 @@ class DomainData:
     data_payload: Optional[str] = None
     source_app: str = "unknown"
     operation: str = "unknown"  # "created", "updated", "deleted", "read"
+    flow_label: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -32,10 +32,10 @@ class EnvironmentDelta:
     accessed: List[DomainData] = field(default_factory=list)
 
 
-# Known noise attributes that should be filtered out during semantic parsing
+# UI-only attributes that should be filtered during semantic parsing. Provenance
+# fields such as id, timestamp, version and metadata are intentionally retained.
 _NOISE_ATTRIBUTES = {
-    "timestamp", "id", "uuid", "version", "metadata", "render_key",
-    "ui_state", "scroll_position", "cursor_position", "animation_state",
+    "render_key", "ui_state", "scroll_position", "cursor_position", "animation_state",
     "loading", "visible", "selected", "focused", "hovered",
 }
 
@@ -51,8 +51,15 @@ class EnvironmentSnapshotParser:
 
     def _is_noise_attr(self, key: str) -> bool:
         """Check if an attribute key is noise (purely rendering/UI related)."""
-        key_lower = key.lower()
-        return any(noise in key_lower for noise in _NOISE_ATTRIBUTES)
+        return key.lower() in _NOISE_ATTRIBUTES
+
+    @staticmethod
+    def _entity_type_for_key(key: str) -> str:
+        """Use the observed container name instead of guessing business meaning."""
+        value = str(key or "").strip()
+        if not value:
+            return "unknown"
+        return value.split("[", 1)[0] or "unknown"
 
     def _semantic_filter(self, data: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
         """
@@ -95,8 +102,8 @@ class EnvironmentSnapshotParser:
         # Handle dict-like states
         if isinstance(state, dict):
             for key, value in state.items():
-                entity_type = self._infer_entity_type(key, value)
-                if entity_type:
+                entity_type = self._entity_type_for_key(key)
+                if entity_type and not isinstance(value, list):
                     attrs = self._semantic_filter(value) if isinstance(value, dict) else {"value": str(value)}
                     data_payload = str(value) if isinstance(value, (str, int, float, bool)) else None
                     entities.append(DomainData(
@@ -110,7 +117,7 @@ class EnvironmentSnapshotParser:
                 elif isinstance(value, list):
                     for i, item in enumerate(value):
                         if isinstance(item, dict):
-                            item_type = self._infer_entity_type(f"{key}[{i}]", item)
+                            item_type = self._entity_type_for_key(key)
                             if item_type:
                                 attrs = self._semantic_filter(item)
                                 entities.append(DomainData(
@@ -135,36 +142,15 @@ class EnvironmentSnapshotParser:
 
         # Handle object with __dict__ or model_dump
         elif hasattr(state, "model_dump"):
-            return self._extract_domain_entities(state.model_dump(), operation)
+            try:
+                dumped = state.model_dump(mode="json")
+            except Exception:
+                dumped = state.model_dump()
+            return self._extract_domain_entities(dumped, operation)
         elif hasattr(state, "__dict__"):
             return self._extract_domain_entities(state.__dict__, operation)
 
         return entities
-
-    def _infer_entity_type(self, key: str, value: Any) -> Optional[str]:
-        """Infer the domain entity type from a key and its value."""
-        key_lower = key.lower()
-        
-        # Email-related
-        if any(word in key_lower for word in ["email", "inbox", "mail", "sent", "draft", "message"]):
-            return "email"
-        # File-related
-        if any(word in key_lower for word in ["file", "document", "attachment", "download"]):
-            return "file"
-        # Contact-related
-        if any(word in key_lower for word in ["contact", "recipient", "sender", "address_book"]):
-            return "contact"
-        # Transaction-related
-        if any(word in key_lower for word in ["transaction", "payment", "transfer", "balance", "account"]):
-            return "transaction"
-        # Calendar-related
-        if any(word in key_lower for word in ["calendar", "event", "meeting", "appointment"]):
-            return "calendar_event"
-        # Travel-related
-        if any(word in key_lower for word in ["flight", "hotel", "booking", "reservation", "trip"]):
-            return "travel_booking"
-        
-        return None
 
     def compute_delta(self, pre_state: Any, post_state: Any) -> EnvironmentDelta:
         """
@@ -229,3 +215,26 @@ def parse_environment_delta(
     """
     parser = EnvironmentSnapshotParser(source_app=source_app)
     return parser.compute_delta(pre_environment, post_environment)
+
+
+def snapshot_environment(environment: Any) -> Any:
+    """Create an immutable, JSON-friendly snapshot before tool execution.
+
+    AgentDojo tools mutate Pydantic environment objects in place. Keeping a
+    reference to the old object therefore loses every update. This helper
+    normalizes the environment before execution so pre/post diffs remain valid.
+    """
+    if environment is None:
+        return None
+    if hasattr(environment, "model_dump"):
+        try:
+            return environment.model_dump(mode="json")
+        except Exception:
+            try:
+                return environment.model_dump()
+            except Exception:
+                pass
+    try:
+        return copy.deepcopy(environment)
+    except Exception:
+        return repr(environment)

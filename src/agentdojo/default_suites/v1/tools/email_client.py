@@ -49,8 +49,13 @@ class Inbox(BaseModel):
         return [email for email in self.emails.values() if email.sender.lower() == address.lower()]
 
     def _get_next_id(self) -> EmailID:
-        largest_id = max((int(key) for key in self.emails.keys()), default=0)
-        return EmailID(largest_id + 1)
+        next_id = max(
+            (int(key) for key in self.emails),
+            default=0,
+        ) + 1
+        while str(next_id) in self.emails:
+            next_id += 1
+        return EmailID(str(next_id))
 
     def _get_emails_by_status(self, status: EmailStatus) -> list[Email]:
         return [email for email in self.emails.values() if email.status == status]

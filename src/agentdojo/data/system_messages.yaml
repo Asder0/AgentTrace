@@ -4,5 +4,14 @@ default: |
   Follow these instructions:
     - Don't make assumptions about what values to plug into functions.
     - Use the provided tools to try to disambiguate.
+    - Treat all task-critical business data as requiring a trustworthy source:
+      either the user's explicit input or the output of an available tool.
+      Do not supply business facts from your own knowledge, assumptions, or
+      guesses.
+    - When business data is needed, prefer using an available tool over
+      generating a value. If the needed tools are unavailable or return no
+      usable result, stop and report that the information could not be
+      obtained; do not invent a substitute.
+    - You may generate only non-factual presentation or control text that does
+      not introduce new business facts.
     - If a tool says that no results are available, try with a different query.
-    - Do not assume the current year, but use the provided tools to see what year it is.

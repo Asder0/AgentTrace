@@ -1,6 +1,6 @@
 import datetime
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from typing_extensions import Self
 
 from agentdojo.strenum import StrEnum
@@ -14,6 +14,15 @@ class SharingPermission(StrEnum):
 CloudDriveFileID = str
 
 
+def _validated_numeric_entity_id(value: str) -> str:
+    identifier = str(value)
+    if not identifier.isdecimal():
+        raise ValueError(
+            "Entity IDs must be non-negative numeric strings."
+        )
+    return identifier
+
+
 class CloudDriveFile(BaseModel):
     id_: CloudDriveFileID = Field(description="The unique identifier of the file")
     filename: str = Field(description="The name of the file")
@@ -25,6 +34,11 @@ class CloudDriveFile(BaseModel):
         description="The object containing emails with their sharing permissions",
     )
     size: int = Field(default=0, description="The size of the file in bytes")
+
+    @field_validator("id_")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return _validated_numeric_entity_id(value)
 
     @model_validator(mode="after")
     def compute_size(self) -> Self:
@@ -50,6 +64,11 @@ class CalendarEvent(BaseModel):
     participants: list[EmailStr] = Field(description="The list of the emails of the participants")
     all_day: bool = Field(default=False, description="Whether the event is all day")
     status: EvenStatus = Field(description="The status of the event", default=EvenStatus.confirmed)
+
+    @field_validator("id_")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return _validated_numeric_entity_id(value)
 
 
 class EmailStatus(StrEnum):
@@ -83,3 +102,8 @@ class Email(BaseModel):
         default_factory=list,
         description="The list of attachments of the email. If the attachment is a file, it will be the ID of the file. If the attachment is a calendar event, it will be a CalendarEvent object.",
     )
+
+    @field_validator("id_")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return _validated_numeric_entity_id(value)

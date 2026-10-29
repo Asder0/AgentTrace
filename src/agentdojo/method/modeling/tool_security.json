@@ -1,0 +1,437 @@
+{
+  "schema_version": 1,
+  "thresholds": {
+    "prompt_injection_min_judge_confidence": 0.3,
+    "max_risk_evidence": 50,
+    "l2_chain_min_confidence": 0.65,
+    "outcome_audit_min_confidence": 0.7,
+    "unknown_category_level": "secret",
+    "unknown_source_integrity": "untrusted",
+    "prompt_injection_scan": {
+      "threshold": 0.95,
+      "mask_urls": false,
+      "mask_emails": true
+    },
+    "field_plan_min_confidence": 0.55,
+    "task_egress_min_confidence": 0.7,
+    "task_effect_min_confidence": {
+      "read": 0.45,
+      "write": 0.65,
+      "egress": 0.75,
+      "privilege": 0.8
+    }
+  },
+  "category_min_level": {
+    "credential": "secret",
+    "verification_code": "secret",
+    "iban": "secret",
+    "financial_data": "secret",
+    "financial_amount": "confidential",
+    "ssn": "secret",
+    "credit_card": "secret",
+    "personal_name": "confidential",
+    "address": "confidential",
+    "phone": "confidential",
+    "location": "confidential",
+    "email": "internal",
+    "calendar": "internal",
+    "file": "internal"
+  },
+  "source_kinds": {
+    "trusted": [
+      "user_prompt",
+      "system_prompt",
+      "tool_schema",
+      "tool_status",
+      "internal_config"
+    ],
+    "external": [
+      "external",
+      "tool_output",
+      "environment",
+      "user_pasted_external"
+    ],
+    "levels": {
+      "user_prompt": "internal",
+      "system_prompt": "internal",
+      "tool_schema": "public",
+      "tool_status": "internal",
+      "internal_config": "internal",
+      "external": "internal",
+      "tool_output": "internal",
+      "environment": "internal",
+      "agent": "internal",
+      "activity": "internal",
+      "sanitized": "internal"
+    }
+  },
+  "profiles": {
+    "read_public": {
+      "effect": "read",
+      "risk_level": "L0",
+      "confidentiality": "public"
+    },
+    "read_internal": {
+      "effect": "read",
+      "risk_level": "L0",
+      "confidentiality": "internal"
+    },
+    "read_confidential": {
+      "effect": "read",
+      "risk_level": "L0",
+      "confidentiality": "confidential"
+    },
+    "read_secret": {
+      "effect": "read",
+      "risk_level": "L0",
+      "confidentiality": "secret"
+    },
+    "write_internal": {
+      "effect": "write",
+      "risk_level": "L1",
+      "confidentiality": "internal"
+    },
+    "privilege": {
+      "effect": "privilege",
+      "risk_level": "L2",
+      "confidentiality": "confidential"
+    },
+    "egress_internal": {
+      "effect": "egress",
+      "risk_level": "L2",
+      "confidentiality": "internal"
+    },
+    "egress_secret": {
+      "effect": "egress",
+      "risk_level": "L2",
+      "confidentiality": "secret"
+    }
+  },
+  "tools": {
+    "add_calendar_event_participants": {
+      "profile": "egress_internal",
+      "control_fields": ["event_id", "participants"],
+      "destination_fields": ["participants"]
+    },
+    "add_user_to_channel": {
+      "profile": "egress_internal",
+      "control_fields": ["channel", "user"],
+      "destination_fields": ["channel", "user"]
+    },
+    "append_to_file": {
+      "profile": "write_internal",
+      "control_fields": ["file_id"],
+      "content_fields": ["content"]
+    },
+    "cancel_calendar_event": {
+      "profile": "egress_internal",
+      "control_fields": ["event_id"],
+      "destination_fields": ["event_id"],
+      "implicit_egress": [
+        {
+          "resource_path": "calendar.events",
+          "id_parameter": "event_id",
+          "entity": "calendar_event",
+          "recipient_field": "participants",
+          "content_fields": [
+            "title",
+            "description",
+            "start_time",
+            "end_time",
+            "location",
+            "participants"
+          ]
+        }
+      ]
+    },
+    "check_restaurant_opening_hours": {"profile": "read_public"},
+    "create_calendar_event": {
+      "profile": "egress_internal",
+      "control_fields": ["start_time", "end_time", "participants", "location"],
+      "destination_fields": ["participants"],
+      "content_fields": ["title", "description"],
+      "semantic_types": {
+        "start_time": "datetime",
+        "end_time": "datetime"
+      }
+    },
+    "create_file": {
+      "profile": "write_internal",
+      "control_fields": ["filename"],
+      "content_fields": ["content"]
+    },
+    "delete_email": {
+      "profile": "write_internal",
+      "risk_level": "L2",
+      "control_fields": ["email_id"]
+    },
+    "delete_file": {
+      "profile": "write_internal",
+      "risk_level": "L2",
+      "control_fields": ["file_id"]
+    },
+    "get_all_car_rental_companies_in_city": {"profile": "read_internal"},
+    "get_all_hotels_in_city": {"profile": "read_internal"},
+    "get_all_restaurants_in_city": {"profile": "read_internal"},
+    "get_balance": {
+      "profile": "read_secret",
+      "categories": ["financial_data"]
+    },
+    "get_car_fuel_options": {"profile": "read_internal"},
+    "get_car_price_per_day": {"profile": "read_internal"},
+    "get_car_rental_address": {"profile": "read_internal"},
+    "get_car_types_available": {"profile": "read_internal"},
+    "get_channels": {"profile": "read_internal"},
+    "get_contact_information_for_restaurants": {"profile": "read_internal"},
+    "get_cuisine_type_for_restaurants": {"profile": "read_public"},
+    "get_current_day": {"profile": "read_public"},
+    "get_day_calendar_events": {
+      "profile": "read_confidential",
+      "semantic_types": {"day": "date"}
+    },
+    "get_dietary_restrictions_for_all_restaurants": {"profile": "read_public"},
+    "get_draft_emails": {
+      "profile": "read_internal",
+      "categories": ["email"]
+    },
+    "get_file_by_id": {
+      "profile": "read_confidential",
+      "categories": ["file"]
+    },
+    "get_flight_information": {"profile": "read_internal"},
+    "get_hotels_address": {"profile": "read_internal"},
+    "get_hotels_prices": {"profile": "read_internal"},
+    "get_iban": {
+      "profile": "read_secret",
+      "categories": ["iban", "financial_data"]
+    },
+    "get_most_recent_transactions": {
+      "profile": "read_secret",
+      "categories": ["financial_data", "financial_amount"]
+    },
+    "get_price_for_restaurants": {"profile": "read_public"},
+    "get_rating_reviews_for_car_rental": {"profile": "read_public"},
+    "get_rating_reviews_for_hotels": {"profile": "read_public"},
+    "get_rating_reviews_for_restaurants": {"profile": "read_public"},
+    "get_received_emails": {
+      "profile": "read_internal",
+      "categories": ["email"]
+    },
+    "get_restaurants_address": {"profile": "read_internal"},
+    "get_scheduled_transactions": {
+      "profile": "read_secret",
+      "categories": ["financial_data"]
+    },
+    "get_sent_emails": {
+      "profile": "read_internal",
+      "categories": ["email"]
+    },
+    "get_unread_emails": {
+      "profile": "read_internal",
+      "categories": ["email"]
+    },
+    "get_user_info": {
+      "profile": "read_confidential",
+      "categories": ["personal_name", "address", "phone"]
+    },
+    "get_user_information": {"profile": "read_internal"},
+    "get_users_in_channel": {
+      "profile": "read_confidential",
+      "categories": ["personal_name"]
+    },
+    "get_webpage": {"profile": "read_internal"},
+    "invite_user_to_slack": {
+      "profile": "egress_internal",
+      "control_fields": ["user", "user_email"],
+      "destination_fields": ["user", "user_email"]
+    },
+    "list_files": {
+      "profile": "read_confidential",
+      "categories": ["file"]
+    },
+    "post_webpage": {
+      "profile": "egress_internal",
+      "control_fields": ["url"],
+      "destination_fields": ["url"],
+      "content_fields": ["content"]
+    },
+    "read_channel_messages": {"profile": "read_internal"},
+    "read_file": {
+      "profile": "read_confidential",
+      "categories": ["file"]
+    },
+    "read_inbox": {"profile": "read_internal"},
+    "remove_user_from_slack": {
+      "profile": "privilege",
+      "control_fields": ["user"]
+    },
+    "reschedule_calendar_event": {
+      "profile": "egress_internal",
+      "control_fields": ["event_id", "new_start_time", "new_end_time"],
+      "destination_fields": ["event_id"],
+      "implicit_egress": [
+        {
+          "resource_path": "calendar.events",
+          "id_parameter": "event_id",
+          "entity": "calendar_event",
+          "recipient_field": "participants",
+          "content_fields": [
+            "title",
+            "description",
+            "start_time",
+            "end_time",
+            "location",
+            "participants"
+          ]
+        }
+      ],
+      "semantic_types": {
+        "new_start_time": "datetime",
+        "new_end_time": "datetime"
+      }
+    },
+    "reserve_car_rental": {
+      "profile": "egress_internal",
+      "control_fields": ["company", "start_time", "end_time"],
+      "destination_fields": ["company"],
+      "semantic_types": {
+        "start_time": "datetime",
+        "end_time": "datetime"
+      }
+    },
+    "reserve_hotel": {
+      "profile": "egress_internal",
+      "control_fields": ["hotel", "start_day", "end_day"],
+      "destination_fields": ["hotel"],
+      "semantic_types": {
+        "start_day": "date",
+        "end_day": "date"
+      }
+    },
+    "reserve_restaurant": {
+      "profile": "egress_internal",
+      "control_fields": ["restaurant", "start_time"],
+      "destination_fields": ["restaurant"],
+      "semantic_types": {"start_time": "datetime"}
+    },
+    "schedule_transaction": {
+      "profile": "egress_secret",
+      "control_fields": ["recipient", "amount", "subject", "date", "recurring"],
+      "destination_fields": ["recipient"],
+      "semantic_types": {
+        "amount": "number",
+        "date": "date"
+      },
+      "parameter_roles": {
+        "recipient": "destination",
+        "amount": "value",
+        "subject": "presentation",
+        "date": "control",
+        "recurring": "control"
+      },
+      "categories": ["financial_data", "financial_amount"]
+    },
+    "search_calendar_events": {
+      "profile": "read_confidential",
+      "semantic_types": {"date": "date"}
+    },
+    "search_contacts_by_email": {
+      "profile": "read_confidential",
+      "categories": ["personal_name", "email"]
+    },
+    "search_contacts_by_name": {
+      "profile": "read_confidential",
+      "categories": ["personal_name", "email"]
+    },
+    "search_emails": {
+      "profile": "read_internal",
+      "categories": ["email"]
+    },
+    "search_files": {
+      "profile": "read_confidential",
+      "categories": ["file"]
+    },
+    "search_files_by_filename": {
+      "profile": "read_confidential",
+      "categories": ["file"]
+    },
+    "send_channel_message": {
+      "profile": "egress_internal",
+      "control_fields": ["channel"],
+      "destination_fields": ["channel"],
+      "content_fields": ["body"]
+    },
+    "send_direct_message": {
+      "profile": "egress_internal",
+      "control_fields": ["recipient"],
+      "destination_fields": ["recipient"],
+      "content_fields": ["body"]
+    },
+    "send_email": {
+      "profile": "egress_internal",
+      "control_fields": ["recipients", "cc", "bcc", "attachments"],
+      "destination_fields": ["recipients", "cc", "bcc"],
+      "content_fields": ["subject", "body", "attachments"],
+      "semantic_types": {
+        "recipients": "email",
+        "cc": "email",
+        "bcc": "email"
+      }
+    },
+    "send_money": {
+      "profile": "egress_secret",
+      "control_fields": ["recipient", "amount", "subject", "date"],
+      "destination_fields": ["recipient"],
+      "semantic_types": {
+        "amount": "number",
+        "date": "date"
+      },
+      "parameter_roles": {
+        "recipient": "destination",
+        "amount": "value",
+        "subject": "presentation",
+        "date": "control"
+      },
+      "categories": ["financial_data", "financial_amount"],
+      "authoritative_parameters": {
+        "date": {
+          "source_action": "get_current_day",
+          "source_path": "$",
+          "selector": "unique"
+        }
+      }
+    },
+    "share_file": {
+      "profile": "egress_internal",
+      "control_fields": ["file_id", "email", "permission"],
+      "destination_fields": ["email"],
+      "semantic_types": {"email": "email"}
+    },
+    "update_password": {
+      "profile": "privilege",
+      "control_fields": ["password"],
+      "categories": ["credential"]
+    },
+    "update_scheduled_transaction": {
+      "profile": "egress_secret",
+      "control_fields": ["recipient", "amount", "date", "recurring", "subject"],
+      "destination_fields": ["recipient"],
+      "semantic_types": {
+        "amount": "number",
+        "date": "date"
+      },
+      "parameter_roles": {
+        "recipient": "destination",
+        "amount": "value",
+        "date": "control",
+        "recurring": "control",
+        "subject": "presentation"
+      },
+      "categories": ["financial_data", "financial_amount"]
+    },
+    "update_user_info": {
+      "profile": "privilege",
+      "control_fields": ["first_name", "last_name"]
+    }
+  }
+}

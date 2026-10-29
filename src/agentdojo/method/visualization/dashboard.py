@@ -17,6 +17,16 @@ def print_risk_card(event_details: dict):
     print("\nRecommended Action: [BLOCK] | [WHITELIST]")
     print("="*50 + "\n")
 
+
+def check_data_shield(app_name: str):
+    """Print a compact confidentiality/integrity label for an APP domain."""
+    print("\n" + "="*50)
+    print("🛡️ [DataShield] Privacy Nutritional Label")
+    print(f"Scope: {app_name}")
+    print("Confidentiality: source-aware (public/internal/confidential/secret)")
+    print("Integrity: trusted/untrusted with taint propagation")
+    print("="*50 + "\n")
+
 def start_dashboard():
     """
     Dumps current Graph DB Provenance metrics for UI rendering.

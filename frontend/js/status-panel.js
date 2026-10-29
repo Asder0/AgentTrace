@@ -44,23 +44,23 @@ const STATUS_PANEL = {
                 <div class="status-overview">
                     <div class="status-overview-item">
                         <span class="status-overview-dot" id="statusDotCapture"></span>
-                        <span>Capture</span>
+                        <span>数据捕获</span>
                     </div>
                     <div class="status-overview-item">
                         <span class="status-overview-dot" id="statusDotModeling"></span>
-                        <span>Modeling</span>
+                        <span>溯源建模</span>
                     </div>
                     <div class="status-overview-item">
                         <span class="status-overview-dot" id="statusDotAnalysis"></span>
-                        <span>Analysis</span>
+                        <span>风险分析</span>
                     </div>
                     <div class="status-overview-item">
                         <span class="status-overview-dot" id="statusDotVisualization"></span>
-                        <span>Visualization</span>
+                        <span>可视化服务</span>
                     </div>
                     <div class="status-overview-item">
                         <span class="status-overview-dot" id="statusDotExecution"></span>
-                        <span>Execution</span>
+                        <span>执行服务</span>
                     </div>
                 </div>
 
@@ -207,6 +207,17 @@ const STATUS_PANEL = {
             }
         }
 
+        for (const [layer, dotId] of Object.entries(layerDots)) {
+            const dot = document.getElementById(dotId);
+            if (!dot || !status.layers?.[layer]) continue;
+            const layerLabel = window.AgentTraceRiskLabels?.layerLabel
+                ? window.AgentTraceRiskLabels.layerLabel(layer)
+                : layer;
+            dot.title = status.layers[layer].status
+                ? `${layerLabel}：正常运行`
+                : `${layerLabel}：异常`;
+        }
+
         // 更新 LLM 模式
         const modeEl = document.getElementById('statusLLMMode');
         if (modeEl) {
@@ -298,7 +309,10 @@ const STATUS_PANEL = {
         for (const layer of layerOrder) {
             if (!grouped[layer]) continue;
             
-            html += `<div class="status-feature-layer">${layer}</div>`;
+            const layerLabel = window.AgentTraceRiskLabels?.layerLabel
+                ? window.AgentTraceRiskLabels.layerLabel(layer)
+                : layer;
+            html += `<div class="status-feature-layer">${layerLabel}</div>`;
             for (const f of grouped[layer]) {
                 const statusClass = f.status ? 'feature-ok' : 'feature-fail';
                 html += `

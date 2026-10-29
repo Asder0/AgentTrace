@@ -1,207 +1,132 @@
-"""
-Ring 0: Prompt Injection Detection for initial user prompt.
-检测用户提交的初始 prompt 中是否包含注入指令。
-复用 Ring 1 的 DeBERTa 检测模型 + 二次验证机制。
+"""Ring 0: chunked small-model direct-prompt injection detection.
 
-与 Ring 1 (skillprobe_topology.py) 的区别：
-- Ring 0：检测 LLM **接收到的 prompt**（用户输入 + 系统消息）
-- Ring 1：检测工具函数的**输出结果**（可能包含间接注入）
-
-两者使用相同的检测模型 (protectai/deberta-v3-base-prompt-injection-v2)，
-但检测阈值和二次验证策略不同：
-- Ring 0：阈值更严格（0.3），因为 prompt 中的注入直接威胁初始安全边界
-- Ring 1：阈值较宽松（0.1），配合二次验证避免误判结构化数据
+The same lightweight classifier used for Ring 1 scans sentence-aware chunks.
+No keyword or synonym security rule participates in the decision.
 """
 
-import re
-from typing import Tuple
-from .model_utils import detect_prompt_injection
-from .defense_config import effective_method_enabled
+from __future__ import annotations
 
-# Ring 0 的检测阈值（比 Ring 1 更严格）
-# 因为 prompt 注入直接威胁初始安全边界，宁可误报不可漏报
-PROMPT_INJECTION_THRESHOLD = 0.3
+from typing import Any
 
-# 安全模式：这些内容在 prompt 中出现时不应判定为注入
-# 避免将正常的任务描述误判为注入
-SAFE_PROMPT_PATTERNS = [
-    r"(?i)ignore\s+(the\s+)?(file|email|message|attachment|request|notification)",  # 用户正常要求忽略某物
-    r"(?i)do\s+not\s+(worry|hesitate|forget)",  # 常见对话用语
-    r"(?i)please\s+ignore",  # 礼貌请求
-    r"(?i)you\s+can\s+ignore",  # 告知性内容
-    r"(?i)check\s+(if|whether|for)\s+",  # 检查类任务
-    r"(?i)make\s+sure\s+(that\s+)?(you\s+)?(don't|do\s+not)\s+",  # 提醒类任务
-]
+from ..modeling.policy import security_thresholds
 
-# 指令性关键词模式：真正的 prompt 注入必须包含这些
-# 用于二次验证，避免误判
-INSTRUCTION_PATTERNS = [
-    r"(?i)ignore\s+(all\s+)?(your\s+)?(previous|prior|above)\s+(instructions|directives|commands|prompts|messages)",
-    r"(?i)disregard\s+(all\s+)?(previous|prior|above)\s+(instructions|directives|commands|prompts)",
-    r"(?i)(new|updated|modified)\s+(system\s+)?prompt",
-    r"(?i)you\s+are\s+(now\s+)?(a\s+)?(new\s+)?(AI|assistant|agent|bot|model)",
-    r"(?i)this\s+is\s+(an\s+)?(important|urgent|critical)\s+(instruction|message|update|directive)",
-    r"(?i)you\s+must\s+(now\s+)?(do|perform|execute|complete|follow|obey)",
-    r"(?i)do\s+not\s+(follow|obey|listen|adhere|comply)",
-    r"(?i)forget\s+(all\s+)?(previous|prior|above)\s+(instructions|directives|commands)",
-    r"(?i)remember\s+(this\s+)?(new\s+)?(instruction|rule|command)",
-    r"(?i)act\s+as\s+(if\s+)?(you\s+are\s+)?(a\s+)?(new\s+)?",
-    r"(?i)from\s+now\s+on",
-    r"(?i)your\s+(new\s+)?(task|mission|goal|purpose|objective)\s+is",
-    r"(?i)say\s+(the\s+)?(word|phrase|text|message)\s+",
-    r"(?i)repeat\s+(after\s+me|the\s+following|this\s+exact)",
-    r"(?i)output\s+(the\s+)?(word|phrase|text|message|following)",
-    r"(?i)start\s+(your\s+)?(response|answer|message)\s+(with|by)",
-    r"(?i)end\s+(your\s+)?(response|answer|message)\s+(with|by)",
-    r"(?i)include\s+(the\s+)?(word|phrase|text|following)\s+",
-    r"(?i)do\s+not\s+(include|show|display|mention|reveal|tell|say)",
-    r"(?i)never\s+(mention|reveal|tell|say|disclose|show)",
-    r"(?i)send\s+(this\s+)?(email|message|information|data|text)\s+to",
-    r"(?i)transfer\s+(money|funds|payment|the\s+money|the\s+funds)\s+to",
-]
+PROMPT_INJECTION_THRESHOLD = float(
+    security_thresholds().get(
+        "prompt_injection_min_judge_confidence",
+        0.30,
+    )
+)
+
+
+def _valid_judgment(
+    judge_result: dict[str, Any] | None,
+    threshold: float,
+) -> bool:
+    return bool(
+        judge_result
+        and judge_result.get("injection") is not None
+        and float(judge_result.get("confidence", 0.0) or 0.0) >= threshold
+    )
 
 
 def check_prompt_for_injection(
     prompt: str,
     threshold: float = PROMPT_INJECTION_THRESHOLD,
-    options: dict = None,
+    options: dict | None = None,
+    judge_result: dict | None = None,
+    scan_result: dict | None = None,
 ) -> bool:
-    """
-    检查用户提交的 prompt 是否包含注入指令。
-    
-    检测逻辑（二次验证）：
-    1. 先检查 SAFE_PROMPT_PATTERNS，匹配则直接放行
-    2. 用 DeBERTa 模型检测 prompt 是否包含注入内容
-    3. 模型判定为注入后，再用 INSTRUCTION_PATTERNS 检查是否包含指令性关键词
-    4. 只有两者都满足才判定为注入
-    
-    Args:
-        prompt: 用户输入的 prompt 文本。
-        threshold: 安全分数阈值（越低越敏感）。
-        
-    Returns:
-        True 如果 prompt 安全（无注入），False 如果检测到注入。
-    """
     if not prompt or not isinstance(prompt, str):
-        return True  # 空 prompt 视为安全
-
-    regex_enabled = effective_method_enabled("ring_0", "regex", options)
-    model_enabled = effective_method_enabled("ring_0", "model", options)
-
-    # 没有任何检测方法开启时，直接放行
-    if not regex_enabled and not model_enabled:
         return True
-    
-    # 先检查安全模式，避免误判
-    if regex_enabled:
-        for safe_pattern in SAFE_PROMPT_PATTERNS:
-            if re.search(safe_pattern, prompt):
-                return True
-    
-    # 正则指令关键词检测（与模型并联或独立执行）
-    regex_injection_detected = False
-    if regex_enabled:
-        for instr_pattern in INSTRUCTION_PATTERNS:
-            if re.search(instr_pattern, prompt):
-                regex_injection_detected = True
-                break
-
-    if model_enabled:
-        # 使用模型检测
-        is_injection, safety_score = detect_prompt_injection(prompt, threshold)
-        if is_injection:
-            # 二次验证：模型判定为注入后，还需检查是否包含指令性关键词
-            # 若 regex 已关闭，模型单独命中即判定为注入
-            if not regex_enabled or regex_injection_detected:
-                return False  # 模型 + 指令关键词双重确认 → 真正的注入
-            # 模型判定为注入，但不含指令关键词 → 视为误判，放行
-            return True
-    elif regex_injection_detected:
-        # 模型关闭时，正则指令关键词命中即阻断
-        return False
-    
-    return True  # 未检测到注入
+    if scan_result is not None:
+        return bool(not scan_result.get("suspected", False))
+    if _valid_judgment(judge_result, threshold):
+        return not bool(judge_result.get("injection"))
+    return False
 
 
 def check_prompt_for_injection_with_details(
     prompt: str,
     threshold: float = PROMPT_INJECTION_THRESHOLD,
-    options: dict = None,
+    options: dict | None = None,
+    judge_result: dict | None = None,
+    scan_result: dict | None = None,
 ) -> dict:
-    """
-    检查 prompt 是否包含注入，返回完整详情用于审计追踪。
-    
-    Returns:
-        dict with keys:
-            - passed: bool (True = safe, False = injection detected)
-            - safety_score: float
-            - detection_method: str
-            - prompt_length: int
-            - matched_pattern: str or None
-    """
     result = {
         "passed": True,
         "safety_score": 1.0,
         "detection_method": "empty_prompt",
         "prompt_length": 0,
-        "matched_pattern": None,
-        "regex_enabled": True,
-        "model_enabled": True,
+        "judge_confidence": None,
+        "judge_threshold": threshold,
     }
-    
     if not prompt or not isinstance(prompt, str):
         return result
-    
     result["prompt_length"] = len(prompt)
-    regex_enabled = effective_method_enabled("ring_0", "regex", options)
-    model_enabled = effective_method_enabled("ring_0", "model", options)
-    result["regex_enabled"] = regex_enabled
-    result["model_enabled"] = model_enabled
-
-    # 所有检测方法都关闭 → 直接放行
-    if not regex_enabled and not model_enabled:
-        result["detection_method"] = "no_method_enabled"
+    if scan_result is not None:
+        available = bool(scan_result.get("available", True))
+        score = float(scan_result.get("score", 0.0) or 0.0)
+        suspected = bool(scan_result.get("suspected", False))
+        result.update(
+            {
+                "passed": available and not suspected,
+                "safety_score": score if suspected else (1.0 - score if available else 0.0),
+                "detection_method": (
+                    "small_model_chunked" if available else "small_model_unavailable"
+                ),
+                "evidence_spans": list(scan_result.get("evidence_spans", [])),
+                "injection_target": "instruction_hierarchy",
+                "reason": (
+                    str(scan_result.get("error", ""))
+                    if not available
+                    else (
+                        "A prompt-injection classifier flagged one or more text chunks."
+                        if suspected
+                        else "No prompt-injection chunk exceeded the configured threshold."
+                    )
+                ),
+                "judge_confidence": score if available else None,
+                "chunk_count": int(scan_result.get("chunk_count", 0) or 0),
+                "scanner_truncated": bool(scan_result.get("truncated", False)),
+            }
+        )
         return result
-    
-    # 先检查安全模式
-    if regex_enabled:
-        for safe_pattern in SAFE_PROMPT_PATTERNS:
-            if re.search(safe_pattern, prompt):
-                result["safety_score"] = 1.0
-                result["detection_method"] = "safe_pattern"
-                result["matched_pattern"] = safe_pattern
-                return result
-    
-    # 正则指令关键词检测
-    regex_injection_detected = False
-    if regex_enabled:
-        for instr_pattern in INSTRUCTION_PATTERNS:
-            if re.search(instr_pattern, prompt):
-                regex_injection_detected = True
-                result["matched_pattern"] = instr_pattern
-                break
+    if judge_result and judge_result.get("error"):
+        result["judge_error"] = judge_result["error"]
 
-    if model_enabled:
-        # 使用模型检测
-        is_injection, safety_score = detect_prompt_injection(prompt, threshold)
-        result["safety_score"] = safety_score
+    if _valid_judgment(judge_result, threshold):
+        injection = bool(judge_result.get("injection"))
+        confidence = float(judge_result.get("confidence", 0.0) or 0.0)
+        result.update(
+            {
+                "passed": not injection,
+                "safety_score": (
+                    1.0 - confidence if injection else confidence
+                ),
+                "detection_method": "main_llm_judge",
+                "evidence_spans": judge_result.get("evidence_spans", []),
+                "injection_target": judge_result.get("target", "none"),
+                "reason": judge_result.get("reason", ""),
+                "judge_confidence": confidence,
+            }
+        )
+        return result
 
-        if is_injection:
-            # 二次验证：模型判定为注入后，还需检查是否包含指令性关键词
-            # 若 regex 关闭，模型单独命中即判定为注入
-            if not regex_enabled or regex_injection_detected:
-                result["passed"] = False
-                result["detection_method"] = "deberta_model"
-            else:
-                result["passed"] = True
-                result["detection_method"] = "deberta_model_with_secondary_check"
-        else:
-            result["detection_method"] = "deberta_model"
-    elif regex_injection_detected:
-        # 模型关闭时，正则指令关键词命中即阻断
-        result["passed"] = False
-        result["detection_method"] = "regex_pattern"
-    else:
-        result["detection_method"] = "no_model_regex_clean"
-    
+    confidence = (
+        float(judge_result.get("confidence", 0.0) or 0.0)
+        if judge_result
+        else None
+    )
+    result.update(
+        {
+            "passed": False,
+            "safety_score": confidence if confidence is not None else 0.0,
+            "detection_method": "main_llm_uncertain",
+            "judge_confidence": confidence,
+            "reason": (
+                "The semantic prompt-injection judgement was unavailable or "
+                "below the confidence threshold."
+            ),
+        }
+    )
     return result

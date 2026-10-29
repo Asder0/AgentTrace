@@ -24,7 +24,7 @@
             <button type="button" class="tab active" data-tab="monitor" aria-current="page">实时监控</button>
             <button type="button" class="tab" data-tab="history">历史回放</button>
             <button type="button" class="tab" data-tab="audit">风险审计</button>
-            <button type="button" class="tab" data-tab="storage">存储视图</button>
+            <button type="button" class="tab" data-tab="storage">环境变更</button>
         </nav>
 
         <div class="navbar-status" role="status">
@@ -39,15 +39,14 @@
             <header class="panel-header">
                 <h2>数据流拓扑图</h2>
                 <div class="graph-controls">
-                    <button type="button" id="btnReset" title="重置视图缩放与平移">重置视图</button>
-                    <button type="button" id="btnAutoLayout" title="重新执行结构化布局">自动布局</button>
+                    <button type="button" id="btnReset" title="恢复结构化节点位置，清理高亮并适应画布">重置布局</button>
+                    <label class="control-checkbox" title="显示任务状态转移、风险证据和辅助来源关系">
+                        <input type="checkbox" id="chkShowAuditEdges">
+                        <span>显示审计边</span>
+                    </label>
                     <label class="control-checkbox">
                         <input type="checkbox" id="chkShowLabels" checked>
                         <span>显示标签</span>
-                    </label>
-                    <label class="control-checkbox">
-                        <input type="checkbox" id="chkShowBelongsTo" checked>
-                        <span>显示归属边</span>
                     </label>
                 </div>
             </header>
@@ -60,27 +59,44 @@
 
                 <!-- 图例：节点类型与关系 -->
                 <div class="legend" aria-label="图例">
+                    <button type="button" class="legend-toggle" id="btnToggleLegend" aria-expanded="true" aria-controls="legendContent">
+                        <span>图例说明</span>
+                        <span class="legend-toggle-icon" aria-hidden="true">▾</span>
+                    </button>
+                    <div class="legend-content" id="legendContent">
                     <div class="legend-group">
                         <div class="legend-group-title">节点</div>
                         <div class="legend-grid">
-                            <div class="legend-item"><span class="legend-color legend-agent"></span><span>智能体</span></div>
-                            <div class="legend-item"><span class="legend-color legend-llm"></span><span>LLM 推理</span></div>
-                            <div class="legend-item"><span class="legend-color legend-tool"></span><span>工具调用</span></div>
-                            <div class="legend-item"><span class="legend-color legend-prompt"></span><span>用户提示</span></div>
-                            <div class="legend-item"><span class="legend-color legend-data"></span><span>数据实体</span></div>
-                            <div class="legend-item"><span class="legend-color legend-risk"></span><span>异常 / 阻断</span></div>
+                            <button type="button" class="legend-item" data-node-filter="agent" aria-pressed="false" title="点击隐藏或显示智能体节点"><span class="legend-color legend-agent"></span><span>智能体</span></button>
+                            <button type="button" class="legend-item" data-node-filter="llm" aria-pressed="false" title="点击隐藏或显示 LLM 推理节点"><span class="legend-color legend-llm"></span><span>LLM 推理</span></button>
+                            <button type="button" class="legend-item" data-node-filter="tool" aria-pressed="false" title="点击隐藏或显示工具调用节点"><span class="legend-color legend-tool"></span><span>工具调用</span></button>
+                            <button type="button" class="legend-item" data-node-filter="prompt" aria-pressed="false" title="点击隐藏或显示用户提示节点"><span class="legend-color legend-prompt"></span><span>用户提示</span></button>
+                            <button type="button" class="legend-item" data-node-filter="data" aria-pressed="false" title="点击隐藏或显示数据实体节点"><span class="legend-color legend-data"></span><span>数据实体</span></button>
+                            <button type="button" class="legend-item" data-node-filter="sensitive" aria-pressed="false" title="点击隐藏或显示敏感数据节点"><span class="legend-color legend-sensitive"></span><span>敏感数据</span></button>
+                            <button type="button" class="legend-item" data-node-filter="untrusted" aria-pressed="false" title="点击隐藏或显示不可信输入节点"><span class="legend-color legend-untrusted"></span><span>不可信输入</span></button>
+                            <button type="button" class="legend-item" data-node-filter="risk" aria-pressed="false" title="点击隐藏或显示异常与阻断节点"><span class="legend-color legend-risk"></span><span>异常 / 阻断</span></button>
+                            <button type="button" class="legend-item" data-node-filter="authorization" aria-pressed="false" title="点击隐藏或显示人工授权节点"><span class="legend-color legend-authorization"></span><span>人工授权</span></button>
+                        </div>
+                        <div class="legend-actions">
+                            <button type="button" class="legend-reset" id="btnResetNodeFilters">全部显示</button>
+                            <span class="legend-status" id="legendNodeStatus"></span>
                         </div>
                     </div>
                     <div class="legend-group">
                         <div class="legend-group-title">关系</div>
                         <div class="legend-grid">
-                            <div class="legend-item"><span class="legend-line legend-line-flow"></span><span>调用 / 数据流</span></div>
-                            <div class="legend-item"><span class="legend-line legend-line-produce"></span><span>产出</span></div>
-                            <div class="legend-item"><span class="legend-line legend-line-belong"></span><span>归属</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-read"></span><span>工具读取输入</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-produce"></span><span>工具产出数据</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-risk"></span><span>派生 / 风险关联</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-egress"></span><span>数据外发</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-auth"></span><span>人工授权</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-cross-app"></span><span>跨 APP 数据/控制流</span></div>
                             <div class="legend-item"><span class="legend-hop"></span><span>跨 APP 切换点</span></div>
+                            <div class="legend-item"><span class="legend-bundle">×N</span><span>聚合分支，悬停节点展开</span></div>
                         </div>
                     </div>
-                    <div class="legend-note">APP 域 = AgentDojo 四个 task suite（银行 / 办公 / 通讯 / 旅行）；file_reader、user_account、email 等为 suite 内部工具模块，展示在节点详情中</div>
+                    <div class="legend-note">悬停节点可聚焦并展开聚合分支；风险、策略和授权关联也在悬停相关节点时显示。辅助证据可通过“显示审计边”展开。</div>
+                    </div>
                 </div>
 
                 <!-- 节点详情浮动面板 -->
@@ -103,10 +119,14 @@
             </div>
         </section>
 
+        <div class="side-resizer" id="sideResizer" role="separator"
+             aria-orientation="vertical" aria-label="拖动调整右侧信息栏宽度"
+             tabindex="0" title="拖动调整宽度；拖到最右侧或双击可折叠"></div>
+
         <!-- 右侧：信息面板 -->
         <aside class="side-panel" aria-label="信息面板">
             <!-- 操作控制台（状态/追踪面板由模块动态插入） -->
-            <section class="card console-card" id="agentConsole" aria-label="操作控制台">
+            <section class="card console-card" aria-label="操作控制台">
                 <header class="card-heading">
                     <h3>操作控制台</h3>
                 </header>
@@ -131,7 +151,7 @@
                 <div class="console-section attack-section">
                     <div class="console-label attack-section-header">
                         <span>攻击场景（注入测试）</span>
-                        <span class="attack-hint">关闭防御后执行可观察注入效果</span>
+                        <span class="attack-hint">按当前防护配置执行，可切换 Ring 对比检测、隔离和阻断效果</span>
                     </div>
                     <div class="attack-scenario-buttons" id="attackScenarioButtons">
                         <p class="hint">加载中...</p>
@@ -161,21 +181,57 @@
                     </div>
                     <div class="stat-item">
                         <span class="stat-value" id="statBlocks">0</span>
-                        <span class="stat-label">风险事件</span>
+                        <span class="stat-label">风险 / 策略</span>
                     </div>
+                </div>
+            </section>
+
+            <!-- 任务级审计摘要 -->
+            <section class="card audit-summary-card" aria-label="任务审计摘要">
+                <header class="card-heading">
+                    <h3>任务审计摘要</h3>
+                    <span class="audit-summary-status" id="auditSummaryStatus">等待任务</span>
+                </header>
+                <div id="auditSummaryBody" class="audit-summary-body">
+                    <p class="hint">执行任务后显示授权范围、跨 APP 路径和敏感数据流向。</p>
                 </div>
             </section>
 
             <!-- 风险卡片面板 -->
             <section class="card risk-card-panel" aria-label="风险事件">
                 <header class="card-heading">
-                    <h3>风险事件</h3>
+                    <h3>风险与策略事件</h3>
                 </header>
                 <div id="riskCards">
                     <p class="hint">暂无风险事件</p>
                 </div>
             </section>
         </aside>
+    </div>
+
+    <div class="confirmation-overlay" id="l2ConfirmationOverlay" hidden>
+        <div class="confirmation-dialog" role="dialog" aria-modal="false" aria-labelledby="l2ConfirmationTitle">
+            <div class="confirmation-kicker">L2 高风险操作确认</div>
+            <div class="confirmation-review-head">
+                <span>图谱审查模式：左侧图谱可缩放、拖动和查看节点</span>
+                <button type="button" class="confirmation-focus" id="btnFocusL2Graph">定位关键证据</button>
+            </div>
+            <h2 id="l2ConfirmationTitle">等待确认</h2>
+            <p class="confirmation-reason" id="l2ConfirmationReason"></p>
+            <div class="confirmation-evidence" id="l2ConfirmationEvidence"></div>
+            <div class="confirmation-chain" id="l2ConfirmationChain"></div>
+            <div class="confirmation-chain" id="l2ConfirmationFlow"></div>
+            <dl class="confirmation-meta">
+                <dt>工具</dt><dd id="l2ConfirmationTool">-</dd>
+                <dt>APP</dt><dd id="l2ConfirmationApp">-</dd>
+                <dt>计划版本</dt><dd id="l2ConfirmationPlan">-</dd>
+            </dl>
+            <pre class="confirmation-args" id="l2ConfirmationArgs"></pre>
+            <div class="confirmation-actions">
+                <button type="button" class="confirmation-reject" id="btnRejectL2">拒绝并阻断</button>
+                <button type="button" class="confirmation-approve" id="btnApproveL2">确认执行</button>
+            </div>
+        </div>
     </div>
 
     <!-- 底部：执行时间线 -->
@@ -206,24 +262,26 @@
         </div>
     </section>
 
-    <!-- 存储视图：从存储/环境数据角度观察各 suite 数据及其变化 -->
-    <section id="storageView" class="storage-view" aria-label="存储视图" hidden>
+    <!-- 环境变更：以字段差异为中心观察各 suite 的真实数据变化 -->
+    <section id="storageView" class="storage-view" aria-label="环境变更" hidden>
         <header class="storage-toolbar">
-            <div class="storage-suite-tabs" id="storageSuiteTabs" role="tablist" aria-label="Suite 选择"></div>
+            <div class="storage-suite-tabs" id="storageSuiteTabs" role="tablist" aria-label="APP 筛选"></div>
             <div class="storage-actions">
-                <div class="storage-mode" id="storageMode" role="group" aria-label="快照模式">
-                    <button type="button" class="storage-mode-btn active" data-mode="current">当前状态</button>
-                    <button type="button" class="storage-mode-btn" data-mode="initial">初始状态</button>
+                <div class="storage-summary" id="storageSummary" aria-label="变更统计"></div>
+                <div class="storage-mode" id="storageMode" role="group" aria-label="环境数据视图">
+                    <button type="button" class="storage-mode-btn active" data-mode="diff">字段差异</button>
+                    <button type="button" class="storage-mode-btn" data-mode="current">当前快照</button>
+                    <button type="button" class="storage-mode-btn" data-mode="initial">任务基线</button>
                 </div>
                 <label class="control-checkbox">
                     <input type="checkbox" id="storageOnlyChanges">
-                    <span>仅显示变化</span>
+                    <span>快照仅变化</span>
                 </label>
                 <label class="control-checkbox">
-                    <input type="checkbox" id="storageAutoRefresh" checked>
+                    <input type="checkbox" id="storageAutoRefresh">
                     <span>自动刷新</span>
                 </label>
-                <input type="search" id="storageSearch" class="storage-search" placeholder="搜索路径或值...">
+                <input type="search" id="storageSearch" class="storage-search" placeholder="搜索实体、字段或值...">
                 <button type="button" id="storageRefreshBtn">刷新</button>
             </div>
         </header>
@@ -231,12 +289,8 @@
         <div class="storage-body">
             <aside class="storage-sidebar">
                 <div class="storage-sidebar-section">
-                    <div class="storage-sidebar-title">Suite 概览</div>
-                    <div id="storageSuiteList" class="storage-suite-list"></div>
-                </div>
-                <div class="storage-sidebar-section">
                     <div class="storage-sidebar-title">
-                        变更摘要
+                        变更记录
                         <span class="storage-change-count" id="storageChangeCount">0</span>
                     </div>
                     <div id="storageChangeList" class="storage-change-list"></div>
@@ -245,38 +299,27 @@
 
             <div class="storage-main">
                 <div class="storage-main-header">
-                    <div id="storageBreadcrumb" class="storage-breadcrumb">选择左侧 suite 查看数据</div>
-                    <div id="storageStatus" class="storage-status"></div>
+                    <div id="storageBreadcrumb" class="storage-breadcrumb">选择左侧变更查看字段差异</div>
+                    <div class="storage-main-meta">
+                        <button type="button" id="storageLocateGraph" class="storage-locate-graph" disabled>在图谱中定位</button>
+                        <div class="storage-status" id="storageStatus"></div>
+                    </div>
                 </div>
-                <div id="storageTree" class="storage-tree"></div>
+                <div id="storageDiffBody" class="storage-diff-body"></div>
+                <div id="storageTree" class="storage-tree" hidden></div>
             </div>
-
-            <aside class="storage-detail" id="storageDetail" hidden>
-                <div class="storage-detail-header">
-                    <span class="storage-detail-title" id="storageDetailTitle">变更详情</span>
-                    <button type="button" class="storage-detail-close" id="storageDetailClose" aria-label="关闭">✕</button>
-                </div>
-                <div class="storage-detail-body" id="storageDetailBody"></div>
-            </aside>
         </div>
     </section>
 
-    <!-- 节点详情弹窗 -->
-    <div id="nodeModal" class="modal" role="dialog" aria-modal="true" aria-label="节点详情弹窗">
-        <div class="modal-content">
-            <button type="button" class="modal-close" aria-label="关闭弹窗">
-                <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-            </button>
-            <div id="modalBody"></div>
-        </div>
-    </div>
-
     <script src="js/api.js"></script>
+    <script src="js/content-renderer.js"></script>
+    <script src="js/app-catalog.js"></script>
+    <script src="js/risk-labels.js"></script>
+    <script src="js/audit-summary.js"></script>
     <script src="js/graph.js"></script>
     <script src="js/timeline.js"></script>
     <script src="js/risk-panel.js"></script>
     <script src="js/status-panel.js"></script>
-    <script src="js/trace-panel.js"></script>
     <script src="js/console.js"></script>
     <script src="js/storage-view.js"></script>
     <script src="js/main.js"></script>

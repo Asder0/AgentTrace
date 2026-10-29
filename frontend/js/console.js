@@ -23,7 +23,7 @@ const CONSOLE = {
     /** 当前 LLM 配置 */
     _llmConfig: {
         provider: 'deepseek',
-        model: 'deepseek-v4-flash',
+        model: 'deepseek-flash',
         api_key: '',
     },
 
@@ -116,6 +116,9 @@ const CONSOLE = {
                 if (scenario.is_sensitive) badges += '<span class="badge badge-sensitive">敏感</span>';
                 if (scenario.cross_app) badges += '<span class="badge badge-cross">跨APP</span>';
                 if (scenario.cross_module) badges += '<span class="badge badge-module">跨模块</span>';
+                if ((scenario.required_suites || []).length > 1) {
+                    badges += `<span class="badge badge-cross">${scenario.required_suites.length} APP</span>`;
+                }
                 
                 const scenarioLabel = (scenario.task_id && scenario.suite)
                     ? `${scenario.task_id} (${scenario.suite})`
@@ -142,10 +145,9 @@ const CONSOLE = {
         
         this._isExecuting = true;
         this._leaveReplay();
-        this._showFeedback('正在执行操作（真实 LLM 自主决策）...', 'info');
+        this._showFeedback('正在执行操作；首次安全检查可能需要加载本地分类模型...', 'info');
         
         // 发布场景执行事件（触发追踪面板）
-        Store.publish('scenario_executed', { action });
         
         try {
             const result = await API.executeAction(action);
@@ -188,7 +190,7 @@ const CONSOLE = {
             // 从执行结果中直接渲染追踪面板
             // 注意：后端 _build_trace_steps_from_messages 已包含阻断步骤，前端不再重复添加
             if (result.steps && result.steps.length > 0) {
-                TRACE_PANEL._renderTrace({
+                TIMELINE.setTrace({
                     trace_id: result.trace_id || action,
                     command: action,
                     llm_mode: 'real',
@@ -203,8 +205,14 @@ const CONSOLE = {
             
             if (result.blocked) {
                 const riskCount = result.risk_cards?.length || 0;
-                const reasons = result.risk_cards?.map(c => c.detail).join('; ') || '';
+                const reasons = this._localizedRiskReasons(result);
                 this._showFeedback(`操作已被阻断（${riskCount} 个风险事件）${reasons ? '；原因：' + reasons.substring(0, 100) : ''}`, 'error');
+            } else if (result.status === 'incomplete') {
+                const reason = this._localizedTaskReason(result);
+                this._showFeedback(`任务未完成：${reason}`, 'warning');
+            } else if ((result.risk_cards?.length || 0) > 0) {
+                const reasons = this._localizedRiskReasons(result);
+                this._showFeedback(`操作已执行，但存在风险提醒${reasons ? '；' + reasons.substring(0, 120) : ''}`, 'warning');
             } else {
                 this._showFeedback(`操作执行成功（${modeText}）`, 'success');
             }
@@ -244,7 +252,7 @@ const CONSOLE = {
         
         this._isExecuting = true;
         this._leaveReplay();
-        this._showFeedback('正在执行自定义指令（真实 LLM 自主决策）...', 'info');
+        this._showFeedback('正在执行自定义指令；首次安全检查可能需要加载本地分类模型...', 'info');
         
         try {
             // 直接将原始指令发送给后端，不进行任何前端解析
@@ -287,12 +295,11 @@ const CONSOLE = {
             RISK_PANEL.loadRiskCards();
             
             // 发布自定义指令事件（触发追踪面板）
-            Store.publish('custom_command', { command: text });
             
             // 从执行结果中直接渲染追踪面板（不依赖独立的追踪 API）
             // 注意：后端 _build_trace_steps_from_messages 已包含阻断步骤，前端不再重复添加
             if (result.steps && result.steps.length > 0) {
-                TRACE_PANEL._renderTrace({
+                TIMELINE.setTrace({
                     trace_id: result.trace_id || 'custom',
                     command: text,
                     llm_mode: 'real',
@@ -306,8 +313,14 @@ const CONSOLE = {
             
             if (result.blocked) {
                 const riskCount = result.risk_cards?.length || 0;
-                const reasons = result.risk_cards?.map(c => c.detail).join('; ') || '';
+                const reasons = this._localizedRiskReasons(result);
                 this._showFeedback(`操作已被阻断（${riskCount} 个风险事件）${reasons ? '；原因：' + reasons.substring(0, 100) : ''}`, 'error');
+            } else if (result.status === 'incomplete') {
+                const reason = this._localizedTaskReason(result);
+                this._showFeedback(`自定义指令未完成：${reason}`, 'warning');
+            } else if ((result.risk_cards?.length || 0) > 0) {
+                const reasons = this._localizedRiskReasons(result);
+                this._showFeedback(`自定义指令已执行，但存在风险提醒${reasons ? '；' + reasons.substring(0, 120) : ''}`, 'warning');
             } else {
                 this._showFeedback(`自定义指令执行成功（${modeText}）`, 'success');
             }
@@ -330,6 +343,50 @@ const CONSOLE = {
         } finally {
             this._isExecuting = false;
         }
+    },
+
+    _localizedRiskReasons(result) {
+        const labels = window.AgentTraceRiskLabels;
+        return (result?.risk_cards || [])
+            .map(card => {
+                const normalized = labels?.normalizeCard
+                    ? labels.normalizeCard(card)
+                    : card;
+                return normalized.defense_detail || '';
+            })
+            .filter(Boolean)
+            .join('；');
+    },
+
+    _localizedTaskReason(result) {
+        const outcomes = result?.completion_audit?.outcomes || [];
+        const unsatisfied = outcomes.filter(item =>
+            String(item.status || '') === 'unsatisfied'
+        );
+        const uncertain = outcomes.filter(item =>
+            String(item.status || '') === 'uncertain'
+        );
+        const reasons = [];
+        if (unsatisfied.length) {
+            reasons.push(
+                `${unsatisfied.length} 项必需结果未满足`
+                + `（${unsatisfied.map(item => item.id || '未命名结果').join('、')}）`
+            );
+        }
+        if (uncertain.length) {
+            reasons.push(
+                `${uncertain.length} 项必需结果无法验证`
+                + `（${uncertain.map(item => item.id || '未命名结果').join('、')}）`
+            );
+        }
+        if (result?.task_stopped) {
+            reasons.push(
+                result.stop_reason === 'l2_egress_execution_uncertain'
+                    ? 'L2 外发执行失败，已禁止自动重试；需要用户明确重新发起'
+                    : '任务因结构化停止条件安全结束'
+            );
+        }
+        return reasons.join('；') || '必需任务结果尚未全部完成';
     },
 
     /**
@@ -436,7 +493,7 @@ const CONSOLE = {
                         <input type="checkbox" id="defenseToggle" checked>
                         <span class="toggle-slider"></span>
                     </label>
-                    <span class="llm-config-help">关闭后跳过 Ring 1-4 检测</span>
+                    <span class="llm-config-help">关闭后跳过 Ring 0-3 检测</span>
                 </div>
                 <div class="llm-config-row llm-config-row-stack">
                     <div class="llm-config-help">Ring 级开关（可单独关闭/开启每个 Ring 及其内部检测方法）</div>
@@ -498,7 +555,7 @@ const CONSOLE = {
         const ringContainer = document.getElementById('ringTogglesContainer');
         if (ringContainer) {
             ringContainer.addEventListener('change', (e) => {
-                if (e.target && e.target.type === 'checkbox' && e.target.dataset.role) {
+                if (e.target && e.target.dataset && e.target.dataset.role) {
                     this._updateRingConfig();
                 }
             });
@@ -510,7 +567,7 @@ const CONSOLE = {
      */
     async _saveLLMConfig() {
         const provider = document.getElementById('llmProvider')?.value || 'deepseek';
-        const model = document.getElementById('llmModel')?.value || 'deepseek-v4-flash';
+        const model = document.getElementById('llmModel')?.value || 'deepseek-flash';
         const apiKey = document.getElementById('llmApiKey')?.value || '';
         
         if (!apiKey) {
@@ -571,7 +628,10 @@ const CONSOLE = {
                 statusText.textContent = config.enabled ? '已启用' : '已关闭';
                 statusText.className = config.enabled ? 'defense-status enabled' : 'defense-status disabled';
             }
-            this._renderRingToggles(config.rings || {});
+            this._renderRingToggles(
+                config.rings || {},
+                config.direct_injection_mode || config.user_anchor_mode || 'quarantine'
+            );
         } catch (err) {
             console.warn('获取防御配置失败:', err.message);
         }
@@ -580,15 +640,15 @@ const CONSOLE = {
     /**
      * 渲染每个 Ring 的开关行（Ring 开关 + 硬编码检测方法开关）
      */
-    _renderRingToggles(rings) {
+    _renderRingToggles(rings, directInjectionMode = 'quarantine') {
         const container = document.getElementById('ringTogglesContainer');
         if (!container || !rings) return;
 
         const ringNames = {
             ring_0: 'Ring 0 · 初始 Prompt 注入检测',
-            ring_1: 'Ring 1 · 工具输出注入检测',
-            ring_2: 'Ring 2 · 意图一致性检查',
-            ring_3: 'Ring 3 · 数据过度暴露(DOE)',
+            ring_1: 'Ring 1 · 不可信控制流提醒',
+            ring_2: 'Ring 2 · 任务工具范围检查',
+            ring_3: 'Ring 3 · 敏感数据外发检查',
         };
 
         const rows = Object.keys(rings).map((ring) => {
@@ -618,7 +678,19 @@ const CONSOLE = {
                 </div>
             `;
         }).join('');
-        container.innerHTML = rows;
+        container.innerHTML = `
+            <div class="ring-config-item">
+                <label class="ring-config-label">
+                    <span>直接注入处理模式</span>
+                </label>
+                <select data-role="direct-injection-mode" class="ring-method">
+                    <option value="advisory" ${directInjectionMode === 'advisory' ? 'selected' : ''}>ADVISORY · 仅记录风险，不修改输入</option>
+                    <option value="quarantine" ${directInjectionMode === 'quarantine' ? 'selected' : ''}>QUARANTINE · 替换风险块后继续</option>
+                    <option value="strict" ${directInjectionMode === 'strict' ? 'selected' : ''}>STRICT · 检测到风险直接阻断</option>
+                </select>
+            </div>
+            ${rows}
+        `;
     },
 
     /**
@@ -642,7 +714,12 @@ const CONSOLE = {
         });
 
         try {
-            const result = await API.setDefenseConfig(null, rings);
+            const anchorSelect = container.querySelector('select[data-role="direct-injection-mode"]');
+            const result = await API.setDefenseConfig(
+                null,
+                rings,
+                anchorSelect ? anchorSelect.value : null
+            );
             if (result && result.status === 'ok') {
                 this._showFeedback('Ring/检测方法开关已更新', 'info');
             }
@@ -652,7 +729,10 @@ const CONSOLE = {
             // 重新拉取配置，恢复实际状态
             try {
                 const config = await API.getDefenseConfig();
-                this._renderRingToggles(config.rings || {});
+                this._renderRingToggles(
+                    config.rings || {},
+                    config.direct_injection_mode || config.user_anchor_mode || 'quarantine'
+                );
             } catch (e) { /* ignore */ }
         }
     },
@@ -995,7 +1075,7 @@ const CONSOLE = {
             // 渲染追踪面板
             // 注意：后端 _build_trace_steps_from_messages 已包含阻断步骤，前端不再重复添加
             if (result.steps && result.steps.length > 0) {
-                TRACE_PANEL._renderTrace({
+                TIMELINE.setTrace({
                     trace_id: result.trace_id || scenario.id,
                     command: `${scenario.attack_name}: ${scenario.user_task_label || scenario.user_task_id} + ${scenario.injection_task_label || scenario.injection_task_id}`,
                     llm_mode: 'real',
@@ -1007,8 +1087,14 @@ const CONSOLE = {
             // 显示执行结果
             if (result.blocked) {
                 const riskCount = result.risk_cards?.length || 0;
-                const reasons = result.risk_cards?.map(c => c.detail).join('; ') || '';
+                const reasons = this._localizedRiskReasons(result);
                 this._showFeedback(`攻击已被防御系统阻断（${riskCount} 个风险事件）${reasons ? '；原因：' + reasons.substring(0, 100) : ''}`, 'error');
+            } else if (result.status === 'incomplete') {
+                const reason = this._localizedTaskReason(result);
+                this._showFeedback(`攻击场景执行未完成：${reason}`, 'warning');
+            } else if ((result.risk_cards?.length || 0) > 0) {
+                const reasons = this._localizedRiskReasons(result);
+                this._showFeedback(`攻击场景已执行，风险已高亮提醒${reasons ? '；' + reasons.substring(0, 120) : ''}`, 'warning');
             } else {
                 this._showFeedback('攻击场景执行完成（防御系统未阻断）', 'warning');
             }

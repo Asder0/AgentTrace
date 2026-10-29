@@ -1,1603 +1,667 @@
-# AgentDojo 防御监控平台文档 (Method Layer)
+# AgentTrace Method Layer
 
-## 概述
+本文描述当前代码中的 AgentTrace 方法层，包括运行时捕获、PROV 图谱、四层风险判定、任务计划、环境快照、历史回放和前端审计。文档以当前实现为准，不再保留已经删除的实验模块和旧版流程。
 
-`src/agentdojo/method/` 目录实现了一套**四层防御监控架构**，用于追踪、分析和防御 AI Agent 在执行工具调用过程中的安全风险。该机制通过**面向切面编程（AOP）** 拦截 Agent 的所有工具调用和 LLM 推理，在调用前后执行多层安全检查，并结合**知识图谱建模**和**可视化仪表盘**提供完整的可观测性。
+## 1. 设计目标
 
-此外，`src/agentdojo/method/visualization/` 还包含一个完整的 **Flask API 服务器** 和 **跨 APP 路由 Runtime**，配合 `frontend/` 目录下的 **D3.js 前端可视化平台**，提供实时数据流追踪、风险审计和交互式拓扑图展示。
+AgentTrace 建立在 AgentDojo 的四个 APP 域之上：
 
-### 核心设计理念
+- `workspace`：邮件、日历、云盘
+- `banking`：银行账户、文件、用户账户
+- `slack`：频道、私信、网页
+- `travel`：酒店、餐厅、租车、航班和预订
 
-- **非侵入式**：通过猴子补丁（Monkey Patching）在运行时动态注入，无需修改 Agent 原有代码
-- **多层防御**：四层架构各司其职，Analysis 层内部 4-Ring 管道提供纵深防御
-- **可观测性**：全量追踪 + 知识图谱溯源 + 可视化仪表盘
-- **优雅降级**：所有 ML 模型均支持懒加载，不可用时自动降级为规则/正则回退
-- **跨 APP 路由**：RouterRuntime 统一路由 workspace + banking 工具调用，模拟真实微服务架构
-- **实时可视化**：Flask API + D3.js 前端提供实时数据流拓扑图、事件时间线和风险审计
+系统遵循以下原则：
 
----
+1. **捕获真实执行**：通过 AOP 拦截真实 LLM 调用和工具调用，不根据自然语言猜测调用链。
+2. **安全判定结构化**：工具等级、数据敏感等级、输入输出 schema 和授权来源由人工配置或确定性规则提供。
+3. **审计证据不丢失**：隔离、脱敏和展示聚合只作用于 Agent 或主视图，原始风险证据和完整 trace 仍保留。
+4. **数据流可追溯**：每次工具调用记录输入、输出、来源、派生关系、风险、策略和人工授权。
+5. **计划与执行可核对**：语义任务计划最终必须映射为结构化工具调用，并与实际参数和来源证据核对。
 
-## 一、防御系统 vs 原 AgentDojo 平台
+## 2. 总体架构
 
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                        AgentDojo 原平台架构                                 │
-│                                                                            │
-│  ┌──────────────┐    ┌──────────────────────────────┐    ┌──────────────┐  │
-│  │ benchmark.py │───▶│       AgentPipeline          │───▶│  TaskSuite   │  │
-│  │ (入口脚本)    │    │                              │    │  (评估套件)   │  │
-│  └──────────────┘    │  ┌────────────────────────┐  │    └──────────────┘  │
-│                      │  │  LLM (推理引擎)          │  │                     │
-│                      │  │  · GoogleLLM            │  │                     │
-│                      │  │  · OpenAILLM            │  │                     │
-│                      │  │  · AnthropicLLM         │  │                     │
-│                      │  │  · LocalLLM             │  │                     │
-│                      │  └───────────┬────────────┘  │                     │
-│                      │              │ 返回工具调用决策 │                     │
-│                      │              ▼                │                     │
-│                      │  ┌────────────────────────┐  │                     │
-│                      │  │   FunctionsRuntime     │  │                     │
-│                      │  │   (工具执行引擎)        │  │                     │
-│                      │  │   · run_function()     │  │                     │
-│                      │  │   · 注册/管理工具       │  │                     │
-│                      │  └────────────────────────┘  │                     │
-│                      └──────────────────────────────┘                     │
-│                                                                            │
-│  ════════════════════════════════════════════════════════════════════════  │
-│                                                                            │
-│              防御监控系统（method/）的切入方式（AOP 面向切面编程）            │
-│                                                                            │
-│  ┌────────────────────────────────────────────────────────────────────┐    │
-│  │  activate_platform() → enable_tracking()                          │    │
-│  │                                                                    │    │
-│  │  猴子补丁 ①: FunctionsRuntime.run_function                         │    │
-│  │    → 被 capture_tool_call 装饰器包装                                │    │
-│  │    → 在工具调用前后插入：                                           │    │
-│  │      前置: 环境快照 → 图谱记录 → Ring 0 → Ring 2                    │    │
-│  │      后置: 环境增量 → 图谱更新 → Ring 3 → Ring 1                    │    │
-│  │                                                                    │    │
-│  │  猴子补丁 ②: LLM.query 方法（遍历 llms 包所有子模块）                 │    │
-│  │    → 被 capture_llm_interaction 包装                                │    │
-│  │    → 在 LLM 推理前后插入：                                          │    │
-│  │      前置: 记录 Prompt                                              │    │
-│  │      后置: 提取 Response → 创建 ReasoningContext → 图谱记录          │    │
-│  │                                                                    │    │
-│  │  关键特性：                                                          │    │
-│  │  · 非侵入式：无需修改 AgentPipeline / FunctionsRuntime 原有代码       │    │
-│  │  · 运行时注入：在 activate_platform() 调用时动态生效                  │    │
-│  │  · 可开关：_defense_enabled 全局变量控制 Analysis Pipeline 启停      │    │
-│  └────────────────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────────────────────────────────┘
+```text
+Browser / Frontend
+        |
+        v
+Flask Visualization API
+        |
+        v
+AgentPipeline ---> LLM
+        |
+        +----> FunctionsRuntime / RouterRuntime
+                    |
+                    +----> workspace environment
+                    +----> banking environment
+                    +----> slack environment
+                    +----> travel environment
+
+Runtime interceptors
+        |
+        +----> TrackingContext
+        +----> Ring 0 / Ring 1 / Ring 2 / Ring 3
+        +----> PROV knowledge graph
+        +----> trace JSON + environment snapshots
 ```
 
----
+四个逻辑层次如下：
 
-## 二、四层防御监控架构总览
+| 层次 | 主要职责 |
+| --- | --- |
+| Capture | 拦截 LLM 和工具调用，维护任务上下文，记录工具执行前后的环境差异 |
+| Modeling | 构建 PROV-AGENT 图谱、FSM 状态、信息流标签和来源关系 |
+| Analysis | 执行 Ring 0–3 风险判定、调用链检查和任务结果审计 |
+| Visualization | 提供 Flask API、D3 拓扑图、时间线、风险卡片、环境变更和历史回放 |
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                       四层防御监控架构                                │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │               Capture Layer (AOP 拦截层)                      │   │
-│  │  ┌─────────────────────┐  ┌──────────────────────────────┐  │   │
-│  │  │  interceptor.py     │  │  environment_snapshot.py     │  │   │
-│  │  │  · 工具调用拦截      │  │  · 环境状态语义解析           │  │   │
-│  │  │  · LLM 推理捕获      │  │  · 增量计算 (created/        │  │   │
-│  │  │  · wasInformedBy 绑定│  │    updated/deleted/accessed) │  │   │
-│  │  │  · TrackingContext   │  │  · 语义噪声过滤              │  │   │
-│  │  └─────────────────────┘  └──────────────────────────────┘  │   │
-│  └──────────────────────┬──────────────────────────────────────┘   │
-│                         │                                          │
-│                         ▼                                          │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │              Modeling Layer (知识图谱建模层)                   │   │
-│  │  ┌──────────────────────────────────────────────────────┐   │   │
-│  │  │  graph_db.py                                         │   │   │
-│  │  │  · PROV + FSM 融合有向图 (NetworkX)                   │   │   │
-│  │  │  · 节点: AIAgent / AIModelInvocation / AgentTool /   │   │   │
-│  │  │         Prompt / DomainData                           │   │   │
-│  │  │  · 边: informed / used / produces / belongsTo         │   │   │
-│  │  │  · 语义化标签 (emoji + 中文描述)                       │   │   │
-│  │  └──────────────────────────────────────────────────────┘   │   │
-│  └──────────────────────┬──────────────────────────────────────┘   │
-│                         │                                          │
-│                         ▼                                          │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │              Analysis Layer (4-Ring 审计管道)                  │   │
-│  │                                                               │   │
-│  │   ┌──────────────┐  ┌──────────────┐  ┌──────────┐  ┌──────────┐ │   │
-│  │   │ Ring 0:      │  │ Ring 1:      │  │ Ring 2:  │  │ Ring 3:  │ │   │
-│  │   │ Prompt Inj.  │  │ Prompt Inj.  │  │ Intent   │  │ DOE      │ │   │
-│  │   │ (LLM 前)     │  │ (后置)       │  │Consistency│  │ 数据脱敏  │ │   │
-│  │   └──────────────┘  └──────────────┘  └──────────┘  └──────────┘ │   │
-│  │                                                               │   │
-│  │   ┌──────────────────────────────────────────────────────┐    │   │
-│  │   │  model_utils.py (模型管理)                            │    │   │
-│  │   │  · PI Detector: protectai/deberta-v3-base-prompt-    │    │   │
-│  │   │    injection-v2 (Ring 0 & Ring 1 共用)               │    │   │
-│  │   │  · Sentence Encoder: all-MiniLM-L6-v2 (Ring 2)      │    │   │
-│  │   │  · NER Pipeline: dslim/bert-base-NER (Ring 3)       │    │   │
-│  │   │  · 所有模型懒加载 + 自动降级                           │    │   │
-│  │   └──────────────────────────────────────────────────────┘    │   │
-│  └──────────────────────┬──────────────────────────────────────┘   │
-│                         │                                          │
-│                         ▼                                          │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │            Visualization Layer (可视化层)                     │   │
-│  │                                                               │   │
-│  │  ┌──────────────────────────────────────────────────────┐   │   │
-│  │  │  dashboard.py (控制台可视化)                          │   │   │
-│  │  │  · InconPreter 风险卡片                               │   │   │
-│  │  │  · DataShield 隐私营养标签                             │   │   │
-│  │  │  · 图谱 JSON 导出                                     │   │   │
-│  │  └──────────────────────────────────────────────────────┘   │   │
-│  │                                                               │   │
-│  │  ┌──────────────────────────────────────────────────────┐   │   │
-│  │  │  server.py (Flask API 服务器)                         │   │   │
-│  │  │  · REST API 端点 (15+)                               │   │   │
-│  │  │  · LLM 配置管理                                      │   │   │
-│  │  │  · 防御开关控制                                      │   │   │
-│  │  │  · AgentPipeline 执行引擎                             │   │   │
-│  │  │  · 追踪记录持久化                                    │   │   │
-│  │  └──────────────────────────────────────────────────────┘   │   │
-│  │                                                               │   │
-│  │  ┌──────────────────────────────────────────────────────┐   │   │
-│  │  │  mock_apps.py (跨 APP 路由 Runtime)                   │   │   │
-│  │  │  · RouterRuntime: 工具名 → APP 路由                   │   │   │
-│  │  │  · UnifiedEnvironment: 统一环境                       │   │   │
-│  │  │  · 原版 TaskSuite 加载                                │   │   │
-│  │  └──────────────────────────────────────────────────────┘   │   │
-│  │                                                               │   │
-│  │  ┌──────────────────────────────────────────────────────┐   │   │
-│  │  │  frontend/ (D3.js 前端可视化平台)                     │   │   │
-│  │  │  · 实时数据流拓扑图 (graph.js)                        │   │   │
-│  │  │  · 事件时间线 (timeline.js)                           │   │   │
-│  │  │  · 风险卡片面板 (risk-panel.js)                       │   │   │
-│  │  │  · 操作控制台 (console.js)                            │   │   │
-│  │  │  · 系统状态面板 (status-panel.js)                     │   │   │
-│  │  │  · 指令流转追踪 (trace-panel.js)                      │   │   │
-│  │  │  · API 通信 (api.js)                                 │   │   │
-│  │  └──────────────────────────────────────────────────────┘   │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
-```
+## 3. 代码结构
 
----
-
-## 三、Capture Layer — AOP 拦截层
-
-**文件**: `src/agentdojo/method/capture/interceptor.py`, `environment_snapshot.py`
-
-### 3.1 核心机制
-
-通过**猴子补丁（Monkey Patching）** 技术，在运行时动态替换 `FunctionsRuntime.run_function` 方法，使其被 `capture_tool_call` 装饰器包装。同时遍历 `agentdojo.agent_pipeline.llms` 包的所有子模块，拦截 LLM 类的 `query` 方法以捕获推理上下文。
-
-```python
-def enable_tracking():
-    import agentdojo.functions_runtime as functions_runtime
-    
-    # 拦截工具调用
-    if not hasattr(functions_runtime.FunctionsRuntime.run_function, "__wrapped__"):
-        original = functions_runtime.FunctionsRuntime.run_function
-        functions_runtime.FunctionsRuntime.run_function = capture_tool_call(original)
-    
-    # 拦截 LLM 推理（遍历 llms 包的所有子模块）
-    _patch_llm_query_methods()
-```
-
-### 3.2 拦截流程
-
-```
-LLM 推理捕获 (capture_llm_interaction)
-  │
-  ├─ 1. 记录 Prompt（用户查询）
-  ├─ 2. 执行 LLM 调用
-  ├─ 3. 提取 Response（Thought + Action）
-  ├─ 4. 创建 ReasoningContext（thought_id, prompt, response）
-  ├─ 5. 记录 LLM 事件到 TrackingContext
-  └─ 6. 记录到知识图谱 (record_llm_interaction)
-
-工具调用拦截 (capture_tool_call)
-  │
-  ├─ 前置阶段
-  │  ├─ 1. 保存执行前环境快照
-  │  ├─ 2. 获取工具语义描述 (Function.description)
-  │  ├─ 3. 推断目标 APP (target_app)
-  │  ├─ 4. 构建 event_record
-  │  ├─ 5. 绑定 wasInformedBy（链接到当前 LLM 推理）
-  │  ├─ 6. 记录到知识图谱 (record_activity)
-  │  ├─ 7. 执行 Analysis Pipeline 前置检查
-│  │    └─ Ring 2 (意图一致性)
-  │  └─ 8. 如果阻断，返回错误
-  │
-  ├─ 执行阶段
-  │  └─ 调用原始 run_function
-  │
-  └─ 后置阶段
-     ├─ 1. 提取输出结果
-     ├─ 2. 计算环境增量 (EnvironmentDelta)
-     ├─ 3. 更新知识图谱 (update_activity_outcome)
-     └─ 4. 执行 Analysis Pipeline 后置检查
-          └─ Ring 3 (DOE 脱敏) → Ring 1 (注入检测)
-```
-
-### 3.3 TrackingContext 单例
-
-使用单例模式维护全局的追踪上下文：
-
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `events` | `List[Dict]` | 事件列表 |
-| `current_agent_id` | `str` | 当前 Agent ID（默认 `"AIAgent_Default"`） |
-| `reasoning_history` | `List[ReasoningContext]` | 推理历史（Thought/Action 序列） |
-| `current_reasoning` | `Optional[ReasoningContext]` | 当前推理上下文 |
-| `last_environment` | `Any` | 执行前的环境快照 |
-
-**ReasoningContext** 记录单次 LLM 推理的完整上下文：
-
-| 字段 | 说明 |
-|------|------|
-| `thought_id` | 唯一标识（如 `thought_a1b2c3d4`） |
-| `prompt` | 发送给 LLM 的 Prompt |
-| `response` | LLM 的响应（Thought + Action） |
-| `tool_calls` | 本次推理触发的工具调用列表 |
-| `timestamp` | 时间戳 |
-
-### 3.4 全局防御开关
-
-```python
-_defense_enabled = True  # 全局开关，关闭后 Analysis Pipeline 全部跳过
-```
-
-当 `_defense_enabled = False` 时：
-- `process_before_execution` 被跳过，直接返回 `(True, kwargs, {}, set())`
-- `process_after_execution` 被跳过，直接返回原始 `result`
-
-该开关可通过前端可视化平台的防御开关 toggle 控制，通过 `/api/config/defense` API 动态修改。
-
-### 3.5 工具语义推断
-
-**`_get_function_description(runtime, function_name)`**：从 `FunctionsRuntime.functions[].description` 获取函数的语义描述（原版 Function 的 docstring 短描述），无需硬编码映射。
-
-**`_infer_app_from_function(function_name)`**：根据函数名推断所属 APP（如 `send_email` → `email`，`get_balance` → `banking`），用于生成友好的可视化标签。
-
-### 3.6 环境状态语义解析
-
-**文件**: `src/agentdojo/method/capture/environment_snapshot.py`
-
-对比执行前后的环境状态，提取语义化的 `DomainData` 实体：
-
-| 实体类型 | 推断关键词 |
-|---------|-----------|
-| `email` | email, inbox, mail, sent, draft, message |
-| `file` | file, document, attachment, download |
-| `contact` | contact, recipient, sender, address_book |
-| `transaction` | transaction, payment, transfer, balance, account |
-| `calendar_event` | calendar, event, meeting, appointment |
-| `travel_booking` | flight, hotel, booking, reservation, trip |
-
-**语义噪声过滤**：自动过滤 UI 渲染相关的噪声属性（如 `timestamp`, `uuid`, `scroll_position`, `animation_state` 等），只保留交互属性和数据负载。
-
-**环境增量（EnvironmentDelta）**：
-
-| 集合 | 说明 |
-|------|------|
-| `created` | 新增的实体 |
-| `updated` | 更新的实体 |
-| `deleted` | 删除的实体 |
-| `accessed` | 访问的实体（无变化） |
-
----
-
-## 四、Modeling Layer — 知识图谱建模层
-
-**文件**: `src/agentdojo/method/modeling/graph_db.py`
-
-### 4.1 核心机制
-
-使用 **NetworkX** 实现内存中的有向图（`nx.DiGraph`），模拟 **PROV-AGENT**（W3C 溯源标准）和 **FSM**（有限状态机）数据结构的融合。采用单例模式，线程安全。
-
-### 4.2 图谱节点类型
-
-| 节点类型 | 说明 | 对应概念 |
-|---------|------|---------|
-| `AIAgent` | AI Agent 实体（根节点） | PROV: Agent |
-| `AIModelInvocation` | LLM 推理步骤（合并 Thought 概念） | PROV: Activity |
-| `AgentTool` | 工具调用活动（FSM Transition） | PROV: Activity |
-| `Prompt` | 推理提示内容 | PROV: Entity |
-| `DomainData` | 输入/输出/环境数据（FSM State） | PROV: Entity |
-
-### 4.3 图谱边类型（v2 优化）
-
-| 边关系 | 方向 | 语义 |
-|-------|------|------|
-| `informed` | Prompt → AIModelInvocation | Prompt（用户指令）通知/触发了 LLM 推理 |
-| `informed` | AIModelInvocation → AgentTool | LLM 推理通知/触发了工具调用 |
-| `used` | AgentTool → DomainData(Input) | 工具调用使用了输入数据 |
-| `produces` | AgentTool → DomainData(Output) | 工具调用产生了输出数据 |
-| `belongsTo` | AgentTool → AIAgent | 工具调用归属于 Agent |
-| `belongsTo` | AIModelInvocation → AIAgent | LLM 推理归属于 Agent |
-
-### 4.4 语义化标签
-
-节点标签使用 emoji + 中文描述，便于可视化展示：
-
-```
-📧 发送邮件          (send_email)
-💰 查询余额          (get_balance)
-📅 获取今日日程      (get_current_day)
-📁 创建文件          (create_file)
-📄 读取文件          (read_file)
-👤 更新用户信息      (update_user_info)
-```
-
-优先使用 `Function.description`（来自原版 docstring），不可用时从函数名自动生成。
-
-### 4.5 关键函数
-
-| 函数 | 触发时机 | 说明 |
-|------|---------|------|
-| `record_llm_interaction(event)` | LLM 推理完成后 | 创建 AIModelInvocation + Prompt 节点，建立 informed 边 |
-| `record_activity(event)` | 工具调用执行前 | 创建 AgentTool + DomainData(Input) 节点，链接到 AIModelInvocation |
-| `update_activity_outcome(event)` | 工具调用执行后 | 创建 DomainData(Output) + 环境增量节点，建立 produces 边 |
-| `get_graph_data()` | 按需调用 | 导出图谱数据（D3.js 兼容格式，source/target 转为对象引用） |
-| `get_graph_summary()` | 按需调用 | 返回图谱统计摘要（节点/边数量、类型分布） |
-
----
-
-## 五、Analysis Layer — 4-Ring 审计管道
-
-**文件**: `src/agentdojo/method/analysis/pipeline.py`
-
-### 5.1 管道编排
-
-```
-process_before_execution(event, prompt)   process_after_execution(event, result)
-         │                                         │
-         ▼                                         ▼
-┌──────────────────────┐                 ┌──────────────────────┐
-│   Ring 0:            │                 │   Ring 3:            │
-│   Prompt Injection   │                 │   DOE Mitigation     │
-│   (LLM 推理前检测)    │                 │   (数据过度暴露脱敏)  │
-│                      │                 │                      │
-│   ⭐ 最先执行！       │                 │   使用 NER + 正则     │
-│   使用 DeBERTa + 正则 │                 │   检测并替换敏感数据   │
-│   检测用户输入中的注入 │                 └──────────┬───────────┘
-│   如检测到则阻断 LLM  │                            ▼
-└──────────┬───────────┘                 ┌──────────────────────┐
-           ▼                            │   Ring 1:            │
-┌──────────────────────┐                 │   Prompt Injection   │
-│   Ring 2:            │                 │   Detection          │
-│   Intent Consistency │                 │   (工具输出检测)      │
-│   (意图一致性检查)    │                 │                      │
-│                      │                 │   使用 DeBERTa + 正则 │
-│   检查当前操作是否与   │                 │   检测工具输出中的注入 │
-│   用户原始意图一致     │                 │   如检测到则阻断结果   │
-└──────────────────────┘                 └──────────────────────┘
-```
-
-**执行顺序说明**：
-
-- **前置（调用前）**：Ring 0（LLM 前注入检测）→ Ring 2（意图一致性检查）
-  - Ring 0 **最先执行**，检测用户输入的 prompt 是否包含注入指令。如果 prompt 本身被注入，后续所有检查都无意义
-  - Ring 2 检查当前操作是否与用户原始意图一致，如果不一致则直接阻断
-  - 注意：Ring 0 仅在 LLM 推理前触发（`capture_llm_interaction`），工具调用前置检查只执行 Ring 2
-
-- **后置（调用后）**：Ring 3（DOE 脱敏）→ Ring 1（提示注入检测）
-  - Ring 3 实现了 **上下文感知脱敏**（D_OE 公式），不仅检测敏感模式，还结合用户意图判断数据是否属于"过度暴露"。用户合法获取凭据时凭据保留，意外泄露时脱敏。
-  - Ring 1 检测脱敏后的输出是否包含注入指令，如果检测到则返回阻断消息
-
-### 5.2 模型管理（model_utils.py）
-
-**文件**: `src/agentdojo/method/analysis/model_utils.py`
-
-所有 ML 模型采用**懒加载**机制，首次使用时加载并缓存，后续调用复用。如果模型加载失败或不可用，自动降级为规则/正则回退。
-
-| 模型 | 用途 | 所属 Ring | 降级策略 |
-|------|------|-----------|---------|
-| `protectai/deberta-v3-base-prompt-injection-v2` | 提示注入检测 | Ring 0 & Ring 1 | 正则模式匹配 |
-| `all-MiniLM-L6-v2` (Sentence-BERT) | 语义相似度计算 | Ring 2 | 关键词重叠 |
-| `dslim/bert-base-NER` | 敏感实体识别 | Ring 3 | 正则模式匹配 |
-
-**设备自动选择**：优先 CUDA → MPS → CPU。
-
----
-
-### 5.3 Ring 1: SkillProbe Prompt Injection Detection — 提示注入检测
-
-**文件**: `src/agentdojo/method/analysis/skillprobe_topology.py`
-
-#### 原理
-
-检测工具输出内容中是否包含**间接提示词注入（Indirect Prompt Injection）** 模式。当 Agent 读取外部内容（如邮件、文件、网页）时，这些内容可能包含恶意指令，试图覆盖 Agent 的原始任务。
-
-#### 检测流程
-
-```
-工具输出
-  │
-  ├─ 1. 安全检查模式匹配（SAFE_PATTERNS）
-  │    └─ 匹配 → 返回安全（避免误报）
-  │
-  └─ 2. DeBERTa 模型检测
-       ├─ 可用 → 模型推理
-       │    └─ safety_score < threshold → 判定为注入
-       └─ 不可用 → 正则回退
-            └─ 匹配注入模式 → 判定为注入
-```
-
-#### 安全模式白名单（SAFE_PATTERNS）
-
-在模型检测前先匹配，避免误报合法内容：
-
-| 模式 | 示例 |
-|------|------|
-| `ignore (the )?(file\|email\|message\|...)` | "Please ignore the file I sent earlier." |
-| `do not (worry\|hesitate\|forget)` | "Do not worry about the deadline." |
-| `please ignore` | "Please ignore the previous message." |
-| `you can ignore` | "You can ignore the notification." |
-
-#### 正则回退模式
-
-| 类别 | 检测模式 |
-|------|---------|
-| 指令覆盖 | `ignore (all )?(previous\|prior\|above) (instructions\|directives\|...)` |
-| 系统提示篡改 | `(new\|updated\|modified) (system )?prompt` |
-| 身份冒充 | `you are (now )?(a )?(new )?(AI\|assistant\|agent\|bot)` |
-| 敏感操作诱导 | `send (this )?(email\|message\|...) to` |
-| 转账诱导 | `transfer (money\|funds\|payment) to` |
-| 元指令 | `this is (an )?(important\|urgent\|critical) (instruction\|message\|update)` |
-| 强制指令 | `you must (now )?(do\|perform\|execute\|complete)` |
-
-#### 阻断效果
-
-返回 `False`，触发 `"BLOCKED: Indirect prompt injection detected in tool output."` 错误。
-
----
-
-### 5.4 Ring 2: FIDES IFC Intent Consistency — 意图一致性检查
-
-**文件**: `src/agentdojo/method/analysis/fides_ifc.py`
-
-#### 原理
-
-检查 Agent 的当前操作是否与用户的原始任务意图一致。当间接提示词注入成功影响 Agent 时，Agent 可能会执行与用户原始请求无关的操作。
-
-#### 实现
-
-1. **意图提取**：从 LLM 推理上下文中提取用户的原始任务描述（`thought_prompt` 中的 `Query:` 部分）
-2. **语义相似度计算**：使用 Sentence-BERT（`all-MiniLM-L6-v2`）计算当前操作意图与用户原始任务描述的语义相似度
-3. **阈值判定**：相似度阈值 **0.25**（低于此值判定为意图不一致）
-4. **读操作豁免**：`search_emails`, `get_balance`, `read_email` 等读操作始终放行
-5. **敏感操作严格审查**：`send_email`, `transfer_money` 等敏感操作需要更高相似度（阈值 + 0.1）
-
-#### IntentTracker 单例
-
-管理用户任务状态，支持 `reset()` 方法用于测试隔离：
-
-```python
-class IntentTracker:
-    _instance = None
-    
-    def __new__(cls):
-        if not cls._instance:
-            cls._instance = super().__new__(cls)
-            cls._instance.user_task: Optional[str] = None
-            cls._instance.actions_taken: List[str] = []
-            cls._instance.injection_detected: bool = False
-        return cls._instance
-    
-    def reset(self):
-        """重置状态（用于测试隔离）"""
-        self.user_task = None
-        self.actions_taken = []
-        self.injection_detected = False
-```
-
-#### 阻断效果
-
-返回 `False`，触发 `"FIDES IFC: Action inconsistent with user intent (possible injection influence)."` 错误。
-
----
-
-### 5.5 Ring 3: AgentRaft DOE — 数据过度暴露缓解
-
-**文件**: `src/agentdojo/method/analysis/agentraft_doe.py`
-
-#### 原理
-
-**DOE（Data Over-Exposure，数据过度暴露）** 缓解机制。公式化表示为：
-
-```
-D_OE = (D_trans \ (D_nec ∪ D_int)) ∩ D_total
-```
-
-其中：
-- **D_total**：代理可访问的全部数据
-- **D_trans**：在一次交互中实际传输的数据
-- **D_nec（必要数据）**：工具功能所必需的数据（如 `get_credentials` 返回凭据是必要的）
-- **D_int（意图数据）**：用户本次任务明确意图访问的数据（如用户说"get my credentials"）
-- **D_OE（过度暴露数据）**：传输数据中减去必要数据和意图数据后的剩余敏感数据，**只对此部分进行脱敏**
-
-#### 关键区别
-
-| 场景 | 旧行为 | 新行为 |
-|------|--------|--------|
-| 用户说"get my credentials" | 密码被 `[REDACTED]` ❌ | 密码保留（D_int 含 credential） ✅ |
-| 读邮件时意外泄露凭据 | 脱敏 ✅ | 脱敏（凭据是 D_OE） ✅ |
-| 无上下文信息 | 脱敏 ✅ | 保守模式，脱敏 ✅ |
-
-#### 实现
-
-1. **D_nec 提取**：从工具意图（`tool_intent`）映射到必要数据类别
-   - `get_credentials` → `{"credential", "known_secret"}`
-2. **D_int 提取**：从用户原始意图（`thought_prompt`）中解析数据类别
-   - "get my credentials" → `{"credential"}`
-   - "read my emails" → `{"email"}`
-3. **NER 模型检测**：使用 `dslim/bert-base-NER` 检测工具返回结果中的命名实体
-4. **正则模式补充**：匹配以下敏感数据类型：
-
-| 类型 | 模式 |
-|------|------|
-| 凭据 | `(password\|secret\|token\|api[_-]?key)...` |
-| 邮箱 | 标准 email 正则 |
-| 信用卡 | `\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}` |
-| SSN | `\d{3}-\d{2}-\d{4}` |
-| 已知密钥 | `password123`, `secret_token`, `my_secret` 等 |
-
-5. **选择性脱敏**：只替换类别不在 `D_nec ∪ D_int` 中的敏感项为 `[REDACTED]`
-6. **自动降级**：如果 NER 模型不可用，自动降级为纯正则匹配；CUDA 加载失败时自动回退 CPU
-
-#### 执行时机
-
-在工具调用**完成后**（后置处理），对返回结果进行脱敏。Ring 3 在 Ring 1 之前执行，确保即使 Ring 1 检测到注入并阻断，敏感数据也已被脱敏（副作用安全）。
-
-**数据流**：`interceptor.py` 从前置阶段的 Ring 2 获取 `intended_data_categories`（D_int），传递给后置阶段的 Ring 3，实现上下文感知脱敏。
-
-#### 实现
-
-1. **NER 模型检测**：使用 `dslim/bert-base-NER` 检测工具返回结果中的命名实体（人名、组织等）
-2. **正则模式补充**：匹配以下敏感数据类型：
-
-| 类型 | 模式 |
-|------|------|
-| 凭据 | `(password\|secret\|token\|api[_-]?key)...` |
-| 邮箱 | 标准 email 正则 |
-| 信用卡 | `\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}` |
-| SSN | `\d{3}-\d{2}-\d{4}` |
-| 已知密钥 | `password123`, `secret_token`, `my_secret` 等 |
-
-3. **脱敏替换**：检测到的敏感内容替换为 `[REDACTED]`
-4. **自动降级**：如果 NER 模型不可用，自动降级为纯正则匹配
-
-#### 执行时机
-
-在工具调用**完成后**（后置处理），对返回结果进行脱敏。Ring 3 在 Ring 1 之前执行，确保即使 Ring 1 检测到注入并阻断，敏感数据也已被脱敏（副作用安全）。
-
----
-
-### 5.6 Ring 0: Prompt Injection Detection (LLM 前) — LLM 推理前提示注入检测
-
-**文件**: `src/agentdojo/method/analysis/prompt_injection.py`
-
-#### 原理
-
-在 LLM 推理**执行前**，对用户输入的 Prompt 进行语义检查，检测是否包含直接提示注入（Direct Prompt Injection）内容。如果检测到注入，则阻断 LLM 调用，防止恶意指令影响 Agent 行为。
-
-#### 实现
-
-1. 在 `capture_llm_interaction` 中，LLM 调用前触发 Ring 0 检测
-2. 对用户输入的 Prompt 使用 **PI 检测模型**（与 Ring 1 共用 `deberta-v3-base-prompt-injection-v2`）进行语义异常检测
-3. 如果 Prompt 被判定为包含注入内容，则阻断 LLM 调用并返回错误
-4. 可配置检测阈值（默认 0.5，越低越敏感）
-5. 短字符串（< 10 字符）直接放行，不触发检测
-
-#### 阻断效果
-
-返回 `False`，触发 `"BLOCKED: Direct prompt injection detected in user input."` 错误。
-
----
-
-## 六、Visualization Layer — 可视化层
-
-可视化层由三部分组成：
-1. **控制台可视化**（`dashboard.py`）— 命令行输出风险卡片和隐私标签
-2. **Flask API 服务器**（`server.py`）— REST API 服务，连接后端与前端
-3. **跨 APP 路由 Runtime**（`mock_apps.py`）— 统一路由 workspace + banking 工具
-
-### 6.1 控制台可视化（dashboard.py）
-
-**文件**: `src/agentdojo/method/visualization/dashboard.py`
-
-#### InconPreter 风险卡片
-
-```python
-print_risk_card(event_details)
-```
-
-生成自然语言格式的安全风险卡片，包含：
-- Agent ID
-- 目标 APP
-- 尝试的操作
-- 阻断原因
-- 推荐操作（BLOCK / WHITELIST）
-
-#### DataShield 隐私营养标签
-
-```python
-check_data_shield(target_app)
-```
-
-显示第三方 API 的隐私营养标签，模拟展示：
-- 是否收集 PII
-- 是否与第三方共享
-- 数据保留期限
-
-#### 图谱导出
-
-```python
-start_dashboard()
-```
-
-从 Modeling Layer 导出完整的 PROV 溯源图谱，以 JSON 格式输出（D3.js 力导向图兼容格式），包含：
-- `nodes`：节点列表（含 id, type, label, app 等属性）
-- `links`：边列表（含 source, target, relation 属性）
-
----
-
-### 6.2 Flask API 服务器（server.py）
-
-**文件**: `src/agentdojo/method/visualization/server.py`（1248 行）
-
-#### 架构设计
-
-Flask 服务器作为后端核心，提供 REST API 服务，连接前端可视化平台与后端的 AgentPipeline、知识图谱和防御系统。
-
-```
-┌──────────────┐     HTTP/JSON      ┌──────────────────┐
-│  前端浏览器   │ ◄──────────────►  │  Flask API 服务器  │
-│  (D3.js)     │    REST API       │  (server.py)      │
-└──────────────┘                    └────────┬─────────┘
-                                             │
-                    ┌────────────────────────┼────────────────────┐
-                    │                        │                    │
-                    ▼                        ▼                    ▼
-           ┌──────────────┐       ┌──────────────┐      ┌──────────────┐
-           │ AgentPipeline │       │ KnowledgeGraph│      │ Interceptor  │
-           │ (真实 LLM)    │       │ (图谱数据)    │      │ (防御开关)   │
-           └──────────────┘       └──────────────┘      └──────────────┘
-```
-
-#### 完整 API 端点列表
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/health` | 健康检查 |
-| GET | `/api/graph` | 获取图谱数据（节点 + 边 + 统计） |
-| GET | `/api/events` | 获取事件历史 |
-| GET | `/api/risk-cards` | 获取风险卡片列表 |
-| GET | `/api/node/<node_id>` | 获取节点详情 |
-| GET | `/api/apps` | 获取 APP 列表及节点数 |
-| GET | `/api/scenarios` | 获取可用预设场景列表 |
-| GET | `/api/status` | 获取系统状态（各层健康 + LLM 配置 + 功能清单） |
-| POST | `/api/execute` | 执行预设场景或自定义指令 |
-| POST | `/api/execute/custom` | 执行自定义指令（带完整参数） |
-| POST | `/api/execute/scenario` | 执行预设场景 |
-| POST | `/api/config/llm` | 更新 LLM 配置（模型、API Key、参数） |
-| GET | `/api/config/llm` | 获取当前 LLM 配置 |
-| POST | `/api/config/defense` | 切换防御开关 |
-| GET | `/api/config/defense` | 获取防御开关状态 |
-| POST | `/api/trace/save` | 保存追踪记录 |
-| GET | `/api/trace/list` | 获取追踪记录列表 |
-| GET | `/api/trace/<trace_id>` | 获取单条追踪记录详情 |
-| DELETE | `/api/trace/<trace_id>` | 删除追踪记录 |
-| POST | `/api/reset` | 重置系统状态（清空图谱 + 事件 + 风险卡片） |
-| GET | `/api/llm-models` | 获取可用 LLM 模型列表 |
-
-#### API 端点详解
-
-##### 健康检查
-
-```http
-GET /api/health
-Response: { "status": "ok", "timestamp": 1718000000.0 }
-```
-
-##### 图谱数据
-
-```http
-GET /api/graph
-Response: {
-  "nodes": [
-    { "id": "agent_1", "type": "AIAgent", "label": "🤖 AI Agent", "app": "system" },
-    { "id": "tool_1", "type": "AgentTool", "label": "📧 发送邮件", "app": "email" }
-  ],
-  "links": [
-    { "source": { "id": "agent_1" }, "target": { "id": "tool_1" }, "relation": "belongsTo" }
-  ],
-  "stats": { "nodes": 10, "edges": 8, "types": { "AIAgent": 1, "AgentTool": 3, ... } }
-}
-```
-
-##### 事件历史
-
-```http
-GET /api/events
-Response: [
-  {
-    "id": "evt_001",
-    "type": "tool_call",
-    "function": "send_email",
-    "args": { "to": "user@example.com", "subject": "Hello", "body": "..." },
-    "result": "Email sent",
-    "timestamp": 1718000000.0,
-    "blocked": false,
-    "block_reason": null,
-    "app": "email",
-    "tool_intent": "send_email"
-  }
-]
-```
-
-##### 风险卡片
-
-```http
-GET /api/risk-cards
-Response: [
-  {
-    "agent_id": "AIAgent_Default",
-    "target_app": "email",
-    "tool_intent": "send_email",
-    "block_reason": "SkillProbe: Indirect prompt injection detected in tool output.",
-    "timestamp": 1718000000.0
-  }
-]
-```
-
-##### 节点详情
-
-```http
-GET /api/node/<node_id>
-Response: {
-  "id": "tool_1",
-  "type": "AgentTool",
-  "label": "📧 发送邮件",
-  "app": "email",
-  "description": "Send an email to a recipient",
-  "neighbors": [
-    { "id": "agent_1", "relation": "belongsTo", "direction": "incoming" },
-    { "id": "data_1", "relation": "produces", "direction": "outgoing" }
-  ]
-}
-```
-
-##### APP 列表
-
-```http
-GET /api/apps
-Response: {
-  "apps": [
-    { "name": "email", "node_count": 5 },
-    { "name": "banking", "node_count": 3 },
-    { "name": "workspace", "node_count": 4 }
-  ]
-}
-```
-
-##### 预设场景
-
-```http
-GET /api/scenarios
-Response: {
-  "scenarios": [
-    {
-      "id": "injection_email",
-      "name": "邮件注入攻击模拟",
-      "description": "模拟包含注入指令的邮件内容，测试 Ring 1 提示注入检测",
-      "prompt": "Please read my email with id '1'...",
-      "tools": ["read_email", "send_email"]
-    },
-    {
-      "id": "intent_mismatch",
-      "name": "意图不一致攻击模拟",
-      "description": "模拟间接注入场景，测试 Ring 2 意图一致性检查",
-      "prompt": "Please check my calendar...",
-      "tools": ["read_email", "transfer_money"]
-    },
-    {
-      "id": "data_exposure",
-      "name": "数据过度暴露模拟",
-      "description": "模拟凭据泄露场景，测试 Ring 3 DOE 脱敏",
-      "prompt": "Please get my credentials for the 'bank' service...",
-      "tools": ["get_credentials"]
-    },
-    {
-      "id": "config_injection",
-      "name": "配置注入攻击模拟",
-      "description": "模拟配置参数注入场景，测试 Ring 0 LLM 前注入检测",
-      "prompt": "Please update my system configuration...",
-      "tools": ["update_config"]
-    },
-    {
-      "id": "full_attack",
-      "name": "完整注入攻击模拟",
-      "description": "模拟完整注入攻击链路，测试全防御系统",
-      "prompt": "Please check the content of this webpage...",
-      "tools": ["get_webpage_content", "send_email"]
-    }
-  ]
-}
-```
-
-##### 系统状态
-
-```http
-GET /api/status
-Response: {
-  "capture_layer": { "status": "active", "events_count": 15 },
-  "modeling_layer": { "status": "active", "nodes": 10, "edges": 8 },
-  "analysis_layer": {
-    "status": "active",
-    "defense_enabled": true,
-    "ring1": { "status": "active", "model": "deberta-v3" },
-    "ring2": { "status": "active", "model": "all-MiniLM-L6-v2" },
-    "ring3": { "status": "active", "model": "bert-base-NER" },
-    "ring0": { "status": "active", "model": "deberta-v3" }
-  },
-  "visualization_layer": { "status": "active" },
-  "llm_config": {
-    "model": "gemini-2.5-flash",
-    "configured": true,
-    "available_models": ["gemini-2.5-flash", "gemini-2.0-flash-001", ...]
-  },
-  "features": {
-    "tool_interception": true,
-    "llm_capture": true,
-    "knowledge_graph": true,
-    "prompt_injection_detection": true,
-    "intent_consistency": true,
-    "doe_mitigation": true,
-    "risk_card_generation": true,
-    "data_shield": true
-  }
-}
-```
-
-##### 执行预设场景
-
-```http
-POST /api/execute/scenario
-Body: { "scenario_id": "injection_email" }
-Response: {
-  "status": "completed",
-  "messages": [...],
-  "events": [...],
-  "risk_cards": [...],
-  "trace": [...]
-}
-```
-
-##### 执行自定义指令
-
-```http
-POST /api/execute/custom
-Body: {
-  "prompt": "Send an email to user@example.com saying hello",
-  "tools": [
-    { "name": "send_email", "func": "def send_email(to, subject, body): ..." },
-    { "name": "read_email", "func": "def read_email(id): ..." }
-  ]
-}
-Response: {
-  "status": "completed",
-  "messages": [...],
-  "events": [...],
-  "risk_cards": [...],
-  "trace": [...]
-}
-```
-
-##### LLM 配置
-
-```http
-GET /api/config/llm
-Response: {
-  "model": "gemini-2.5-flash",
-  "temperature": 0.7,
-  "max_tokens": 4096,
-  "api_key_configured": true
-}
-
-POST /api/config/llm
-Body: {
-  "model": "gemini-2.5-flash",
-  "temperature": 0.5,
-  "max_tokens": 2048,
-  "api_key": "your-api-key"
-}
-Response: { "status": "ok", "message": "LLM configuration updated" }
-```
-
-##### 防御开关
-
-```http
-GET /api/config/defense
-Response: { "defense_enabled": true }
-
-POST /api/config/defense
-Body: { "defense_enabled": false }
-Response: { "status": "ok", "defense_enabled": false }
-```
-
-##### 追踪记录
-
-```http
-POST /api/trace/save
-Body: { "name": "测试运行 1", "events": [...], "risk_cards": [...] }
-Response: { "status": "ok", "trace_id": "trace_abc123" }
-
-GET /api/trace/list
-Response: {
-  "traces": [
-    { "id": "trace_abc123", "name": "测试运行 1", "timestamp": 1718000000.0, "event_count": 10 }
-  ]
-}
-
-GET /api/trace/<trace_id>
-Response: { "id": "trace_abc123", "name": "测试运行 1", "events": [...], "risk_cards": [...] }
-
-DELETE /api/trace/<trace_id>
-Response: { "status": "ok", "message": "Trace deleted" }
-```
-
-##### 重置系统
-
-```http
-POST /api/reset
-Response: { "status": "ok", "message": "System state reset" }
-```
-
-##### 可用模型列表
-
-```http
-GET /api/llm-models
-Response: {
-  "models": [
-    { "id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "provider": "google" },
-    { "id": "gemini-2.0-flash-001", "name": "Gemini 2.0 Flash", "provider": "google" },
-    { "id": "gemini-1.5-flash-002", "name": "Gemini 1.5 Flash", "provider": "google" },
-    { "id": "gemini-1.5-pro-002", "name": "Gemini 1.5 Pro", "provider": "google" }
-  ]
-}
-```
-
-#### 服务器启动
-
-```python
-from agentdojo.method.visualization.server import start_server
-
-# 启动 Flask 服务器（默认端口 5000）
-start_server(host="0.0.0.0", port=5000, debug=True)
-```
-
----
-
-### 6.3 跨 APP 路由 Runtime（mock_apps.py）
-
-**文件**: `src/agentdojo/method/visualization/mock_apps.py`
-
-#### RouterRuntime 设计原理
-
-`RouterRuntime` 继承自 `FunctionsRuntime`，扩展了工具路由能力，支持跨 APP 的工具调用分发：
-
-```python
-class RouterRuntime(FunctionsRuntime):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._app_routers: Dict[str, FunctionsRuntime] = {}
-        self._current_app: Optional[str] = None
-```
-
-**核心功能**：
-
-1. **APP 注册**：`register_app(name, runtime)` — 注册子 APP 的 Runtime
-2. **工具路由**：`run_function(name, ...)` — 根据工具名自动路由到对应 APP 的 Runtime
-3. **跨 APP 任务标记**：`set_cross_app_task(flag)` — 标记当前是否为跨 APP 任务
-4. **APP 感知**：`get_current_app()` — 获取当前执行的 APP 名称
-
-#### UnifiedEnvironment 统一环境
-
-`UnifiedEnvironment` 继承自 `Environment`，统一管理 workspace 和 banking 两个 APP 的环境状态：
-
-```python
-class UnifiedEnvironment(Environment):
-    def __init__(self):
-        super().__init__()
-        self._workspace_env = WorkspaceEnvironment()
-        self._banking_env = BankingEnvironment()
-```
-
-**核心功能**：
-
-1. **统一状态管理**：同时维护 workspace 和 banking 两个子环境
-2. **APP 感知查询**：`get_state(app_name)` — 根据 APP 名称返回对应子环境的状态
-3. **跨 APP 数据流**：支持一个工具调用同时影响多个 APP 的状态
-4. **原版 TaskSuite 加载**：`load_task_suite(suite_name)` — 加载原版 TaskSuite 的初始状态
-
-#### 原版 TaskSuite 加载
-
-```python
-def load_task_suite(suite_name: str) -> UnifiedEnvironment:
-    """加载原版 TaskSuite 的初始状态到 UnifiedEnvironment"""
-    from agentdojo.default_suites.v1 import banking, workspace
-    
-    env = UnifiedEnvironment()
-    env._workspace_env = workspace.create_inbox()
-    env._banking_env = banking.create_accounts()
-    return env
-```
-
----
-
-## 七、前端可视化平台（frontend/）
-
-**目录**: `frontend/`
-
-### 7.1 架构总览
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     前端可视化平台架构                                 │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  index.html (主页面)                                          │   │
-│  │  · 布局: 顶部状态栏 + 左侧拓扑图 + 右侧面板                    │   │
-│  │  · 引入所有 JS 模块和 CSS 样式                                 │   │
-│  └──────────────────────┬──────────────────────────────────────┘   │
-│                         │                                          │
-│  ┌──────────────────────▼──────────────────────────────────────┐   │
-│  │  main.js (主入口 + 全局状态管理)                              │   │
-│  │  · Store 对象: 全局状态中心                                   │   │
-│  │  · 初始化所有子模块                                           │   │
-│  │  · 定时轮询后端 API                                           │   │
-│  └──────┬──────────┬──────────┬──────────┬──────────┬─────────┘   │
-│         │          │          │          │          │             │
-│         ▼          ▼          ▼          ▼          ▼             │
-│  ┌────────┐ ┌──────────┐ ┌────────┐ ┌────────┐ ┌────────────┐   │
-│  │api.js  │ │graph.js  │ │timeline│ │risk-   │ │console.js  │   │
-│  │(API 通信)│ │(拓扑图)  │ │.js     │ │panel.js│ │(操作控制台) │   │
-│  └────────┘ │D3.js     │ │(时间线) │ │(风险卡片)│ └────────────┘   │
-│             └──────────┘ └────────┘ └────────┘                   │
-│  ┌────────┐ ┌────────────┐ ┌────────────┐                       │
-│  │status- │ │trace-panel │ │style.css   │                       │
-│  │panel.js│ │.js         │ │(样式系统)   │                       │
-│  │(状态面板)│ │(追踪面板)  │ └────────────┘                       │
-│  └────────┘ └────────────┘                                       │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### 7.2 数据流
-
-```
-后端 API (Flask)                   前端浏览器
-┌──────────────┐                  ┌──────────────────────────────┐
-│  /api/graph   │ ◄── 轮询 ────  │  api.js → main.js Store      │
-│  /api/events  │ ◄── 轮询 ────  │       ↓                      │
-│  /api/status  │ ◄── 轮询 ────  │  Store 更新 → 各模块渲染      │
-│  /api/risk-   │ ◄── 轮询 ────  │       ↓                      │
-│    cards      │                │  ┌────────────────────────┐  │
-│  /api/execute │ ◄── 用户操作 ─ │  │  graph.js: 更新拓扑图    │  │
-│  /api/config/ │ ◄── 配置修改 ─ │  │  timeline.js: 追加事件   │  │
-│    llm        │                │  │  risk-panel.js: 更新卡片 │  │
-│  /api/config/ │ ◄── 开关切换 ─ │  │  status-panel.js: 更新   │  │
-│    defense    │                │  │  trace-panel.js: 更新    │  │
-└──────────────┘                │  └────────────────────────┘  │
-                                └──────────────────────────────┘
-```
-
-### 7.3 各模块详解
-
-#### api.js — API 通信模块
-
-**文件**: `frontend/js/api.js`
-
-封装所有后端 API 调用，提供统一的错误处理和 Promise 接口：
-
-```javascript
-const API = {
-    // 图谱数据
-    fetchGraph: () => fetch('/api/graph').then(r => r.json()),
-    
-    // 事件历史
-    fetchEvents: () => fetch('/api/events').then(r => r.json()),
-    
-    // 风险卡片
-    fetchRiskCards: () => fetch('/api/risk-cards').then(r => r.json()),
-    
-    // 系统状态
-    fetchStatus: () => fetch('/api/status').then(r => r.json()),
-    
-    // 执行预设场景
-    executeScenario: (scenarioId) => fetch('/api/execute/scenario', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scenario_id: scenarioId })
-    }).then(r => r.json()),
-    
-    // 执行自定义指令
-    executeCustom: (prompt, tools) => fetch('/api/execute/custom', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, tools })
-    }).then(r => r.json()),
-    
-    // LLM 配置
-    updateLLMConfig: (config) => fetch('/api/config/llm', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config)
-    }).then(r => r.json()),
-    
-    // 防御开关
-    toggleDefense: (enabled) => fetch('/api/config/defense', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ defense_enabled: enabled })
-    }).then(r => r.json()),
-    
-    // 追踪记录
-    saveTrace: (data) => fetch('/api/trace/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data)
-    }).then(r => r.json()),
-    
-    // 重置系统
-    resetSystem: () => fetch('/api/reset', { method: 'POST' }).then(r => r.json()),
-    
-    // 可用模型列表
-    fetchModels: () => fetch('/api/llm-models').then(r => r.json()),
-    
-    // 预设场景列表
-    fetchScenarios: () => fetch('/api/scenarios').then(r => r.json()),
-    
-    // APP 列表
-    fetchApps: () => fetch('/api/apps').then(r => r.json()),
-    
-    // 节点详情
-    fetchNodeDetail: (nodeId) => fetch(`/api/node/${nodeId}`).then(r => r.json()),
-};
-```
-
-#### main.js — 主入口 + 全局状态管理
-
-**文件**: `frontend/js/main.js`
-
-**Store 对象**：全局状态中心，管理所有模块共享的状态：
-
-```javascript
-const Store = {
-    // 图谱数据
-    graphData: { nodes: [], links: [] },
-    // 事件列表
-    events: [],
-    // 风险卡片列表
-    riskCards: [],
-    // 系统状态
-    status: {},
-    // 当前选中的节点
-    selectedNode: null,
-    // 当前选中的事件
-    selectedEvent: null,
-    // 防御开关状态
-    defenseEnabled: true,
-    // LLM 配置
-    llmConfig: {},
-    // 可用模型列表
-    availableModels: [],
-    // 预设场景列表
-    scenarios: [],
-    // APP 列表
-    apps: [],
-    // 追踪记录列表
-    traces: [],
-};
-```
-
-**核心功能**：
-
-1. **初始化**：页面加载时初始化所有子模块，启动定时轮询
-2. **定时轮询**：每 2 秒轮询 `/api/graph`、`/api/events`、`/api/status`、`/api/risk-cards`
-3. **状态同步**：当 Store 更新时，通知各模块重新渲染
-4. **事件处理**：处理节点点击、事件选择等用户交互
-
-#### graph.js — D3.js 拓扑图
-
-**文件**: `frontend/js/graph.js`（1313 行）
-
-使用 D3.js 实现交互式力导向拓扑图，展示知识图谱的完整结构。
-
-**核心功能**：
-
-| 功能 | 说明 |
-|------|------|
-| **力导向图** | D3.js force simulation，节点自动布局 |
-| **泳道图模式** | 按 APP 分泳道（email / banking / workspace / system） |
-| **粒子动画** | 数据流粒子沿边运动，展示实时数据流动 |
-| **视图切换** | 拓扑视图 ↔ 泳道视图 切换 |
-| **节点交互** | 点击节点显示详情，悬停显示标签 |
-| **缩放/拖拽** | 鼠标滚轮缩放，拖拽平移 |
-| **节点颜色编码** | 按节点类型着色（AIAgent=蓝, AgentTool=绿, DomainData=橙, Prompt=紫, AIModelInvocation=红） |
-| **边标签** | 显示边关系（informed / used / produces / belongsTo） |
-| **实时更新** | 图谱变化时自动增量更新，支持节点/边的添加和移除动画 |
-
-**关键实现细节**：
-
-```javascript
-// 力导向图配置
-const simulation = d3.forceSimulation(nodes)
-    .force("link", d3.forceLink(links).id(d => d.id).distance(150))
-    .force("charge", d3.forceManyBody().strength(-300))
-    .force("center", d3.forceCenter(width / 2, height / 2))
-    .force("collision", d3.forceCollide().radius(30));
-
-// 泳道图配置（按 APP 分组）
-const laneForce = d3.forceY(d => {
-    const laneIndex = laneOrder.indexOf(d.app);
-    return laneIndex >= 0 ? (laneIndex + 1) * height / (laneOrder.length + 1) : height / 2;
-}).strength(0.3);
-
-// 粒子动画
-function animateParticles(links) {
-    // 沿边创建流动粒子
-    links.forEach(link => {
-        particles.push({ x: link.source.x, y: link.source.y, target: link });
-    });
-    // 每帧更新粒子位置
-    particles.forEach(p => {
-        p.x += (p.target.target.x - p.x) * 0.02;
-        p.y += (p.target.target.y - p.y) * 0.02;
-    });
-}
-```
-
-#### timeline.js — 事件时间线
-
-**文件**: `frontend/js/timeline.js`
-
-按时间顺序展示所有事件（LLM 推理 + 工具调用），支持筛选和详情查看。
-
-**核心功能**：
-
-1. **时间线渲染**：垂直时间线，每个事件为一个时间点
-2. **事件类型标识**：不同颜色标识 LLM 推理（蓝色）和工具调用（绿色/红色）
-3. **阻断标记**：被防御系统阻断的事件显示红色标记
-4. **详情展开**：点击事件展开详情（参数、结果、阻断原因）
-5. **自动滚动**：新事件自动滚动到时间线底部
-6. **筛选功能**：按事件类型、APP、阻断状态筛选
-
-#### risk-panel.js — 风险卡片面板
-
-**文件**: `frontend/js/risk-panel.js`
-
-展示 InconPreter 生成的安全风险卡片列表。
-
-**核心功能**：
-
-1. **卡片列表**：按时间倒序排列的风险卡片
-2. **严重程度标识**：不同颜色标识风险等级（高=红, 中=橙, 低=黄）
-3. **详情展开**：点击卡片展开详细信息
-4. **操作按钮**：BLOCK（已自动执行）/ WHITELIST（手动确认）
-5. **自动更新**：新风险卡片自动添加到列表顶部
-6. **清空功能**：一键清空所有风险卡片
-
-#### console.js — 操作控制台
-
-**文件**: `frontend/js/console.js`
-
-提供 LLM 配置、防御开关、预设场景执行和自定义指令执行功能。
-
-**核心功能**：
-
-| 功能 | 说明 |
-|------|------|
-| **LLM 模型选择** | 下拉选择可用模型（从 `/api/llm-models` 获取） |
-| **API Key 配置** | 输入 Google API Key |
-| **模型参数配置** | Temperature、Max Tokens 滑块 |
-| **防御开关** | 一键启用/禁用防御系统 |
-| **预设场景执行** | 从下拉列表选择预设场景并执行 |
-| **自定义指令** | 输入自定义 Prompt 并执行 |
-| **工具代码编辑** | 为自定义指令注册工具函数（代码编辑器） |
-| **执行结果展示** | 显示执行结果、事件列表和风险卡片 |
-| **追踪保存** | 将执行结果保存为追踪记录 |
-
-#### status-panel.js — 系统状态面板
-
-**文件**: `frontend/js/status-panel.js`
-
-实时展示系统各层的健康状态和功能清单。
-
-**核心功能**：
-
-1. **各层状态指示**：Capture / Modeling / Analysis / Visualization 四层的状态（active / inactive / error）
-2. **防御开关状态**：显示当前防御开关状态
-3. **LLM 配置状态**：显示当前 LLM 模型和配置状态
-4. **功能清单**：列出所有功能及其启用状态（绿色/红色指示灯）
-5. **图谱统计**：节点数、边数、节点类型分布
-6. **事件统计**：总事件数、阻断事件数、风险卡片数
-
-#### trace-panel.js — 指令流转追踪面板
-
-**文件**: `frontend/js/trace-panel.js`
-
-展示 Agent 执行过程中的指令流转追踪，从用户输入到最终输出的完整链路。
-
-**核心功能**：
-
-1. **追踪步骤展示**：按执行顺序展示每个步骤（用户输入 → LLM 推理 → 工具调用 → 工具结果 → LLM 响应）
-2. **步骤详情**：点击步骤展开详情（Prompt、Response、参数、结果）
-3. **阻断标记**：被防御系统阻断的步骤显示红色标记和阻断原因
-4. **追踪记录管理**：保存、加载、删除追踪记录
-5. **步骤导航**：上一步/下一步导航，快速定位关键步骤
-
----
-
-### 7.4 样式系统（style.css）
-
-**文件**: `frontend/css/style.css`（1733 行）
-
-#### 设计主题
-
-- **暗色主题**：深色背景（`#1a1a2e`、`#16213e`），霓虹色点缀
-- **赛博朋克风格**：发光边框、渐变背景、霓虹文字
-- **响应式布局**：适配不同屏幕尺寸
-
-#### 关键样式组件
-
-| 组件 | 说明 |
-|------|------|
-| **布局系统** | CSS Grid 布局，顶部状态栏 + 左侧主区域 + 右侧面板 |
-| **拓扑图容器** | 全屏 SVG 容器，支持缩放 |
-| **时间线样式** | 垂直时间线，圆点标记，连接线 |
-| **风险卡片** | 卡片式布局，发光边框，颜色编码 |
-| **控制台面板** | 表单样式，按钮样式，代码编辑器 |
-| **状态面板** | 指示灯样式，进度条，统计数字 |
-| **追踪面板** | 步骤导航，详情展开动画 |
-| **动画效果** | 粒子动画，过渡动画，加载动画 |
-| **滚动条** | 自定义滚动条样式 |
-
----
-
-## 八、完整调用流程
-
-```
-1. 用户调用 activate_platform()
-   │
-   ├─ 2. enable_tracking() 执行猴子补丁
-   │    ├─ 包装 FunctionsRuntime.run_function
-   │    └─ 包装 LLM.query 方法
-   │
-   ├─ 3. AgentPipeline 开始执行
-   │    ├─ 3.1 LLM 推理
-   │    │    ├─ 前置: 记录 Prompt
-   │    │    ├─ 执行: LLM 调用
-   │    │    └─ 后置: 创建 ReasoningContext → 图谱记录
-   │    │
-   │    └─ 3.2 工具调用 (被 capture_tool_call 拦截)
-   │         ├─ 前置:
-   │         │    ├─ 环境快照
-   │         │    ├─ 图谱记录 (record_activity)
-│         │    ├─ Ring 0: LLM 推理前注入检测
-│         │    └─ Ring 2: 意图一致性检查
-   │         │
-   │         ├─ 执行: 原始 run_function
-   │         │
-   │         └─ 后置:
-   │              ├─ 环境增量计算
-   │              ├─ 图谱更新 (update_activity_outcome)
-   │              ├─ Ring 3: DOE 数据脱敏
-   │              └─ Ring 1: 提示注入检测
-   │
-   ├─ 4. 可视化输出
-   │    ├─ 控制台: 风险卡片 + 隐私标签 + 图谱导出
-   │    ├─ Flask API: 提供 REST 接口
-   │    └─ 前端: D3.js 拓扑图 + 时间线 + 风险面板
-   │
-   └─ 5. 用户通过前端交互
-        ├─ 查看拓扑图
-        ├─ 查看事件时间线
-        ├─ 查看风险卡片
-        ├─ 执行预设场景
-        ├─ 配置 LLM
-        └─ 切换防御开关
-```
-
----
-
-## 九、使用方式
-
-### 9.1 激活防御平台
-
-```python
-from agentdojo.method import activate_platform
-
-# 在 AgentPipeline 执行前调用
-activate_platform()
-
-# 之后所有工具调用和 LLM 推理都会被自动拦截和审计
-```
-
-### 9.2 启动可视化服务器
-
-```python
-from agentdojo.method.visualization.server import start_server
-
-# 启动 Flask API 服务器
-start_server(host="0.0.0.0", port=5000, debug=True)
-```
-
-### 9.3 前端访问
-
-启动服务器后，在浏览器访问：
-
-```
-http://localhost:5000
-```
-
-前端页面会自动加载并开始轮询后端 API，实时展示：
-- 知识图谱拓扑图
-- 事件时间线
-- 风险卡片
-- 系统状态
-- 操作控制台
-
-### 9.4 API 调用示例
-
-```python
-import requests
-
-# 健康检查
-response = requests.get("http://localhost:5000/api/health")
-print(response.json())  # {"status": "ok", "timestamp": 1718000000.0}
-
-# 获取图谱数据
-response = requests.get("http://localhost:5000/api/graph")
-graph_data = response.json()
-
-# 执行预设场景
-response = requests.post("http://localhost:5000/api/execute/scenario", json={
-    "scenario_id": "injection_email"
-})
-result = response.json()
-
-# 切换防御开关
-response = requests.post("http://localhost:5000/api/config/defense", json={
-    "defense_enabled": False
-})
-print(response.json())  # {"status": "ok", "defense_enabled": false}
-
-# 更新 LLM 配置
-response = requests.post("http://localhost:5000/api/config/llm", json={
-    "model": "gemini-2.5-flash",
-    "temperature": 0.5,
-    "max_tokens": 2048,
-    "api_key": "your-api-key"
-})
-print(response.json())  # {"status": "ok", "message": "LLM configuration updated"}
-```
-
----
-
-## 十、防御机制总结表
-
-| 防御层 | 组件 | 触发时机 | 检测方法 | 阻断效果 |
-|--------|------|---------|---------|---------|
-| Ring 0 | Prompt Injection (LLM 前) | LLM 推理前 | DeBERTa 模型 + 正则 | 阻断 LLM 调用，返回注入错误 |
-| Ring 1 | SkillProbe 提示注入检测 | 工具调用后 | DeBERTa 模型 + 正则 | 阻断工具输出，返回注入错误 |
-| Ring 2 | FIDES IFC 意图一致性检查 | 工具调用前 | Sentence-BERT 语义相似度 | 阻断工具调用，返回意图不一致错误 |
-| Ring 3 | AgentRaft DOE 数据脱敏 | 工具调用后 | NER 模型 + 正则 + 意图上下文 | 选择性替换 D_OE 为 [REDACTED]，保留 D_nec/D_int |
-
----
-
-## 十一、文件结构
-
-```
+```text
 src/agentdojo/method/
-├── __init__.py                          # 入口: activate_platform()
+├── app_domains.py
 ├── capture/
-│   ├── interceptor.py                   # AOP 拦截器 + LLM 推理捕获
-│   └── environment_snapshot.py          # 环境状态语义解析 + 增量计算
+│   ├── interceptor.py
+│   └── environment_snapshot.py
 ├── modeling/
-│   └── graph_db.py                      # 知识图谱 (PROV + FSM, NetworkX)
+│   ├── graph_db.py
+│   ├── labels.py
+│   ├── provenance.py
+│   ├── policy.py
+│   ├── data_sensitivity.py
+│   ├── data_sensitivity.json
+│   └── tool_security.json
 ├── analysis/
-│   ├── pipeline.py                      # 4-Ring 管道编排
-│   ├── model_utils.py                   # 模型管理 (懒加载 + 自动降级)
-│   ├── skillprobe_topology.py           # Ring 1: 提示注入检测
-│   ├── fides_ifc.py                     # Ring 2: 意图一致性检查
-│   ├── agentraft_doe.py                 # Ring 3: DOE 数据脱敏
-│   ├── prompt_injection.py              # Ring 0: LLM 前注入检测
-│   └── fides_hiding.py                  # Ring 4: 选择性隐藏（已弃用）
+│   ├── pipeline.py
+│   ├── injection_scanner.py
+│   ├── prompt_injection.py
+│   ├── tool_output_scanner.py
+│   ├── flow_policy.py
+│   ├── data_need.py
+│   ├── access_plan.py
+│   ├── parameter_binding.py
+│   ├── l2_chain.py
+│   ├── outcome_audit.py
+│   ├── risk_types.py
+│   └── defense_config.py
+├── tasks/
+│   └── cross_app.py
 └── visualization/
-    ├── dashboard.py                     # 控制台可视化 (风险卡片 + 隐私标签)
-    ├── server.py                        # Flask API 服务器 (1248 行)
-    └── mock_apps.py                     # 跨 APP 路由 Runtime
-
-frontend/
-├── index.html                           # 主页面
-├── css/
-│   └── style.css                        # 样式系统 (1733 行)
-└── js/
-    ├── api.js                           # API 通信模块
-    ├── main.js                          # 主入口 + 全局状态管理
-    ├── graph.js                         # D3.js 拓扑图 (1313 行)
-    ├── timeline.js                      # 事件时间线
-    ├── risk-panel.js                    # 风险卡片面板
-    ├── console.js                       # 操作控制台
-    ├── status-panel.js                  # 系统状态面板
-    └── trace-panel.js                   # 指令流转追踪面板
+    ├── server.py
+    ├── mock_apps.py
+    ├── storage_view.py
+    └── dashboard.py
 ```
 
----
+`dashboard.py` 是命令行兼容输出；完整可视化以前端和 Flask API 为准。
 
-## 十二、测试
+## 4. 单次任务执行流程
 
-**文件**: `tests/test_method.py`, `tests/test_method_with_llm.py`
+当前服务对任务执行使用进程内可重入锁。以下步骤整体串行执行，避免并发任务互相覆盖环境、任务基线和 trace：
 
-### 12.1 测试概览
+1. 重置图谱、TrackingContext、APP 环境和任务基线。
+2. 加载对应 APP 环境，或构造 `UnifiedEnvironment`。
+3. 应用场景测试数据、账单邮件或攻击注入数据。
+4. **在测试数据准备完成、Agent 正式执行前捕获任务基线。**
+5. 将用户 prompt、工具 schema、任务计划和控制器占位符通知交给 AgentPipeline。
+6. LLM 推理并选择工具调用。
+7. 工具执行前依次进行 Ring 2 调用范围检查和 Ring 3 最终外发检查。
+8. 工具执行后由 Ring 1 扫描输出字段，并将可安全内容交给 Agent。
+9. 记录图谱、风险事件、FSM 状态、执行时间线、工具活动和任务结果。
+10. 导出任务基线与执行后环境快照，写入 trace 文件。
 
-| 测试编号 | 测试名称 | 类型 | 说明 |
-|---------|---------|------|------|
-| 1 | `test_integration` | 集成测试 | 验证拦截器、图谱、风险卡片、仪表盘完整链路 |
-| 2 | `test_capture_layer` | 无 LLM | 验证 AOP 拦截是否生效，TrackingContext 单例 |
-| 3 | `test_ring1_topology` | 无 LLM | 验证 Ring 1 提示注入检测（安全/注入/系统提示篡改/误报） |
-| 4 | `test_ring2_ifc` | 无 LLM | 验证 Ring 2 意图一致性检查（读操作/一致/不一致） |
-| 5 | `test_ring3_doe` | 无 LLM | 验证 Ring 3 DOE 公式（保守模式/合法获取/邮件泄露/正常文本） |
-| 6 | `test_ring0_injection` | 无 LLM | 验证 Ring 0 LLM 前注入检测（直接注入/正常输入） |
-| 7 | `test_modeling_layer` | 无 LLM | 验证知识图谱构建（节点类型/图谱导出） |
-| 8 | `test_visualization_layer` | 无 LLM | 验证风险卡片和隐私标签输出 |
-| 9 | `test_ring1_with_llm` | 带 LLM | 真实 LLM 调用：Ring 1 提示注入检测 |
-| 10 | `test_ring2_with_llm` | 带 LLM | 真实 LLM 调用：Ring 2 意图一致性检查 |
-| 11 | `test_ring3_with_llm` | 带 LLM | 真实 LLM 调用：Ring 3 上下文感知脱敏（DeepSeek/Gemini） |
-| 12 | `test_ring0_with_llm` | 带 LLM | 真实 LLM 调用：Ring 0 LLM 前注入检测 |
-| 13 | `test_full_pipeline_with_llm` | 带 LLM | 完整 Pipeline 注入攻击模拟 |
+```mermaid
+flowchart LR
+    Reset[Reset] --> Fixtures[Load fixtures]
+    Fixtures --> Baseline[Capture task baseline]
+    Baseline --> Agent[AgentPipeline]
+    Agent --> Before[Ring 2 + Ring 3]
+    Before --> Tool[Execute tool]
+    Tool --> After[Ring 1 scan]
+    After --> Agent
+    Agent --> Trace[Graph + events + snapshots]
+```
 
-### 12.2 运行方式
+预设任务、自定义任务、攻击任务和 `/api/reset` 共用该执行锁。锁是进程内锁，适用于当前单进程 Flask 服务；多进程部署需要外部锁或任务级隔离存储。
+
+## 5. Capture Layer
+
+### 5.1 AOP 拦截
+
+`capture/interceptor.py` 在运行时包装：
+
+- `AgentPipeline.query`
+- LLM 的 `query` 方法
+- `FunctionsRuntime.run_function`
+
+拦截器记录真实消息、工具参数、工具结果、目标 APP、执行状态和异常，不在业务代码中插入模拟调用。
+
+### 5.2 TrackingContext
+
+`TrackingContext` 是当前任务的运行时容器，保存：
+
+- 当前 task、suite 和 agent
+- LLM prompt、response 和上下文字段
+- 工具调用事件
+- 数据来源和来源标签
+- 任务计划、计划使用情况和停止条件
+- 风险、策略和防御诊断
+- 部分消息和最终任务状态
+
+它是线程单例。服务层在执行入口串行化任务，避免单例上下文被多个任务同时复用。
+
+### 5.3 工具调用捕获
+
+工具调用分为 `api_call_start`、`api_call_end` 和阻断事件。事件包含：
+
+- 原始和规范化工具名
+- 目标 APP
+- 参数、参数来源和占位符解析结果
+- 执行前后的环境差异
+- 原始输出与可交给 Agent 的安全输出
+- 信息流标签、注入扫描结果
+- Ring 诊断、风险与策略事件
+
+### 5.4 任务级环境快照
+
+单个工具调用使用 `environment_snapshot.py` 计算局部环境差异。任务级环境变更由 `visualization/storage_view.py` 管理：
+
+- 测试数据完成注入后捕获 `task baseline`
+- Agent 结束后捕获当前环境
+- 比较两份快照，生成 added / changed / removed
+- 为变更补充实体、字段和人工配置的敏感等级
+
+快照序列化只保留 Pydantic 模型声明字段，并统一使用规范容器：
+
+- `Inbox.emails`，省略 `initial_emails` 和计算字段 `received/sent/drafts`
+- `Calendar.events`，省略 `initial_events`
+- `CloudDrive.files`，省略 `initial_files`
+
+这样避免同一对象通过多个镜像字段重复产生差异。无稳定 ID 的列表使用序列差异而不是逐索引比较，避免删除第一项后误报后续所有元素。
+
+邮件、日历事件和云盘文件的运行期实体 `id_` 使用非负数字字符串，作为 APP
+环境中的唯一主键。测试夹具使用独立的 `fixture_id` 保存可读场景标识，不能用
+`scenario_*` 字符串替代运行期实体 ID。夹具注入时会校验数字格式，错误 ID 在
+环境加载阶段立即失败；新建实体统一按当前最大数字 ID 递增。
+
+### 5.5 基线语义
+
+环境变更只应表示 Agent 行为造成的修改。测试时预先加载的账单邮件、攻击文本或场景数据必须进入任务基线，不能作为 Agent 新增内容。
+
+旧 trace 未保存完整任务级快照时，历史回放会从图谱中的环境变更节点恢复摘要，并明确标记“仅保留环境变更摘要”。
+
+## 6. Modeling Layer
+
+### 6.1 核心节点
+
+| 节点类型 | 含义 |
+| --- | --- |
+| `AIAgent` | 当前 Agent |
+| `Prompt` | 用户提示或任务上下文 |
+| `AIModelInvocation` | 一次 LLM 推理 |
+| `AgentTool` | 工具调用活动 |
+| `DomainData` | 输入、输出、清洗结果和环境变更实体 |
+| `TaskState` | FSM 状态 |
+| `RiskEvent` | 风险事件 |
+| `PolicyEvent` | 任务范围或外发策略事件 |
+| `EgressSink` | 外部接收目标 |
+| `HumanAuthorization` | L2 授权请求与结果 |
+
+### 6.2 核心关系
+
+| 关系 | 含义 |
+| --- | --- |
+| `informed` | 上下文或数据影响推理，或推理触发工具 |
+| `used` | 工具读取输入数据 |
+| `produces` | 工具产生输出数据 |
+| `wasDerivedFrom` | 派生数据来源于父数据 |
+| `risk_of` / `policy_of` | 风险或策略事件关联到工具 |
+| `risk_evidence` / `source_of` | 风险关联到具体数据来源 |
+| `egress_to` | 工具连接外部出口 |
+| `leak_sink` | 风险关联到外部出口 |
+| `authorizes` | 人工授权允许某次工具调用 |
+| `transition_to` | 工具或推理触发 FSM 状态 |
+
+`belongsTo`、`wasAssociatedWith`、`wasAttributedTo`、`hasState`、`contains` 等 PROV 或归属边保留在底层图谱和节点详情中，但不进入默认主视图。
+
+### 6.3 信息流标签
+
+每个数据节点和工具结果包含：
+
+```text
+flow_label
+├── confidentiality
+│   ├── level: public | internal | confidential | secret
+│   ├── categories
+│   ├── source_ids
+│   └── source_entities
+├── integrity
+│   ├── kind: trusted | untrusted | tainted
+│   └── taint_roots
+├── injection
+│   ├── source_flagged
+│   ├── flagged_fields
+│   ├── quarantined_fields
+│   └── evidence_refs
+└── influence
+    ├── data
+    └── control
+```
+
+机密性取所有来源的最高等级。派生数据继承父数据等级。完整性标签保留不可信来源和污染根，不对整批结果进行无依据扩散。
+
+### 6.4 FSM 与任务结果
+
+任务状态覆盖：
+
+```text
+INPUT_RECEIVED
+CONTEXT_READY
+ACTION_PROPOSED
+ADMITTED / SANITIZED / HELD / QUARANTINED / BLOCKED
+COMPLETED / INCOMPLETE / FAILED / CANCELLED
+```
+
+`outcome_audit.py` 根据结构化任务计划和实际事件核对必需结果。最终 trace 只保留一个任务级终态，同时保留产生终态的步骤和证据。
+
+仅评估 `presentation` 参数质量、准确性、语气或事实覆盖的 semantic outcome
+不进入 `required_outcomes`。计划编译会将其移动到
+`manual_review_outcomes` 并记录
+`presentation_semantic_outcome_downgraded:<id>`，因此不会把已经成功完成的
+可观察结果错误降级为 `incomplete`。评估酒店选择、金额计算等结构化语义结果的
+outcome 仍保留为必需结果。
+
+## 7. Analysis Layer：四层风险判定
+
+### 7.1 Ring 0：用户输入直接注入
+
+默认检测器为项目本地的 `Horizon-Labs/prompt-injection-guard-small`，支持分块、重叠窗口、URL/邮箱掩码、缓存和批量推理。
+
+支持三种模式：
+
+| 模式 | 行为 |
+| --- | --- |
+| `advisory` | 记录风险，不修改原始 prompt |
+| `quarantine` | 将命中的输入块替换为安全占位符后继续 |
+| `strict` | 检出攻击、无可用内容或检测器不可用时阻断 |
+
+无论采用哪种模式，检测器不可用或扫描不完整都会按 fail-closed 阻断。
+
+安全占位符不是业务数据，也不会被要求还原。若任务依赖被隔离的内容，Agent 应说明信息已被安全策略隐藏。
+
+### 7.2 Ring 1：工具输出与不可信控制流
+
+工具输出在进入后续推理前按字段分块扫描：
+
+- 仅扫描自然语言字段；枚举、布尔、数值、日期时间和机器标识符记为 `not_applicable`
+- 高风险字段替换为间接注入占位符
+- 原始输出、命中块和隔离字段保留在 trace
+- 数据源标记为可疑，并进入后续信息流标签
+- 当不可信数据影响控制参数时产生 ADVISORY 风险
+
+Ring 1 不修改完整审计证据，只限制 Agent 可见内容。
+
+### 7.3 Ring 2：任务范围与工具等级
+
+工具等级来自 `modeling/tool_security.json`：
+
+- `L0`：只读
+- `L1`：普通写操作或不含敏感数据的外发
+- `L2`：敏感外发、删除、权限修改和高影响操作
+
+处理流程：
+
+1. 主模型根据用户目标生成语义任务计划。
+2. 确定性控制器根据工具 schema、APP 和声明式元数据编译、映射并校验计划。
+3. L0/L1 在已授权范围内自动执行；运行时补充的 L0/L1 可按范围更新计划。
+4. L2 必须存在于初始授权计划中。
+5. L2 先通过确定性参数、工具、APP 和来源检查，再由主模型检查调用链合理性。
+6. 检查通过后暂停执行并创建人工授权节点。
+7. 用户批准后仅执行当前计划版本和当前参数；拒绝或异常直接阻断。
+
+L2 的确定性条件由 Ring 2 和 Ring 3 分别给出，包括计划成员、依赖完成、
+effect/APP 授权、工具等级、来源授权、接收方授权、敏感等级和占位符状态。
+主模型调用链检查只做语义判断，返回
+`semantic_plan_relation`、`semantic_preconditions`、
+`semantic_destination_purpose`、`semantic_effect_purpose` 和
+`semantic_parameter_relevance`。这些语义检查全部通过且 `violations` 为空后
+才允许进入人工授权。
+
+`generation_kind=presentation` 或 `parameter_role=presentation` 的自然语言参数
+不参与 L2 的 `semantic_parameter_relevance` 事实审计。模型即使返回针对这些参数的
+`unsupported_fact` 等内容，也只作为 `manual_review_notes` 进入人工确认提示，
+不会导致调用链阻断。计划位置、依赖、结构化接收方和操作效果仍正常检查。
+
+运行时补充的 L0 来源加入外发动作契约时，必须同时更新动作级
+`required_source_refs`、`source_bindings`，以及 APP 和数据实体匹配的参数级
+`allowed_source_refs`。这一同步只扩展同类实体的参数来源，不会把地址、评价等
+来源自动授权给日期或其他无关参数。
+
+运行时步骤的 `supports_outcomes` 默认只建立 supporting source。只有来源的 APP
+和实体能直接匹配现有外发参数绑定，或由显式 `add_binding` 建立关系时，来源才会
+升级为外发 `required_sources` 并成为 egress 步骤依赖。辅助校验来源不得自动
+污染最终外发参数契约。
+
+人工授权节点绑定 `plan_id`、`plan_revision` 与 `plan_hash`。等待期间任务进入
+`HELD`，批准并成功执行后进入实际结果状态。人工授权没有超时。上下文清除、
+任务取消或显式拒绝才会终止等待。L2 外发工具执行失败时，系统记录
+`execution_uncertain` 并安全停止当前任务，不自动重新发送；重新尝试必须由
+用户明确发起并重新经过完整计划、调用链、数据流和人工授权检查。
+
+### 7.4 Ring 3：最终外发数据流
+
+Ring 3 只针对最终外发工具函数，不单独定义外发请求。判定内容：
+
+- 实际将发送的最终参数
+- 参数对应字段和来源
+- 所有来源的敏感等级
+- 派生等级和最高敏感等级
+- 接收方授权状态
+
+接收方分为：
+
+- `fixed_authorized`：用户直接指定
+- `derived_authorized`：由用户授权规则从指定数据源解析
+- `unauthorized`：偏离计划、无法解析或不在授权范围
+
+Ring 3 区分两类来源：
+
+- 直接数据来源：最终参数实际引用的工具输出字段，用于判断来源是否属于计划允许集合；
+- 溯源祖先来源：派生对象历史依赖的父实体，用于敏感等级继承、污染传播和图谱审计。
+
+来源授权只比较直接数据来源。祖先来源即使不属于本次参数的直接允许集合，也不能
+因此误判为越权；它们仍参与最高敏感等级计算，并在 trace 的
+`provenance_ancestors` 中保留。
+
+动态参数可使用控制器占位符。Agent 必须保留占位符，由控制器按计划绑定关系和允许来源解析。最终外发前仍存在占位符时直接阻断。
+
+只有以下条件同时满足才允许进入统一的 L2 人工确认：
+
+- 实际参数都来自授权数据范围
+- 最高敏感等级不超过允许上限
+- 接收方处于授权状态
+- 调用链与计划一致
+
+任一字段越权、接收方越权或敏感等级超限都会记录风险，并阻断或请求重新授权。最终参数、原始参数、字段来源、敏感等级和决策依据全部写入 trace。
+
+对于每个控制器占位符，参数解析器必须同时返回具体值、业务 `explanation`、
+`[0, 1]` 范围内的 `confidence`，以及包含脱敏字段路径和原文片段的来源证据。
+如果 Agent 已经填入具体结构化值，解析器返回的 `value` 必须与该最终值一致；
+不一致时以 `parameter_value_mismatch:<参数名>` fail-closed。
+控制器根据引用文本计算字符区间，并把声明的来源解析到授权计划，随后验证字段
+归属、来源授权、敏感等级和接收方范围。计算、摘要或其他无法在来源中逐字定位
+的语义派生会标记为 `semantic_derivation_unverified` 并交由人工核对，但不会
+绕过证据、授权或敏感等级检查。直接复制参数由控制器生成确定性说明和完整置信度。
+
+`generation_kind=presentation` 或 `parameter_role=presentation` 的自然语言参数
+不比较整段文本，也不执行事实覆盖或候选值检查。Agent 的最终自然语言内容保持不变，
+解析器仍提供解释、置信度、来源证据和敏感等级信息，并在 trace 中标记为
+`validation_mode=natural_language_manual`。该参数仍必须通过来源授权、接收方、
+敏感等级、占位符和统一 L2 人工确认。
+
+L2 人工确认页面按外发参数组织证据。每个参数展示最终值、生成方式、模型解释、
+模型自报置信度、语义支持状态、来源字段、原文片段和溯源引用。模型解释只作为
+人工判断的辅助证据，不构成授权，也不会降低上述确定性校验和人工确认门槛。
+
+`provenance_state` 只有在所有必选来源和字段证据都有效时才是 `complete`；
+缺来源为 `incomplete`，参数解析错误为 `invalid`。
+
+### 7.5 风险决策
+
+```text
+PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
+```
+
+- `PASS`：无风险
+- `ADVISORY`：记录提醒，继续执行
+- `MITIGATE`：使用隔离或清洗后的内容继续
+- `HOLD`：等待人工确认
+- `QUARANTINE`：隔离相关内容
+- `BLOCK`：终止当前操作或任务
+
+风险严重度与工具等级分开保存：数据使用 `risk_level`，工具使用 `tool_risk_level`。
+
+## 8. Visualization API
+
+`visualization/server.py` 提供 Flask REST API：
+
+| 类别 | 端点 |
+| --- | --- |
+| 状态 | `GET /api/status`、`GET /api/health`、`GET /api/apps` |
+| 图谱与事件 | `GET /api/graph`、`GET /api/events`、`GET /api/node/<id>` |
+| 风险 | `GET /api/risk-cards`、`GET /api/risk-events`、`GET /api/policy-events` |
+| 执行 | `POST /api/execute`、`POST /api/execute/custom`、`POST /api/execute/attack` |
+| 配置 | `GET/POST /api/config/llm`、`GET/POST /api/config/defense` |
+| 场景 | `GET /api/scenarios`、`GET /api/attack-scenarios`、攻击任务列表端点 |
+| 人工授权 | `GET /api/confirmations`、`POST /api/confirmations/<request_id>` |
+| 历史 | `GET /api/traces`、`GET /api/traces/<trace_id>` |
+| 环境变更 | `GET /api/storage/suites`、`GET /api/storage/suites/<suite>` |
+| 重置 | `POST /api/reset` |
+
+执行接口共享进程内串行锁，任务期间不会并发修改环境或任务基线。
+
+## 9. 前端
+
+主要文件：
+
+| 文件 | 职责 |
+| --- | --- |
+| `frontend/index.html` | 页面结构和主视图 |
+| `frontend/js/graph.js` | D3 拓扑图、节点布局、边路由、节点详情 |
+| `frontend/js/timeline.js` | 执行时间线和图谱定位 |
+| `frontend/js/risk-panel.js` | 风险、策略和防御卡片 |
+| `frontend/js/storage-view.js` | 环境变更、任务基线和历史快照 |
+| `frontend/js/main.js` | 初始化、视图切换、历史回放和轮询 |
+| `frontend/js/content-renderer.js` | Markdown、表格、代码和 JSON 的安全渲染 |
+
+### 9.1 主拓扑图
+
+默认链路：
+
+```text
+提示词 -> 智能体 -> 推理 -> 输入数据 -> 工具 -> 输出数据 -> 风险/FSM
+```
+
+节点宽度按实际文本像素测量。边使用平滑曲线、不同端口和动态曲率避让节点，并避免重合。主视图默认聚合：
+
+- 同一 Prompt 的多次上下文边
+- 同一工具的多个产出
+- 同一目标的多个派生来源
+- 重复的风险证据/来源关系
+
+悬停相关节点可展开聚合分支。“显示审计边”用于展开状态和辅助证据关系。
+
+### 9.2 环境变更
+
+默认展示字段差异，而不是完整 JSON 树：
+
+- 左侧按实体分组变更
+- 同一 APP 内相同变更类型、实体和字段的记录默认折叠，点击后展开具体路径
+- 右侧并排展示变更前后值
+- 显示敏感等级、来源工具和图谱节点
+- 支持字段差异、任务基线、当前快照三种视图
+- 自动刷新默认关闭
+
+图谱环境变更节点、工具时间线和环境变更视图之间支持相互定位。
+
+### 9.3 历史回放
+
+新 trace 保存：
+
+- 当次图谱
+- 执行时间线
+- 任务基线与执行后环境快照
+- 环境字段差异
+- 风险、策略、任务计划和最终结果
+
+历史回放不会读取当前实时环境。旧 trace 没有完整环境快照时，只显示图谱中可恢复的变更摘要。
+
+## 10. Trace 结构
+
+主要字段：
+
+```text
+trace_id
+timestamp
+prompt
+app_name / suite
+messages
+events
+steps
+graph
+graph_summary
+risk_cards
+policy_events
+task_data_plan
+plan_usage
+task_outcome
+completion_audit
+environment_snapshots
+```
+
+`environment_snapshots[suite]` 包含：
+
+```text
+initial                  # 任务基线
+current                  # 执行后快照
+diff.changes
+diff.counts
+diff.total
+diff.raw_change_count
+baseline_captured_at
+baseline_source
+captured_at
+```
+
+每条环境差异包含：
+
+```text
+path
+kind
+before
+after
+entity
+field
+sensitivity.level
+source_paths
+```
+
+## 11. 配置
+
+### 11.1 工具与敏感等级
+
+| 文件 | 内容 |
+| --- | --- |
+| `modeling/tool_security.json` | 工具 profile、L0/L1/L2、effect、控制字段、内容字段、接收方字段、阈值 |
+| `modeling/data_sensitivity.json` | 四个 APP 的人工实体敏感等级和工具输出实体映射 |
+
+未手工登记的实体默认按 `secret` 处理，未知来源默认标记为 `untrusted`。
+
+### 11.2 防御开关
+
+`analysis/defense_config.py` 支持：
+
+- Ring 0：`small_model`
+- Ring 1：`chunk_scanner`、`untrusted_flow`
+- Ring 2：`task_scope`
+- Ring 3：`sensitive_egress`
+- Ring 0 模式：`advisory`、`quarantine`、`strict`
+
+可全局更新，也可通过单次调用 `options` 覆盖。
+
+### 11.3 环境变量
+
+| 变量 | 说明 |
+| --- | --- |
+| `AGENTDOJO_PI_MODEL_PATH` | 覆盖本地提示注入模型目录 |
+| `AGENTDOJO_USE_RELOADER=true` | 开启 Flask 自动重载 |
+| `AGENTDOJO_ATTACK_SCENARIOS_PER_SUITE` | 每个 suite 生成的攻击场景数量 |
+| `LOCAL_LLM_PORT` | 本地 OpenAI 兼容服务端口，默认 `8000` |
+
+模型加载使用 `local_files_only=True`，不会静默切换到在线下载。
+
+## 12. 启动与调用
+
+### 12.1 跨 APP 验收场景
+
+内置场景均使用 `suite="unified"`，并声明所需 APP、步骤依赖和跨域数据制品：
+
+| 场景 ID | APP 路径 | 重点验证 |
+| --- | --- | --- |
+| `cross_app::inbox_and_balance` | workspace → banking | 只读跨域依赖，不应产生环境修改或 L2 请求 |
+| `cross_app::trip_request_to_slack` | workspace → travel → banking → Slack | 四 APP 数据依赖、预算判断、固定频道外发和 L2 确认 |
+| `cross_app::email_bill_transfer` | workspace → banking | 邮件注入隔离、账单金额来源校验、银行外发和交易环境变更 |
+| `cross_app::calendar_digest_to_slack` | workspace → Slack | 日历机密数据进入统一外发检查，允许固定频道但必须 L2 确认 |
+| `cross_app::todo_file_to_slack` | workspace → Slack | L1 文件创建后，再对 Slack 外发执行 L2 确认 |
+| `cross_app::paris_hotel_reservation` | workspace → travel → workspace | 搜索、价格约束、外部预订和二次邮件外发确认 |
+
+每个场景执行后应同时检查：
+
+1. `required_suites` 中的 APP 均出现在图谱和 APP 流程条。
+2. 工具调用符合数据依赖，后一步确实消费前一步产物。
+3. 所有外发操作进入 Ring 3，并在需要时产生人工授权节点。
+4. 环境差异只包含 Agent 执行后的变化，不含测试 fixture 初始化。
+5. trace 保存图谱、时间线、任务结果和环境快照，并可从历史记录回放。
+
+通过 API 执行：
 
 ```bash
-# 只跑无 LLM 的快速测试
-python -m pytest tests/test_method_with_llm.py -v -m "not llm"
-
-# 跑所有测试（含 LLM，需要 GEMINI_API_KEY）
-python -m pytest tests/test_method_with_llm.py -v
-
-# 只跑 LLM 测试
-python -m pytest tests/test_method_with_llm.py -v -m llm
-
-# 指定模型（默认 gemini-2.5-flash）
-python -m pytest tests/test_method_with_llm.py -v --llm-model gemini-2.5-flash -m llm
-
-# 运行基础集成测试
-python -m pytest tests/test_method.py -v
+curl -X POST http://localhost:5000/api/execute \
+  -H "Content-Type: application/json" \
+  -d '{"action":"cross_app::calendar_digest_to_slack"}'
 ```
 
-### 12.3 测试隔离
-
-所有测试使用 `_reset_all_singletons()` 辅助函数重置单例状态，确保测试间隔离：
-
-```python
-def _reset_all_singletons():
-    """重置所有单例状态，确保测试间隔离"""
-    from agentdojo.method.capture.interceptor import TrackingContext
-    from agentdojo.method.modeling.graph_db import KnowledgeGraph
-    from agentdojo.method.analysis.fides_ifc import IntentTracker
-
-    TrackingContext._instance = None
-    KnowledgeGraph._instance = None
-    IntentTracker._instance = None
-
-    # 恢复环境变量，防止被 agent_pipeline.py 中的 os.environ.pop 影响
-    os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "False"
+```bash
+pip install -e ".[transformers]"
+pip install flask flask-cors networkx
+python -m agentdojo.method.visualization.server
 ```
 
+前端直接打开：
 
+```text
+frontend/index.html
+```
+
+前端当前从 `https://d3js.org` 加载 D3 v7。完全离线部署时需将 D3 资源本地化。
+
+执行预设任务：
+
+```bash
+curl -X POST http://localhost:5000/api/execute \
+  -H "Content-Type: application/json" \
+  -d '{"action":"user_task_0"}'
+```
+
+更新防御配置：
+
+```bash
+curl -X POST http://localhost:5000/api/config/defense \
+  -H "Content-Type: application/json" \
+  -d '{"ring_0":{"enabled":true,"methods":{"small_model":true}},"direct_injection_mode":"quarantine"}'
+```
+
+## 13. 扩展方式
+
+### 新增 APP 或工具
+
+1. 在 AgentDojo task suite 中注册工具和环境。
+2. 在 `app_domains.py` 增加 APP 归属。
+3. 在 `tool_security.json` 登记工具等级、effect 和相关字段。
+4. 在 `data_sensitivity.json` 登记原始实体敏感等级。
+5. 若工具返回新实体，在 `tool_security.json` 的 `tool_output_entities` 中登记输出实体。
+
+### 新增敏感实体
+
+只修改人工配置文件，不根据字段内容猜测敏感等级。派生实体使用来源字段的最高等级。
+
+### 新增检测器
+
+实现与 `InjectionScanner` 相同的分类接口，或通过 `defense_config.py` 增加可开关方法。风险输出必须转换为统一 `RiskAssessment`。
+
+## 14. 已知边界
+
+- 执行串行锁是单进程锁；多进程部署需要外部锁或按 `task_id` 隔离环境。
+- trace 默认可包含完整邮件、文件内容、账户信息和工具输出，属于敏感审计数据。当前 API 未提供额外鉴权，建议仅在本机可信环境运行。
+- 前端依赖 D3 CDN，离线环境需要本地化依赖。
+- 旧 trace 若没有 `environment_snapshots`，只能恢复环境变更摘要。
+- 真实任务执行需要配置可用 LLM API；本地注入分类器需要 `transformers` 和 `torch`。

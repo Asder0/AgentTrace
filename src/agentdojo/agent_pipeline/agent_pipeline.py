@@ -7,7 +7,6 @@ from functools import partial
 from typing import Literal
 
 import anthropic
-import cohere
 import openai
 import requests
 import yaml
@@ -18,7 +17,10 @@ from typing_extensions import Self
 from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
 from agentdojo.agent_pipeline.basic_elements import InitQuery, SystemMessage
 from agentdojo.agent_pipeline.llms.anthropic_llm import AnthropicLLM
-from agentdojo.agent_pipeline.llms.cohere_llm import CohereLLM
+try:
+    from agentdojo.agent_pipeline.llms.cohere_llm import CohereLLM
+except ImportError:  # Optional SDK dependencies may be unavailable.
+    CohereLLM = None  # type: ignore[assignment]
 from agentdojo.agent_pipeline.llms.google_llm import GoogleLLM
 from agentdojo.agent_pipeline.llms.local_llm import LocalLLM
 from agentdojo.agent_pipeline.llms.deepseek_llm import DeepSeekLLM
@@ -32,6 +34,8 @@ from agentdojo.agent_pipeline.tool_execution import (
 )
 from agentdojo.functions_runtime import EmptyEnv, Env, FunctionsRuntime
 from agentdojo.logging import Logger
+from agentdojo.method.analysis.injection_scanner import DEFAULT_THRESHOLD
+from agentdojo.model_assets import DEFAULT_INJECTION_MODEL_ID
 from agentdojo.models import MODEL_PROVIDERS, ModelsEnum
 from agentdojo.types import ChatMessage
 
@@ -98,6 +102,12 @@ def get_llm(provider: str, model: str, model_id: str | None, tool_delimiter: str
         )
         llm = PromptingLLM(client, model)
     elif provider == "cohere":
+        if CohereLLM is None:
+            raise ImportError(
+                "The Cohere provider is unavailable. Install the optional "
+                "Cohere dependencies (including tokenizers)."
+            )
+        import cohere
         client = cohere.Client()
         llm = CohereLLM(client, model)
     elif provider == "google":
@@ -240,9 +250,9 @@ class AgentPipeline(BasePipelineElement):
                 [
                     ToolsExecutor(tool_output_formatter),
                     TransformersBasedPIDetector(
-                        model_name="protectai/deberta-v3-base-prompt-injection-v2",
+                        model_name=DEFAULT_INJECTION_MODEL_ID,
                         safe_label="SAFE",
-                        threshold=0.5,
+                        threshold=DEFAULT_THRESHOLD,
                         mode="message",
                     ),
                     llm,

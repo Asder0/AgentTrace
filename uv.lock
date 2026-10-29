@@ -23,6 +23,7 @@ dependencies = [
     { name = "langchain" },
     { name = "openai" },
     { name = "pydantic", extra = ["email"] },
+    { name = "python-dateutil" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "rich" },

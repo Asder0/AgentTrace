@@ -3,11 +3,10 @@ Defense configuration for the 4-Ring auditing layer.
 
 Provides runtime-adjustable switches for:
 - Each ring (ring_0 .. ring_3): enable / disable the whole ring.
-- Hardcoded detection methods inside each ring (regex patterns,
-  keyword matching, action classification tables, etc.):
-  each can be enabled / disabled independently.
+- Independently switchable methods inside each ring (prompt classification,
+  untrusted-flow advisories, task scope and sensitive-egress checks).
 
-All switches default to enabled, preserving the original behavior.
+All switches default to enabled for the lightweight runtime policy.
 The configuration can be updated at runtime through
 ``set_method_enabled`` / ``set_ring_enabled`` / ``update_config``,
 or by passing per-call ``options`` to the pipeline / detection
@@ -21,26 +20,20 @@ from typing import Any, Dict
 # Configuration schema
 # ---------------------------------------------------------------------------
 
-#: Per-ring hardcoded / model-based detection methods.
-#: ring_0 / ring_1 -> regex + model-based injection detection
-#: ring_2         -> keyword fallback + action classification table
-#: ring_3         -> regex sensitive-data detection + keyword category extraction
+#: Lightweight runtime methods exposed by the tracing platform.
 RING_METHODS: Dict[str, Dict[str, str]] = {
     "ring_0": {
-        "regex": "regex 正则匹配（安全模式 + 指令关键词二次验证）",
-        "model": "DeBERTa 模型检测",
+        "small_model": "小模型分块检测用户输入中的直接提示注入",
     },
     "ring_1": {
-        "regex": "regex 正则匹配（安全模式 + 指令关键词并联检测）",
-        "model": "DeBERTa 模型检测",
+        "chunk_scanner": "小模型分块检测工具输出中的间接提示注入",
+        "untrusted_flow": "将外部不可信数据对控制参数的影响标记为黄色提醒",
     },
     "ring_2": {
-        "keyword": "keyword 关键词相似度回退（Sentence-BERT 不可用时的硬编码回退）",
-        "action_class": "动作分类表（敏感/只读操作阈值表）",
+        "task_scope": "检查工具、APP 和 effect 是否属于本次任务授权",
     },
     "ring_3": {
-        "regex": "regex 敏感数据正则检测（SENSITIVE_PATTERNS）",
-        "keyword": "keyword 关键词类别提取（D_nec / D_int 硬编码关键词表）",
+        "sensitive_egress": "检查敏感类别、机密等级和外发目的地",
     },
 }
 
@@ -66,6 +59,7 @@ def _copy_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _CONFIG = _copy_config(DEFAULT_CONFIG)
+_DIRECT_INJECTION_MODE = "quarantine"
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +68,48 @@ _CONFIG = _copy_config(DEFAULT_CONFIG)
 
 def get_config() -> Dict[str, Any]:
     """Return a deep copy of the current defense configuration."""
-    return _copy_config(_CONFIG)
+    config = _copy_config(_CONFIG)
+    config["direct_injection_mode"] = _DIRECT_INJECTION_MODE
+    # Backward-compatible key used by older frontends and tests.
+    config["user_anchor_mode"] = _DIRECT_INJECTION_MODE
+    return config
+
+
+def direct_injection_mode(options: Dict[str, Any] | None = None) -> str:
+    """Resolve Ring 0 handling for direct prompt injection.
+
+    ``advisory`` records risk without modifying the prompt, ``quarantine``
+    replaces flagged chunks before Agent invocation, and ``strict`` blocks the
+    request when any chunk exceeds the threshold.
+    """
+    value = (
+        options.get("direct_injection_mode")
+        or options.get("user_anchor_mode")
+        if isinstance(options, dict)
+        else None
+    ) or _DIRECT_INJECTION_MODE
+    value = str(value).lower()
+    return value if value in {"advisory", "quarantine", "strict"} else "quarantine"
+
+
+def user_anchor_mode(options: Dict[str, Any] | None = None) -> str:
+    """Backward-compatible alias for :func:`direct_injection_mode`."""
+    return direct_injection_mode(options)
+
+
+def set_direct_injection_mode(mode: str) -> None:
+    global _DIRECT_INJECTION_MODE
+    value = str(mode).lower()
+    if value not in {"advisory", "quarantine", "strict"}:
+        raise ValueError(
+            "direct_injection_mode must be 'advisory', 'quarantine' or 'strict'"
+        )
+    _DIRECT_INJECTION_MODE = value
+
+
+def set_user_anchor_mode(mode: str) -> None:
+    """Backward-compatible alias for the Ring 0 mode setter."""
+    set_direct_injection_mode(mode)
 
 
 def get_ring_config(ring: str) -> Dict[str, Any]:
@@ -126,6 +161,8 @@ def effective_method_enabled(ring: str, method: str, options: Dict[str, Any] = N
     If the whole ring is disabled in ``options`` (or globally) the
     method is also considered disabled.
     """
+    if not effective_ring_enabled(ring, options):
+        return False
     ring_cfg = None
     if options is not None and isinstance(options.get(ring), dict):
         ring_cfg = options[ring]
@@ -167,13 +204,19 @@ def update_config(partial: Dict[str, Any]) -> Dict[str, Any]:
 
     Accepted shape (all fields optional):
     {
-        "ring_0": {"enabled": bool, "methods": {"regex": bool, "model": bool}},
+        "ring_0": {"enabled": bool, "methods": {"small_model": bool}},
         ...
     }
     """
     if not isinstance(partial, dict):
         raise TypeError("Configuration update must be a dict")
+    if "direct_injection_mode" in partial:
+        set_direct_injection_mode(str(partial["direct_injection_mode"]))
+    if "user_anchor_mode" in partial:
+        set_user_anchor_mode(str(partial["user_anchor_mode"]))
     for ring, ring_cfg in partial.items():
+        if ring in {"user_anchor_mode", "direct_injection_mode"}:
+            continue
         ring = str(ring)
         if ring not in RING_METHODS:
             raise KeyError(
@@ -199,6 +242,7 @@ def update_config(partial: Dict[str, Any]) -> Dict[str, Any]:
 
 def reset_config() -> Dict[str, Any]:
     """Restore all rings and methods to the default (all enabled)."""
-    global _CONFIG
+    global _CONFIG, _DIRECT_INJECTION_MODE
     _CONFIG = _copy_config(DEFAULT_CONFIG)
+    _DIRECT_INJECTION_MODE = "quarantine"
     return get_config()

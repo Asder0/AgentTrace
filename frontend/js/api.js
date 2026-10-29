@@ -58,6 +58,21 @@ const API = {
     },
 
     /**
+     * 获取任务范围等策略事件。
+     * @returns {Promise<Array>}
+     */
+    async getPolicyEvents() {
+        try {
+            const response = await fetch(`${this.BASE_URL}/policy-events`);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return await response.json();
+        } catch (err) {
+            console.error('获取策略事件失败:', err.message);
+            throw err;
+        }
+    },
+
+    /**
      * 获取事件历史
      * @returns {Promise<Array>}
      */
@@ -263,7 +278,7 @@ const API = {
         } catch (err) { return null; }
     },
 
-    async setDefenseConfig(enabled, rings = null) {
+    async setDefenseConfig(enabled, rings = null, directInjectionMode = null) {
         try {
             const body = {};
             if (enabled !== null && enabled !== undefined) {
@@ -271,6 +286,9 @@ const API = {
             }
             if (rings) {
                 body.rings = rings;
+            }
+            if (directInjectionMode) {
+                body.direct_injection_mode = directInjectionMode;
             }
             const response = await fetch(`${this.BASE_URL}/config/defense`, {
                 method: 'POST',
@@ -283,6 +301,25 @@ const API = {
             console.error('设置防御配置失败:', err.message);
             throw err;
         }
+    },
+
+    async getPendingConfirmations() {
+        const response = await fetch(`${this.BASE_URL}/confirmations`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json();
+    },
+
+    async resolveConfirmation(requestId, approved) {
+        const response = await fetch(
+            `${this.BASE_URL}/confirmations/${encodeURIComponent(requestId)}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ approved: !!approved }),
+            }
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json();
     },
 
     // ============================================================
@@ -374,7 +411,7 @@ const API = {
     },
 
     // ============================================================
-    // 存储视图 API
+    // 环境变更视图 API
     // ============================================================
 
     /**

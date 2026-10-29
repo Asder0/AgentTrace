@@ -54,8 +54,8 @@ class ModelsEnum(StrEnum):
     """Gemini 2.5 Pro Preview 05/06"""
     GEMINI_2_5_FLASH = "gemini-2.5-flash" ###
     GEMINI_3_1_FLASH_LITE = "gemini-3.1-flash-lite"
-    DEEPSEEK_V4_FLASH = "deepseek-v4-flash"
-    """DeepSeek V4 Flash"""
+    DEEPSEEK_V4_1_FLASH = "deepseek-flash"
+    """DeepSeek V4.1 Flash"""
     LOCAL = "local"
     """Local model"""
     VLLM_PARSED = "vllm_parsed"
@@ -89,7 +89,7 @@ MODEL_PROVIDERS = {
     ModelsEnum.GEMINI_2_5_PRO_PREVIEW_05_06: "google",
     ModelsEnum.GEMINI_2_5_FLASH: "google", ###
     ModelsEnum.GEMINI_3_1_FLASH_LITE: "google",
-    ModelsEnum.DEEPSEEK_V4_FLASH: "deepseek",
+    ModelsEnum.DEEPSEEK_V4_1_FLASH: "deepseek",
     ModelsEnum.LOCAL: "local",
     ModelsEnum.VLLM_PARSED: "vllm_parsed",
 }
@@ -122,7 +122,7 @@ MODEL_NAMES = {
     "gemini-2.5-pro-preview-05-06": "AI model developed by Google",
     # 添加这一行：以兼容所有包含 "gemini" 关键字的模型名字（包括 gemini-2.5）
     "gemini": "AI model developed by Google",
-    "deepseek-v4-flash": "DeepSeek",
+    "deepseek-flash": "DeepSeek",
     "local": "Local model",
     "vllm_parsed": "Local model",
 }

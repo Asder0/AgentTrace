@@ -348,11 +348,15 @@ def reserve_hotel(
     :param start_day: The check-in day for the hotel. Should be in ISO format 'YYYY-MM-DD'.
     :param end_day: The check-out day for the hotel. Should be in ISO format 'YYYY-MM-DD'.
     """
+    parsed_start_day = datetime.datetime.fromisoformat(start_day)
+    parsed_end_day = datetime.datetime.fromisoformat(end_day)
+    if parsed_end_day < parsed_start_day:
+        raise ValueError("The hotel check-out day cannot be before the check-in day.")
     reservation.contact_information = get_user_information(user)["Phone Number"]
     reservation.reservation_type = ReservationType.HOTEL
     reservation.title = hotel
-    reservation.start_time = datetime.datetime.fromisoformat(start_day)
-    reservation.end_time = datetime.datetime.fromisoformat(end_day)
+    reservation.start_time = parsed_start_day
+    reservation.end_time = parsed_end_day
     return f"Reservation for {hotel} from {start_day} to {end_day} has been made successfully."
 
 
@@ -368,14 +372,16 @@ def reserve_restaurant(
     :param start_time: The reservation time. Should be in ISO format 'YYYY-MM-DD HH:MM'.
     The end time is automatically set to be two hours after the start of the reservation.
     """
+    parsed_start_time = datetime.datetime.fromisoformat(start_time)
+    parsed_end_time = parsed_start_time + datetime.timedelta(hours=2)
     reservation.contact_information = get_user_information(user)["Phone Number"]
     reservation.reservation_type = ReservationType.RESTAURANT
     reservation.title = restaurant
-    reservation.start_time = datetime.datetime.fromisoformat(start_time)
-    reservation.end_time = datetime.datetime.fromisoformat(start_time) + datetime.timedelta(hours=2)
-    reservation_date = reservation.start_time.date().isoformat()
-    start_time = reservation.start_time.strftime("%H:%M")
-    end_time = reservation.end_time.strftime("%H:%M")
+    reservation.start_time = parsed_start_time
+    reservation.end_time = parsed_end_time
+    reservation_date = parsed_start_time.date().isoformat()
+    start_time = parsed_start_time.strftime("%H:%M")
+    end_time = parsed_end_time.strftime("%H:%M")
     return f"Reservation for {restaurant} from {start_time} to {end_time} on {reservation_date} has been made successfully."
 
 
@@ -392,11 +398,19 @@ def reserve_car_rental(
     :param start_time: The reservation starting time. Should be in ISO format 'YYYY-MM-DD HH:MM'.
     :param end_time: The reservation end time. Should be in ISO format 'YYYY-MM-DD HH:MM'.
     """
+    parsed_start_time = datetime.datetime.fromisoformat(start_time)
+    parsed_end_time = (
+        datetime.datetime.fromisoformat(end_time)
+        if end_time is not None
+        else parsed_start_time
+    )
+    if parsed_end_time < parsed_start_time:
+        raise ValueError("The car rental end time cannot be before its start time.")
     reservation.contact_information = get_user_information(user)["Phone Number"]
     reservation.reservation_type = ReservationType.CAR
     reservation.title = company
-    reservation.start_time = datetime.datetime.fromisoformat(start_time)
-    reservation.end_time = datetime.datetime.fromisoformat(start_time)
+    reservation.start_time = parsed_start_time
+    reservation.end_time = parsed_end_time
     return f"Reservation for a car at {company} from {start_time} to {end_time} has been made successfully."
 
 

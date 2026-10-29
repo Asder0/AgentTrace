@@ -26,7 +26,7 @@ class Calendar(BaseModel):
 
     def _get_next_id(self) -> CalendarEventID:
         largest_id = max((int(key) for key in self.events.keys()), default=0)
-        return CalendarEventID(largest_id + 1)
+        return CalendarEventID(str(largest_id + 1))
 
     def get_by_day(self, day: datetime.date) -> list[CalendarEvent]:
         return [event for event in self.events.values() if event.start_time.date() == day]

@@ -40,6 +40,8 @@ const TIMELINE = {
     _heightKey: 'agentdojo.timelineHeight',
     _defaultHeight: 300,
     _minHeightPx: 96,
+    _collapseHeightPx: 56,
+    _collapsedRestoreHeight: null,
 
     /**
      * 初始化时间线
@@ -88,6 +90,17 @@ const TIMELINE = {
         }
 
         this.container.addEventListener('click', (ev) => {
+            const storageLink = ev.target.closest('.timeline-storage-link');
+            if (storageLink) {
+                if (typeof STORAGE_VIEW !== 'undefined' && STORAGE_VIEW.openTool) {
+                    STORAGE_VIEW.openTool({
+                        label: storageLink.dataset.toolName || '',
+                        app: storageLink.dataset.app || '',
+                    });
+                }
+                return;
+            }
+
             // 点击“图谱定位”时在拓扑图中高亮对应节点
             const nodeLink = ev.target.closest('.timeline-node-link');
             if (nodeLink) {
@@ -120,9 +133,22 @@ const TIMELINE = {
      * 设置收起 / 展开状态
      */
     _setCollapsed(collapsed) {
-        this._collapsed = !!collapsed;
+        const next = !!collapsed;
+        if (next && !this._collapsed) {
+            this._collapsedRestoreHeight = this._currentHeight();
+        }
+        this._collapsed = next;
         if (this.panel) {
             this.panel.classList.toggle('collapsed', this._collapsed);
+            if (this._collapsed) {
+                this.panel.style.height = '';
+                this.panel.classList.remove('timeline-resized');
+            } else if (
+                this._collapsedRestoreHeight
+                && this._collapsedRestoreHeight > this._collapseHeightPx
+            ) {
+                this._applyHeight(this._collapsedRestoreHeight, false);
+            }
         }
         const toggleBtn = document.getElementById('btnToggleTimeline');
         if (toggleBtn) {
@@ -209,6 +235,13 @@ const TIMELINE = {
     _applyResizeFromPointer(ev) {
         if (!this._resizeState) return;
         const height = this._resizeState.startHeight + (this._resizeState.startY - ev.clientY);
+        if (height <= this._collapseHeightPx) {
+            this._setCollapsed(true);
+            return;
+        }
+        if (this._collapsed) {
+            this._setCollapsed(false);
+        }
         this._applyHeight(height, false);
     },
 
@@ -226,9 +259,13 @@ const TIMELINE = {
         document.body.classList.remove('resizing-timeline');
         this._resizeState = null;
 
-        const height = this._currentHeight();
-        this._writeSavedHeight(height);
-        this._updateResizerAria(height);
+        if (this._collapsed) {
+            this._clearSavedHeight();
+        } else {
+            const height = this._currentHeight();
+            this._writeSavedHeight(height);
+            this._updateResizerAria(height);
+        }
 
         // 高度变化后通知拓扑图重新计算 SVG 尺寸
         window.dispatchEvent(new Event('resize'));
@@ -464,6 +501,14 @@ const TIMELINE = {
         ].join('\u0001');
     },
 
+    _eventKind(event) {
+        if (!event) return 'tool';
+        if (event.type === 'risk' || event.type === 'policy') return 'risk';
+        if (event.type === 'llm') return 'llm';
+        if (event.type === 'phase') return 'phase';
+        return 'tool';
+    },
+
     /**
      * 合并步骤与事件，生成统一的展示条目。
      * 步骤提供顺序与状态，事件提供完整内容。
@@ -474,7 +519,7 @@ const TIMELINE = {
 
         if (steps.length === 0) {
             return pendingEvents.map(event => ({
-                kind: event.type === 'risk' ? 'risk' : (event.type === 'llm' ? 'llm' : 'tool'),
+                kind: this._eventKind(event),
                 step: null,
                 event,
             }));
@@ -500,12 +545,12 @@ const TIMELINE = {
                 event = takeNext(e => e.type === 'llm');
             } else if (name.startsWith('工具调用')) {
                 const toolName = name.replace(/^工具调用[:：]\s*/, '');
-                event = takeNext(e => (e.type === 'tool' || e.type === 'risk')
+                event = takeNext(e => (e.type === 'tool' || e.type === 'risk' || e.type === 'policy')
                     && e.tool_intent === toolName);
                 if (!event) {
-                    event = takeNext(e => e.type === 'tool' || e.type === 'risk');
+                    event = takeNext(e => e.type === 'tool' || e.type === 'risk' || e.type === 'policy');
                 }
-                kind = (event && event.type === 'risk') ? 'risk' : 'tool';
+                kind = (event && (event.type === 'risk' || event.type === 'policy')) ? 'risk' : 'tool';
             }
 
             entries.push({ kind, step, event });
@@ -514,7 +559,7 @@ const TIMELINE = {
         // 未被步骤匹配到的事件（例如后端未返回步骤）追加在末尾
         for (const event of pendingEvents) {
             entries.push({
-                kind: event.type === 'risk' ? 'risk' : (event.type === 'llm' ? 'llm' : 'tool'),
+                kind: this._eventKind(event),
                 step: null,
                 event,
             });
@@ -688,8 +733,16 @@ const TIMELINE = {
         }
 
         const expandable = text.length > previewLimit;
-        const preview = this._formatText(this._truncate(text, previewLimit), mode);
-        const full = this._formatText(text, mode);
+        const renderer = window.AgentTraceContent;
+        const summaryText = renderer
+            ? renderer.summarize(text, previewLimit)
+            : this._truncate(text, previewLimit);
+        const preview = renderer
+            ? this._escape(summaryText)
+            : this._formatText(this._truncate(text, previewLimit), mode);
+        const full = renderer
+            ? renderer.render(text)
+            : this._formatText(text, mode);
         const warning = /\{injection_[^}]*\}/i.test(text)
             ? '<span class="timeline-warning" title="内容包含疑似注入占位符">未信任内容</span>'
             : '';
@@ -703,9 +756,46 @@ const TIMELINE = {
             warning,
             html: `
                 <div class="timeline-content ${className}">
-                    <div class="timeline-preview">${preview}</div>
-                    ${expandable ? `<div class="timeline-full">${full}</div>` : ''}
+                    ${expandable
+                        ? `<div class="timeline-preview">${preview}</div>
+                           <div class="timeline-full">${full}</div>`
+                        : full}
                 </div>`,
+        };
+    },
+
+    _flowMeta(event) {
+        const label = event?.output_flow_label || event?.input_flow_label || {};
+        const confidentiality = label.confidentiality || {};
+        const integrity = label.integrity || {};
+        const injection = label.injection || {};
+        const categories = Array.isArray(confidentiality.categories)
+            ? confidentiality.categories
+            : [];
+        const level = String(confidentiality.level || '').toLowerCase();
+        return {
+            categories,
+            categoryLabels: categories.map(category =>
+                window.AgentTraceRiskLabels?.categoryLabel
+                    ? window.AgentTraceRiskLabels.categoryLabel(category)
+                    : category
+            ),
+            level,
+            trust: String(integrity.kind || '').toLowerCase(),
+            sourceFlagged: Boolean(
+                injection.source_flagged
+                || (injection.risky_entities || []).length
+                || (injection.quarantined_fields || []).length
+            ),
+            injectionIncomplete: Boolean(injection.incomplete),
+            injectionAvailable: injection.available !== false,
+            injectionScore: Number(injection.max_score || 0),
+            injectionFields: Array.isArray(injection.quarantined_fields)
+                ? injection.quarantined_fields
+                : [],
+            sensitive: level === 'confidential'
+                || level === 'secret'
+                || categories.length > 0,
         };
     },
 
@@ -720,6 +810,8 @@ const TIMELINE = {
                 return '<span class="timeline-status timeline-status-blocked">已阻断</span>';
             case 'error':
                 return '<span class="timeline-status timeline-status-error">失败</span>';
+            case 'incomplete':
+                return '<span class="timeline-status timeline-status-error">未完成</span>';
             default:
                 return '<span class="timeline-status timeline-status-ok">成功</span>';
         }
@@ -734,47 +826,26 @@ const TIMELINE = {
         return `<button type="button" class="timeline-node-link" data-node-id="${safeId}" title="在拓扑图中定位该节点">图谱定位</button>`;
     },
 
+    _storageLink(toolName, app) {
+        if (!toolName) return '';
+        return `<button type="button" class="timeline-storage-link" `
+            + `data-tool-name="${this._escape(toolName)}" `
+            + `data-app="${this._escape(app || '')}" `
+            + `title="查看该工具对应的字段级环境变更">环境变更</button>`;
+    },
+
     /**
      * 兼容旧 trace 的模块级 APP 名，统一为 AgentDojo 的 suite 域。
      */
     _canonicalApp(app) {
-        const raw = String(app == null ? '' : app).trim();
-        if (!raw || raw === 'unknown') return raw;
-        const suites = ['system', 'banking', 'workspace', 'slack', 'travel'];
-        if (suites.includes(raw)) return raw;
-
-        const moduleSuites = {
-            'banking_client': ['banking'],
-            'file_reader': ['banking'],
-            'user_account': ['banking'],
-            'email': ['workspace', 'travel'],
-            'email_client': ['workspace', 'travel'],
-            'calendar': ['workspace', 'travel'],
-            'calendar_client': ['workspace', 'travel'],
-            'cloud_drive': ['workspace'],
-            'cloud_drive_client': ['workspace'],
-            'slack': ['slack'],
-            'web': ['slack'],
-            'travel': ['travel'],
-            'travel_booking_client': ['travel'],
-        };
-        const owners = moduleSuites[raw] || [];
-        if (this._contextSuite && owners.includes(this._contextSuite)) return this._contextSuite;
-        if (owners.length === 1) return owners[0];
-        if (owners.length > 1) return 'unified';
-        return raw;
+        return window.AgentTraceAppCatalog.canonicalApp(
+            app,
+            this._contextSuite
+        );
     },
 
     _appLabel(app) {
-        const labels = {
-            'system': '系统',
-            'banking': '银行',
-            'workspace': '办公',
-            'slack': '通讯',
-            'travel': '旅行',
-            'unified': '统一',
-        };
-        return labels[app] || app || '';
+        return window.AgentTraceAppCatalog.appLabel(app);
     },
 
     /**
@@ -834,6 +905,13 @@ const TIMELINE = {
                     <span class="timeline-prompt-label">任务指令</span>${this._escape(this._truncate(prompt, 240))}
                 </div>`;
         }
+        if (event.prompt_modified && event.raw_prompt) {
+            promptHtml += `
+                <details class="timeline-original-prompt">
+                    <summary>查看隔离前的原始 Prompt</summary>
+                    <div>${this._formatText(event.raw_prompt, 'tool')}</div>
+                </details>`;
+        }
 
         const body = this._buildContentBlock(response, 'timeline-thought', 220, 'thought');
         const decision = (step.detail && event.response)
@@ -862,10 +940,26 @@ const TIMELINE = {
     /**
      * 工具调用 / 风险事件：工具名 + 目标 APP + 输出 / 阻断原因
      */
+    _localizedBlockReason(event) {
+        const labels = window.AgentTraceRiskLabels;
+        const candidates = [
+            ...(event?.policy_events || []),
+            ...(event?.risks || []),
+        ];
+        if (labels?.normalizeCard && candidates.length) {
+            const normalized = labels.normalizeCard(candidates[0]);
+            if (normalized?.defense_detail) {
+                return normalized.defense_detail;
+            }
+        }
+        return '安全策略已阻断该操作。';
+    },
+
     _renderToolEntry(entry, seq, time) {
         const step = entry.step || {};
         const event = entry.event || {};
         const isRisk = entry.kind === 'risk';
+        const isPolicy = event.type === 'policy';
         const toolName = event.tool_intent
             || String(step.name || '').replace(/^工具调用[:：]\s*/, '')
             || '未知工具';
@@ -873,25 +967,46 @@ const TIMELINE = {
         const app = appDomain
             ? `<span class="timeline-chip">${this._escape(this._appLabel(appDomain))}</span>`
             : '';
+        const flow = this._flowMeta(event);
+        const categoryChips = flow.categoryLabels.length
+            ? `<span class="timeline-chip timeline-chip-sensitive" title="${this._escape(flow.categoryLabels.join(', '))}">敏感 · ${this._escape(flow.categoryLabels.slice(0, 3).join('/'))}</span>`
+            : '';
+        const trustChip = flow.trust === 'untrusted' || flow.trust === 'tainted'
+            ? `<span class="timeline-chip timeline-chip-untrusted">外部 ${flow.trust === 'tainted' ? '污染' : '输入'}</span>`
+            : '';
+        const injectionChip = flow.sourceFlagged
+            ? `<span class="timeline-chip timeline-chip-injection" title="${this._escape(flow.injectionFields.join(', '))}">注入已隔离 · ${flow.injectionScore.toFixed(2)}</span>`
+            : (!flow.injectionAvailable || flow.injectionIncomplete)
+                ? '<span class="timeline-chip timeline-chip-injection">注入扫描不完整</span>'
+                : '';
 
         const blockReason = event.block_reason
-            ? `<div class="timeline-content timeline-block">${this._formatText(event.block_reason, 'tool')}</div>`
+            ? `<div class="timeline-content timeline-block">${this._escape(this._localizedBlockReason(event))}</div>`
             : '';
 
         const outputText = event.outputs || (!event.tool_intent ? step.detail : '');
-        const body = this._buildContentBlock(outputText, 'timeline-result', 180, 'tool');
+        const body = this._buildContentBlock(
+            outputText,
+            'timeline-result',
+            180,
+            'tool',
+        );
 
         return `
             <article class="timeline-event ${isRisk ? 'timeline-event-risk' : 'timeline-event-tool'}${body.expandable ? ' has-detail' : ''}">
                 <div class="timeline-event-header">
                     <span class="timeline-seq">${seq}</span>
                     <span class="timeline-time">${time}</span>
-                    <span class="timeline-kind ${isRisk ? 'timeline-kind-risk' : 'timeline-kind-tool'}">${isRisk ? '风险' : '工具'}</span>
+                    <span class="timeline-kind ${isRisk ? (isPolicy ? 'timeline-kind-policy' : 'timeline-kind-risk') : 'timeline-kind-tool'}">${isRisk ? (isPolicy ? '策略' : '风险') : '工具'}</span>
                     <span class="timeline-title timeline-tool-name">${this._escape(toolName)}</span>
                     ${app}
+                    ${categoryChips}
+                    ${trustChip}
+                    ${injectionChip}
                     ${body.warning}
                     ${this._statusBadge(step.status || (isRisk ? 'blocked' : (event.status === 'error' ? 'error' : 'completed')))}
                     ${this._nodeLink(step.nodeId)}
+                    ${isRisk ? '' : this._storageLink(toolName, appDomain)}
                     ${body.toggle}
                 </div>
                 ${blockReason}

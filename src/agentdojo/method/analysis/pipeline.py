@@ -1,24 +1,49 @@
-"""
-Orchestrates the 4 rings of the Defense Pipeline.
-Focuses on detecting indirect prompt injection in tool outputs,
-rather than blindly blocking operation sequences.
+"""Runtime policy pipeline for traceable cross-APP Agent execution.
 
-Ring 0: Prompt Injection Detection — Detects injection in initial user prompt
-Ring 1: Prompt Injection Detection — Detects malicious instructions in tool outputs
-Ring 2: Intent Consistency Check — Verifies LLM actions align with user's original task
-Ring 3: DOE (Data Over-Exposure) — Redacts sensitive data from outputs
+The pipeline deliberately keeps only three runtime concerns:
+
+* Ring 0: optional direct-user prompt classification;
+* Ring 1: report untrusted data that influences control arguments;
+* Ring 2: verify the action against a task-scoped capability;
+* Ring 3: verify final egress arguments against action-local flow contracts.
+
+Raw tool outputs are not rewritten. Data capture and provenance remain the
+source of truth; risks are attached to the activity and rendered by the graph.
 """
-from typing import Dict, Any, Tuple
+
+from __future__ import annotations
+
+from typing import Any, Dict, Tuple
+
+from .defense_config import (
+    direct_injection_mode,
+    effective_method_enabled,
+    effective_ring_enabled,
+)
+from .flow_policy import (
+    check_sensitive_egress,
+    check_task_scope,
+    check_untrusted_control,
+)
+from .injection_scanner import (
+    get_injection_scanner,
+    has_residual_instruction,
+    redact_injection_chunks,
+)
 from .prompt_injection import check_prompt_for_injection_with_details
-from .skillprobe_topology import check_tool_output_for_injection, check_tool_output_for_injection_with_details
-from .fides_ifc import check_intent_consistency_with_details
-from .agentraft_doe import apply_doe_mitigation, apply_doe_mitigation_with_details
-from .model_utils import extract_necessary_categories, extract_intended_categories
-from .defense_config import effective_ring_enabled
+from .risk_types import (
+    DECISION_ADVISORY,
+    DECISION_BLOCK,
+    DECISION_MITIGATE,
+    DECISION_QUARANTINE,
+    add_risk_to_event,
+    make_risk,
+    stabilize_risk_identity,
+)
+from .tool_output_scanner import scan_tool_output
 
 
 def _skipped_diagnostics(ring: str, reason: str = "ring_disabled") -> dict:
-    """Diagnostics payload used when a ring is skipped."""
     return {
         "passed": True,
         "skipped": True,
@@ -27,192 +52,386 @@ def _skipped_diagnostics(ring: str, reason: str = "ring_disabled") -> dict:
     }
 
 
-def validate_call_event(event: Dict[str, Any]):
-    """
-    Generic validation, can be used by external loggers.
-    """
-    pass
+def validate_call_event(event: Dict[str, Any]) -> None:
+    """Compatibility hook used by external loggers."""
+    return None
+
+
+def _append_risk(
+    event: Dict[str, Any],
+    diagnostics: Dict[str, Any],
+    risk: dict[str, Any],
+    *,
+    discriminator: str,
+) -> None:
+    stabilize_risk_identity(
+        risk,
+        task_id=event.get("task_id"),
+        discriminator=discriminator,
+    )
+    add_risk_to_event(event, risk)
+    diagnostics.setdefault("risk_assessments", []).append(risk)
 
 
 def process_before_execution(
     event: Dict[str, Any],
-    prompt: str = None,
-    options: dict = None,
+    prompt: str | None = None,
+    options: dict | None = None,
 ) -> Tuple[bool, Dict[str, Any], Dict[str, Any], set]:
-    """
-    Ring 0 & Ring 2 execution logic.
-    
-    Ring 0: Prompt Injection Detection — Detects injection in user prompt (LLM 前)
-    Ring 2: Intent Consistency Check — Verifies LLM actions align with user's original task
-    
-    Also extracts D_int (intended data categories) for use by Ring 3 DOE.
-    
-    Ring 0 最先执行，因为 prompt 注入直接威胁初始安全边界。
-    如果 prompt 本身包含注入指令，后续所有检查都无意义。
-    
-    Args:
-        event: 工具调用事件字典（用于 Ring 2 意图一致性检查）
-        prompt: 用户输入的 prompt 文本（用于 Ring 0 注入检测）
-                如果为 None，则跳过 Ring 0（工具调用场景）
-    
-    Returns (Allowed, Modified_Kwargs, Diagnostics, Intended_Data_Categories)
-    """
-    kwargs = event.get('inputs', {})
-    diagnostics = {"ring_0": {}, "ring_2": {}}
-    intended_data_categories: set = set()
+    """Run prompt, provenance-scope and sensitive-egress checks.
 
-    ring0_enabled = effective_ring_enabled("ring_0", options)
-    ring2_enabled = effective_ring_enabled("ring_2", options)
-    
-    # Ring 0: Prompt Injection Detection (LLM 前，最先执行)
-    # 检测用户输入的 prompt 是否包含注入指令
+    The fourth return value is retained for backward compatibility. Data
+    categories are now carried by flow labels and task plans instead of a
+    legacy category set inferred from text.
+    """
+    kwargs = event.get("inputs", {})
+    diagnostics: Dict[str, Any] = {
+        "ring_0": {},
+        "ring_1": {},
+        "ring_2": {},
+        "ring_3": {},
+        "risk_assessments": [],
+    }
+
+    if (
+        prompt is not None
+        and effective_ring_enabled("ring_0", options)
+        and not effective_method_enabled("ring_0", "small_model", options)
+    ):
+        diagnostics["ring_0"] = _skipped_diagnostics(
+            "ring_0",
+            "method_disabled",
+        )
+        prompt = None
+
     if prompt is not None:
-        if ring0_enabled:
-            ring0_details = check_prompt_for_injection_with_details(prompt, options=options)
-            diagnostics["ring_0"] = ring0_details
+        if effective_ring_enabled("ring_0", options):
+            details = check_prompt_for_injection_with_details(
+                prompt,
+                options=options,
+                scan_result=event.get("injection_scan"),
+                judge_result=(
+                    event.get("injection_judge")
+                    if effective_method_enabled(
+                        "ring_0", "small_model", options
+                    )
+                    else None
+                ),
+            )
+            diagnostics["ring_0"] = details
+            mode = direct_injection_mode(options)
+            detector_unavailable = (
+                details.get("detection_method")
+                in {
+                    "small_model_unavailable",
+                    "main_llm_uncertain",
+                }
+            )
+            scanner_incomplete = bool(
+                details.get("scanner_truncated", False)
+            )
+            detected = (
+                not details.get("passed", True)
+                and details.get("detection_method")
+                in {"small_model_chunked", "main_llm_judge"}
+            )
+            details["mode"] = mode
+            details["raw_prompt"] = prompt
+            sanitized_prompt = prompt
+            risk_decision = None
+            if detector_unavailable or scanner_incomplete:
+                risk_decision = DECISION_BLOCK
+                details["coverage_incomplete"] = True
+            elif detected:
+                if mode == "quarantine":
+                    sanitized_prompt = redact_injection_chunks(
+                        prompt,
+                        event.get("injection_scan") or {},
+                    )
+                    details["sanitized_prompt"] = sanitized_prompt
+                    details["prompt_modified"] = sanitized_prompt != prompt
+                    if not has_residual_instruction(
+                        prompt,
+                        event.get("injection_scan") or {},
+                    ):
+                        risk_decision = DECISION_BLOCK
+                        details["quarantine_empty"] = True
+                    else:
+                        risk_decision = DECISION_MITIGATE
+                elif mode == "advisory":
+                    risk_decision = DECISION_ADVISORY
+                else:
+                    risk_decision = DECISION_BLOCK
 
-            # Extract D_int from user prompt (for Ring 3 DOE)
-            intended_data_categories = extract_intended_categories(prompt, options)
-
-            if not ring0_details["passed"]:
-                event['block_reason'] = "Ring 0: Prompt injection detected in user input."
-                return False, kwargs, diagnostics, intended_data_categories
+            if risk_decision is not None:
+                risk = make_risk(
+                    0,
+                    risk_decision,
+                    (
+                        "The direct-injection detector is unavailable or "
+                        "uncertain in fail-closed mode."
+                        if detector_unavailable
+                        else (
+                            "The direct prompt was not fully scanned; "
+                            "execution was blocked to avoid unscanned input."
+                            if scanner_incomplete
+                            else (
+                                "Direct prompt injection chunks were replaced "
+                                "before Agent invocation."
+                                if risk_decision == DECISION_MITIGATE
+                                else (
+                                    "Prompt injection detected; no usable task "
+                                    "remained after quarantine."
+                                    if details.get("quarantine_empty")
+                                    else (
+                                        "Prompt contains instruction "
+                                        "manipulation; advisory mode preserved "
+                                        "the raw prompt."
+                                        if risk_decision == DECISION_ADVISORY
+                                        else "Direct prompt injection detected."
+                                    )
+                                )
+                            )
+                        )
+                    ),
+                    severity="high" if risk_decision == DECISION_BLOCK else "medium",
+                    event_kind="security",
+                    policy_id="ring0.direct_user_instruction",
+                    confidence=details.get("safety_score"),
+                    fsm_before="CONTEXT_READY",
+                    fsm_after=(
+                        "BLOCKED"
+                        if risk_decision == DECISION_BLOCK
+                        else (
+                            "SANITIZED"
+                            if risk_decision == DECISION_MITIGATE
+                            else "ADMITTED"
+                        )
+                    ),
+                )
+                _append_risk(
+                    event,
+                    diagnostics,
+                    risk,
+                    discriminator=f"ring0:{prompt}",
+                )
+                if risk_decision == DECISION_BLOCK:
+                    event["block_reason"] = (
+                        "Ring 0: injection detector unavailable or "
+                        "uncertain in fail-closed mode."
+                        if detector_unavailable
+                        else (
+                            "Ring 0: the direct prompt was only partially "
+                            "scanned."
+                            if scanner_incomplete
+                            else (
+                                "Ring 0: no usable task remained after prompt "
+                                "quarantine."
+                                if details.get("quarantine_empty")
+                                else "Ring 0: direct prompt injection detected."
+                            )
+                        )
+                    )
+                    return False, kwargs, diagnostics, set()
+                if risk_decision == DECISION_MITIGATE:
+                    event["sanitized_prompt"] = sanitized_prompt
         else:
-            # Ring 0 关闭：跳过注入检测，但仍提取 D_int 供 Ring 3 使用
             diagnostics["ring_0"] = _skipped_diagnostics("ring_0")
-            intended_data_categories = extract_intended_categories(prompt, options)
-    
-    # Ring 2: Intent Consistency Check
-    # Verifies that the LLM's action is consistent with the user's original task
-    if ring2_enabled:
-        ring2_details = check_intent_consistency_with_details(event, options=options)
-        diagnostics["ring_2"] = ring2_details
 
-        # If Ring 2 has user intent text, also extract D_int
-        user_intent = ring2_details.get("user_intent", "")
-        if user_intent:
-            intended_data_categories = intended_data_categories | extract_intended_categories(user_intent, options)
+    ring1 = check_untrusted_control(event, options=options)
+    diagnostics["ring_1"] = ring1
+    if ring1.get("risk"):
+        _append_risk(
+            event,
+            diagnostics,
+            ring1["risk"],
+            discriminator=(
+                f"ring1:{event.get('tool_intent', '')}:"
+                f"{','.join(ring1.get('control_arguments', []))}"
+            ),
+        )
 
-        if not ring2_details["passed"]:
-            event['block_reason'] = "FIDES IFC: Action inconsistent with user intent (possible injection influence)."
-            return False, kwargs, diagnostics, intended_data_categories
-    else:
-        # Ring 2 关闭：跳过意图一致性检查
-        diagnostics["ring_2"] = _skipped_diagnostics("ring_2")
-        # 仍尝试从事件中提取 D_int 供 Ring 3 使用
-        thought_prompt = event.get("thought_prompt", "")
-        if thought_prompt:
-            intended_data_categories = intended_data_categories | extract_intended_categories(thought_prompt, options)
-    
-    return True, kwargs, diagnostics, intended_data_categories
+    ring2 = check_task_scope(event, options=options)
+    diagnostics["ring_2"] = ring2
+    if ring2.get("risk"):
+        _append_risk(
+            event,
+            diagnostics,
+            ring2["risk"],
+            discriminator=(
+                f"ring2:{event.get('tool_intent', '')}:"
+                f"{ring2.get('reason', '')}"
+            ),
+        )
+    if not ring2.get("passed", True):
+        event["block_reason"] = (
+            (ring2.get("risk") or {}).get("reason")
+            or f"Ring 2 blocked {event.get('tool_intent', 'tool')}: "
+            f"{ring2.get('reason', 'policy check failed')}."
+        )
+        return False, kwargs, diagnostics, set()
+
+    ring3 = check_sensitive_egress(event, options=options)
+    diagnostics["ring_3"] = ring3
+    if ring3.get("risk"):
+        _append_risk(
+            event,
+            diagnostics,
+            ring3["risk"],
+            discriminator=(
+                f"ring3:{event.get('tool_intent', '')}:"
+                f"{ring3.get('reason', '')}"
+            ),
+        )
+    if not ring3.get("passed", True):
+        event["block_reason"] = (
+            (ring3.get("risk") or {}).get("reason")
+            or f"Ring 3 blocked {event.get('tool_intent', 'tool')}: "
+            f"{ring3.get('reason', 'flow check failed')}."
+        )
+        return False, kwargs, diagnostics, set()
+
+    return True, kwargs, diagnostics, set()
 
 
 def process_after_execution(
     event_complete: Dict[str, Any],
     result: Any,
-    nec_data: set = None,
-    intent_data: set = None,
-    options: dict = None,
+    nec_data: set | None = None,
+    intent_data: set | None = None,
+    options: dict | None = None,
+    isolated_reader=None,
 ) -> Any:
-    """
-    Ring 1 & 3 execution logic.
-
-    Ring 3: DOE (Data Over-Exposure) mitigation — Redacts sensitive data from outputs
-            respecting D_nec (tool-necessary) and D_int (user-intended) categories.
-    Ring 1: Checks if the tool output contains malicious instructions
-
-    All rings execute regardless of previous ring results, but if Ring 1 detects
-    injection, the final result is replaced with a block message.
-    """
-    ring3_enabled = effective_ring_enabled("ring_3", options)
-    ring1_enabled = effective_ring_enabled("ring_1", options)
-
-    sanitized_result = result
-    if ring3_enabled:
-        # Ring 3: DOE (Data Over-Exposure) mitigation — run first so sanitized data
-        # is available even if Ring 1 blocks
-        if nec_data is None:
-            nec_data = extract_necessary_categories(event_complete.get("tool_intent", ""), options)
-        if intent_data is None:
-            thought_prompt = event_complete.get("thought_prompt", "")
-            intent_data = extract_intended_categories(thought_prompt, options)
-
-        sanitized_result = apply_doe_mitigation(
-            event_complete, result, nec_data=nec_data, intent_data=intent_data, options=options
-        )
-
-    # Ring 1: Prompt Injection Detection in tool outputs
-    if ring1_enabled:
-        tool_output = event_complete.get('outputs', '')
-        if tool_output and not check_tool_output_for_injection(tool_output, options=options):
-            # Injection detected — return safe placeholder (same as original agentdojo's approach)
-            return "<Data omitted because a prompt injection was detected>"
-
-    return sanitized_result
+    """Apply Ring 1 quarantine without exposing the full audit view."""
+    final_result, _diagnostics = process_after_execution_with_details(
+        event_complete,
+        result,
+        nec_data=nec_data,
+        intent_data=intent_data,
+        options=options,
+        isolated_reader=isolated_reader,
+    )
+    return final_result
 
 
 def process_after_execution_with_details(
     event_complete: Dict[str, Any],
     result: Any,
-    nec_data: set = None,
-    intent_data: set = None,
-    options: dict = None,
+    nec_data: set | None = None,
+    intent_data: set | None = None,
+    options: dict | None = None,
+    isolated_reader=None,
 ) -> Tuple[Any, Dict[str, Any]]:
-    """
-    Ring 1 & 3 execution logic with detailed diagnostics for audit tracing.
-
-    Args:
-        event_complete: Tool call event with metadata.
-        result: The tool output to sanitize.
-        nec_data: D_nec — data categories necessary for the tool's function.
-        intent_data: D_int — data categories the user intended to access.
-
-    Returns (Final_Result, Diagnostics)
-    """
-    diagnostics = {"ring_3": {}, "ring_1": {}}
-
-    ring3_enabled = effective_ring_enabled("ring_3", options)
-    ring1_enabled = effective_ring_enabled("ring_1", options)
-
-    sanitized_result = result
-    if ring3_enabled:
-        # Compute D_nec and D_int if not provided
-        if nec_data is None:
-            nec_data = extract_necessary_categories(event_complete.get("tool_intent", ""), options)
-        if intent_data is None:
-            thought_prompt = event_complete.get("thought_prompt", "")
-            intent_data = extract_intended_categories(thought_prompt, options)
-
-        # Ring 3: DOE (Data Over-Exposure) mitigation with context
-        ring3_details = apply_doe_mitigation_with_details(
-            event_complete, result, nec_data=nec_data, intent_data=intent_data, options=options
-        )
-        diagnostics["ring_3"] = ring3_details
-        sanitized_result = ring3_details["sanitized_result"]
-    else:
-        diagnostics["ring_3"] = _skipped_diagnostics("ring_3")
-
-    # Ring 1: Prompt Injection Detection in tool outputs
-    if ring1_enabled:
-        tool_output = event_complete.get('outputs', '')
-        ring1_details = check_tool_output_for_injection_with_details(tool_output, options=options)
-        diagnostics["ring_1"] = ring1_details
-
-        if tool_output and not ring1_details["passed"]:
-            # 在 event_complete 中设置 block_reason，以便前端展示风险卡片
-            event_complete["block_reason"] = "Ring 1: Indirect prompt injection detected in tool output."
-            # 将完整的诊断信息附加到 event_complete，确保 interceptor 能捕获到
-            # 同时保存 ring_1 和 ring_3，避免异常中断导致诊断数据丢失
-            event_complete["_ring1_diagnostics"] = ring1_details
-            event_complete["_ring3_diagnostics"] = diagnostics["ring_3"]
-            # 抛出异常中断 AgentPipeline 执行循环，避免 LLM 继续尝试其他工具调用
-            from ..capture.interceptor import PromptInjectionBlockedError
-            raise PromptInjectionBlockedError(
-                f"Tool output contains prompt injection.",
-                block_reason="Ring 1: Indirect prompt injection detected in tool output.",
-                tool_intent=event_complete.get('tool_intent', ''),
-            )
-    else:
+    """Scan tool output, quarantine suspicious chunks, and retain audit raw data."""
+    diagnostics = {
+        "ring_1": {
+            "passed": True,
+            "executed": False,
+            "mode": "label_only",
+            "output_integrity": (
+                ((event_complete.get("output_flow_label") or {}).get(
+                    "integrity"
+                ) or {})
+            ),
+        },
+        "ring_3": {
+            "passed": True,
+            "executed": False,
+            "mode": "sink_policy_only",
+        },
+        "risk_assessments": [],
+    }
+    if not effective_ring_enabled("ring_1", options):
         diagnostics["ring_1"] = _skipped_diagnostics("ring_1")
+        return result, diagnostics
+    if not effective_method_enabled("ring_1", "chunk_scanner", options):
+        diagnostics["ring_1"] = {
+            "passed": True,
+            "executed": False,
+            "mode": "disabled",
+            "skipped_reason": "chunk_scanner_disabled",
+        }
+        return result, diagnostics
 
-    return sanitized_result, diagnostics
+    scan = scan_tool_output(
+        result,
+        scanner=get_injection_scanner(),
+        tool_name=str(event_complete.get("tool_intent", "")),
+        schema=(
+            event_complete.get("output_schema")
+            if isinstance(event_complete.get("output_schema"), dict)
+            else None
+        ),
+    )
+    diagnostics["ring_1"] = {
+        "passed": scan.available,
+        "executed": True,
+        "mode": "chunk_scanner_quarantine",
+        **scan.to_dict(),
+    }
+    event_complete["injection_scan"] = scan.to_dict()
+
+    output_label = event_complete.get("output_flow_label")
+    if not isinstance(output_label, dict):
+        output_label = {}
+    output_label = dict(output_label)
+    output_label["injection"] = scan.information_flow()
+    event_complete["output_flow_label"] = output_label
+
+    if scan.source_flagged:
+        scan_failed = not scan.available or scan.incomplete
+        decision = (
+            DECISION_QUARANTINE
+            if scan_failed
+            else DECISION_MITIGATE
+        )
+        risk = make_risk(
+            1,
+            decision,
+            (
+                (
+                    "Tool output could not be scanned completely and was "
+                    "quarantined before the next Agent reasoning step. "
+                )
+                if scan_failed
+                else (
+                    "Indirect prompt injection content was detected and "
+                    "quarantined before the next Agent reasoning step. "
+                )
+            )
+            + (
+                "Affected fields: "
+                f"{', '.join(scan.flagged_fields)}."
+            ),
+            severity=(
+                "high"
+                if scan_failed or scan.max_score >= 0.8
+                else "medium"
+            ),
+            event_kind="security",
+            policy_id="ring1.indirect_prompt_injection",
+            activity_id=event_complete.get("activity_id"),
+            source_ids=scan.evidence_refs,
+            taint_roots=scan.evidence_refs,
+            sink_ids=[str(event_complete.get("tool_intent", ""))],
+            fsm_before="OUTPUT_OBSERVED",
+            fsm_after=(
+                "QUARANTINED"
+                if decision == DECISION_QUARANTINE
+                else "SANITIZED"
+            ),
+            confidence=scan.max_score,
+        )
+        _append_risk(
+            event_complete,
+            diagnostics,
+            risk,
+            discriminator=(
+                f"ring1-scan:{event_complete.get('tool_intent', '')}:"
+                f"{','.join(scan.flagged_fields)}"
+            ),
+        )
+    return (
+        scan.sanitized_value if scan.changed else result,
+        diagnostics,
+    )

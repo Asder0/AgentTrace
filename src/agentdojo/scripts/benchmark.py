@@ -108,9 +108,9 @@ def show_results(suite_name: str, results: SuiteResults, show_security_results: 
 @click.command()
 @click.option(
     "--model",
-    default="deepseek-v4-flash",
+    default="deepseek-flash",
     type=str,  # 将 click.Choice 替换为 str，允许直接输入任意小写模型名称
-    help="The language model to benchmark. Defaults to `deepseek-v4-flash`.",
+    help="The language model to benchmark. Defaults to `deepseek-flash`.",
 )
 
 # @click.option(

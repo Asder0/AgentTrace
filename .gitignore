@@ -390,3 +390,9 @@ notebooks/plots/
 runs/
 src/workfolder/
 .claude
+
+# Local model weights are provisioned separately and must not be committed.
+models/
+
+.pytest_*/
+.pytest_tmp/

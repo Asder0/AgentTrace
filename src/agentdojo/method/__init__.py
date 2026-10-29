@@ -1,11 +1,10 @@
 """
 Agentic Data Flow Tracking and Visualization Platform
-Implements Capture (AOP), Modeling (FSM+PROV), Analysis (4-Ring Auditing), and Visualization layers.
+Implements Capture (AOP), Modeling (FSM+PROV), lightweight policy analysis,
+and Visualization layers.
 """
 from .capture.interceptor import enable_tracking
 from .visualization.dashboard import start_dashboard, print_risk_card
-
-import networkx as nx
 
 def activate_platform():
     """

@@ -34,11 +34,19 @@ def tool_result_to_str(
                 res_items += [str(item)]
             elif isinstance(item, BaseModel):
                 res_items += [item.model_dump()]
+            elif isinstance(item, dict):
+                # Ring 3 may deliberately return sanitized structured records
+                # as dictionaries. They are valid FunctionReturnType values and
+                # must not break the Agent execution loop.
+                res_items += [item]
             else:
                 raise TypeError("Not valid type for item tool result: " + str(type(item)))
 
         # If type checking passes, this is guaranteed to be a list of BaseModel
         return dump_fn(res_items).strip()
+
+    if isinstance(tool_result, dict):
+        return dump_fn(tool_result).strip()
 
     return str(tool_result)
 

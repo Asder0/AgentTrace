@@ -5,7 +5,6 @@
  * 
  * 增强功能：
  * - 统一状态管理（Store）
- * - 事件发布/订阅模式
  * - 优化轮询逻辑（增量更新检测）
  * - 加载状态管理
  * - 错误边界处理
@@ -16,45 +15,19 @@
 // ============================================================
 const Store = {
     _state: {
-        loading: true,
-        error: null,
         lastNodeCount: 0,
         lastEdgeCount: 0,
         isPolling: false,
         replaying: false,
     },
     
-    _listeners: {},
-    
     get(key) {
         return this._state[key];
     },
     
     set(key, value) {
-        const old = this._state[key];
         this._state[key] = value;
-        this._emit(key, value, old);
     },
-    
-    on(event, callback) {
-        if (!this._listeners[event]) {
-            this._listeners[event] = [];
-        }
-        this._listeners[event].push(callback);
-    },
-    
-    _emit(event, newVal, oldVal) {
-        (this._listeners[event] || []).forEach(cb => cb(newVal, oldVal));
-    },
-    
-    // 全局事件总线
-    publish(event, data) {
-        (this._listeners[event] || []).forEach(cb => cb(data));
-    },
-    
-    subscribe(event, callback) {
-        this.on(event, callback);
-    }
 };
 
 // ============================================================
@@ -85,14 +58,14 @@ const APP = {
         initModule('TIMELINE', () => TIMELINE.init());
         initModule('RISK_PANEL', () => RISK_PANEL.init());
         initModule('STATUS_PANEL', () => STATUS_PANEL.init());
-        initModule('TRACE_PANEL', () => TRACE_PANEL.init());
         initModule('STORAGE_VIEW', () => STORAGE_VIEW.init());
 
         // 视图交互与模块无关，必须绑定
         this._initTabs();
-        this._initModal();
         this._initResetButton();
         this._initFloatPanel();
+        this._initSidePanelResizer();
+        this._initL2ConfirmationPolling();
 
         try {
             await CONSOLE.init();
@@ -113,7 +86,6 @@ const APP = {
             }
         }
 
-        Store.set('loading', false);
         this._hideLoading();
 
         if (GRAPH.simulation) {
@@ -126,6 +98,538 @@ const APP = {
     /**
      * 显示加载状态
      */
+    _initSidePanelResizer() {
+        const panel = document.querySelector('.side-panel');
+        const handle = document.getElementById('sideResizer');
+        const container = document.querySelector('.main-container');
+        if (!panel || !handle || !container) return;
+
+        this._sidePanel = panel;
+        this._sideResizer = handle;
+        this._mainContainer = container;
+        this._sidePanelWidthKey = 'agentdojo.sidePanelWidth';
+        this._sidePanelCollapsedKey = 'agentdojo.sidePanelCollapsed';
+        this._sidePanelRestoreWidth = 360;
+
+        const savedWidth = this._readSidePanelNumber(this._sidePanelWidthKey, 360);
+        this._sidePanelRestoreWidth = savedWidth;
+        this._applySidePanelWidth(savedWidth, false);
+        this._setSidePanelCollapsed(
+            this._readSidePanelNumber(this._sidePanelCollapsedKey, 0) === 1,
+            false
+        );
+
+        handle.addEventListener('pointerdown', (ev) => this._startSidePanelResize(ev));
+        handle.addEventListener('dblclick', () => {
+            this._setSidePanelCollapsed(!panel.classList.contains('collapsed'));
+        });
+        handle.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter' || ev.key === ' ') {
+                ev.preventDefault();
+                this._setSidePanelCollapsed(!panel.classList.contains('collapsed'));
+                return;
+            }
+            const step = ev.shiftKey ? 48 : 16;
+            const current = panel.classList.contains('collapsed')
+                ? 0
+                : panel.getBoundingClientRect().width;
+            if (ev.key === 'ArrowLeft') {
+                ev.preventDefault();
+                this._setSidePanelCollapsed(false);
+                this._applySidePanelWidth(current + step);
+            } else if (ev.key === 'ArrowRight') {
+                ev.preventDefault();
+                this._applySidePanelWidth(current - step);
+            } else if (ev.key === 'Home') {
+                ev.preventDefault();
+                this._setSidePanelCollapsed(true);
+            } else if (ev.key === 'End') {
+                ev.preventDefault();
+                this._setSidePanelCollapsed(false);
+                this._applySidePanelWidth(this._maxSidePanelWidth());
+            }
+        });
+    },
+
+    _startSidePanelResize(ev) {
+        if (typeof ev.button === 'number' && ev.button !== 0) return;
+        ev.preventDefault();
+        if (this._sidePanel.classList.contains('collapsed')) {
+            this._setSidePanelCollapsed(false, false);
+        }
+        this._sideResizeState = {
+            startX: ev.clientX,
+            startWidth: this._sidePanel.getBoundingClientRect().width,
+        };
+        document.body.classList.add('resizing-side');
+        this._onSidePointerMove = this._onSidePointerMove || ((event) => {
+            if (!this._sideResizeState) return;
+            const width = this._sideResizeState.startWidth
+                + (this._sideResizeState.startX - event.clientX);
+            if (width <= 64) {
+                this._setSidePanelCollapsed(true, false);
+                return;
+            }
+            this._applySidePanelWidth(width, false);
+        });
+        this._onSidePointerUp = this._onSidePointerUp || (() => {
+            if (!this._sideResizeState) return;
+            window.removeEventListener('pointermove', this._onSidePointerMove);
+            window.removeEventListener('pointerup', this._onSidePointerUp);
+            window.removeEventListener('pointercancel', this._onSidePointerUp);
+            this._sideResizeState = null;
+            document.body.classList.remove('resizing-side');
+            if (this._sidePanel.classList.contains('collapsed')) {
+                this._storeSidePanelNumber(this._sidePanelCollapsedKey, 1);
+            } else {
+                this._storeSidePanelNumber(
+                    this._sidePanelWidthKey,
+                    this._sidePanel.getBoundingClientRect().width
+                );
+                this._storeSidePanelNumber(this._sidePanelCollapsedKey, 0);
+            }
+            window.dispatchEvent(new Event('resize'));
+        });
+        window.addEventListener('pointermove', this._onSidePointerMove);
+        window.addEventListener('pointerup', this._onSidePointerUp);
+        window.addEventListener('pointercancel', this._onSidePointerUp);
+        if (this._sideResizer.setPointerCapture) {
+            try {
+                this._sideResizer.setPointerCapture(ev.pointerId);
+            } catch (err) {
+                // Window-level listeners still complete the resize.
+            }
+        }
+    },
+
+    _setSidePanelCollapsed(collapsed, persist = true) {
+        if (!this._sidePanel || !this._sideResizer) return;
+        const next = !!collapsed;
+        if (next && !this._sidePanel.classList.contains('collapsed')) {
+            this._sidePanelRestoreWidth = this._sidePanel.getBoundingClientRect().width;
+        }
+        this._sidePanel.classList.toggle('collapsed', next);
+        this._sideResizer.classList.toggle('is-collapsed', next);
+        this._sideResizer.title = next
+            ? '点击展开右侧信息栏'
+            : '拖动调整宽度；拖到最右侧或双击可折叠';
+        if (!next && this._sidePanelRestoreWidth) {
+            this._applySidePanelWidth(this._sidePanelRestoreWidth, false);
+        }
+        if (persist) {
+            this._storeSidePanelNumber(this._sidePanelCollapsedKey, next ? 1 : 0);
+            if (!next) {
+                this._storeSidePanelNumber(
+                    this._sidePanelWidthKey,
+                    this._sidePanelRestoreWidth
+                );
+            }
+            window.dispatchEvent(new Event('resize'));
+        }
+    },
+
+    _applySidePanelWidth(width, persist = true) {
+        if (!this._sidePanel) return;
+        const min = 220;
+        const max = this._maxSidePanelWidth();
+        const value = Math.max(min, Math.min(max, Math.round(Number(width) || 360)));
+        this._sidePanel.style.width = `${value}px`;
+        this._sidePanel.classList.remove('collapsed');
+        this._sideResizer.classList.remove('is-collapsed');
+        if (persist) {
+            this._storeSidePanelNumber(this._sidePanelWidthKey, value);
+        }
+    },
+
+    _maxSidePanelWidth() {
+        const width = this._mainContainer
+            ? this._mainContainer.getBoundingClientRect().width
+            : window.innerWidth;
+        return Math.max(300, Math.min(640, width * 0.55));
+    },
+
+    _readSidePanelNumber(key, fallback) {
+        try {
+            const raw = window.localStorage.getItem(key);
+            if (raw == null || raw === '') return fallback;
+            const value = Number(raw);
+            return Number.isFinite(value) ? value : fallback;
+        } catch (err) {
+            return fallback;
+        }
+    },
+
+    _storeSidePanelNumber(key, value) {
+        try {
+            window.localStorage.setItem(key, String(value));
+        } catch (err) {
+            // Ignore storage failures.
+        }
+    },
+
+    _initL2ConfirmationPolling() {
+        const overlay = document.getElementById('l2ConfirmationOverlay');
+        if (!overlay) return;
+        this._confirmationOverlay = overlay;
+        this._activeConfirmationId = null;
+        this._confirmationResolving = false;
+
+        const approve = document.getElementById('btnApproveL2');
+        const reject = document.getElementById('btnRejectL2');
+        const focusGraph = document.getElementById('btnFocusL2Graph');
+        if (approve) {
+            approve.addEventListener('click', () => this._resolveL2Confirmation(true));
+        }
+        if (reject) {
+            reject.addEventListener('click', () => this._resolveL2Confirmation(false));
+        }
+        if (focusGraph) {
+            focusGraph.addEventListener('click', () => {
+                if (
+                    this._activeConfirmationRequest
+                    && typeof GRAPH !== 'undefined'
+                ) {
+                    GRAPH.focusConfirmationEvidence(
+                        this._activeConfirmationRequest
+                    );
+                }
+            });
+        }
+
+        const poll = async () => {
+            if (this._confirmationResolving || document.hidden) return;
+            try {
+                const pending = await API.getPendingConfirmations();
+                this._renderL2Confirmation(
+                    Array.isArray(pending) && pending.length ? pending[0] : null
+                );
+            } catch (err) {
+                // The execution endpoint can be starting while polling begins.
+            }
+        };
+        poll();
+        this._confirmationTimer = setInterval(poll, 1000);
+    },
+
+    _renderL2Confirmation(request) {
+        const overlay = this._confirmationOverlay;
+        if (!overlay) return;
+        if (!request) {
+            overlay.hidden = true;
+            overlay.classList.remove('reviewing-graph');
+            document.body.classList.remove('l2-review-active');
+            this._activeConfirmationId = null;
+            this._activeConfirmationRequest = null;
+            return;
+        }
+        const isNewRequest = this._activeConfirmationId !== request.request_id;
+        this._activeConfirmationId = request.request_id;
+        this._activeConfirmationRequest = request;
+        overlay.hidden = false;
+        overlay.classList.add('reviewing-graph');
+        document.body.classList.add('l2-review-active');
+        const chain = request.chain_check || {};
+        const riskLabels = window.AgentTraceRiskLabels || {};
+        const setText = (id, value) => {
+            const element = document.getElementById(id);
+            if (element) element.textContent = value == null ? '-' : String(value);
+        };
+        setText('l2ConfirmationTitle', `${request.tool_name} 需要确认`);
+        setText('l2ConfirmationReason', chain.reason || '调用链检查通过，等待用户确认。');
+        setText(
+            'l2ConfirmationChain',
+            (chain.evidence || []).join(' → ') || '调用链证据已记录在任务计划中。'
+        );
+        const flow = request.flow_check || {};
+        const destinationLabels = {
+            fixed_authorized: '固定授权接收方',
+            derived_authorized: '受控派生接收方',
+            unauthorized: '未授权接收方',
+        };
+        setText(
+            'l2ConfirmationFlow',
+            [
+                `接收方：${destinationLabels[flow.destination_state] || flow.destination_state || '未检查'}`,
+                `外发等级：${flow.confidentiality || '-'} / ${flow.max_confidentiality || '-'}`,
+                `来源完整性：${flow.provenance_state === 'unknown' ? '未知' : '已声明'}`,
+                `数据来源：${(flow.data_sources || []).join(', ') || '用户输入'}`,
+                `来源提示：${(flow.provenance_warnings || []).join(', ') || '无'}`,
+            ].join(' · ')
+        );
+        setText('l2ConfirmationTitle', `${request.tool_name} 需要确认`);
+        setText(
+            'l2ConfirmationReason',
+            riskLabels.confirmationReason
+                ? riskLabels.confirmationReason(request)
+                : '该操作属于计划内 L2 动作，请人工确认后执行。'
+        );
+        setText(
+            'l2ConfirmationChain',
+            riskLabels.confirmationSummary
+                ? riskLabels.confirmationSummary(request)
+                : '调用链检查已完成，证据已记录在任务计划中。'
+        );
+        const localizedDestinationLabels = {
+            fixed_authorized: '固定授权接收方',
+            derived_authorized: '受控派生接收方',
+            unauthorized: '未授权接收方',
+        };
+        setText(
+            'l2ConfirmationFlow',
+            [
+                `接收方：${(flow.destinations || []).join(', ') || '-'}`,
+                `接收方状态：${
+                    localizedDestinationLabels[flow.destination_state]
+                    || '未检查'
+                }`,
+                `敏感等级：${
+                    riskLabels.confidentialityLabel
+                        ? riskLabels.confidentialityLabel(flow.confidentiality)
+                        : flow.confidentiality || '-'
+                } / 上限 ${
+                    riskLabels.confidentialityLabel
+                        ? riskLabels.confidentialityLabel(flow.max_confidentiality)
+                        : flow.max_confidentiality || '-'
+                }`,
+                `来源完整性：${
+                    riskLabels.provenanceStateLabel
+                        ? riskLabels.provenanceStateLabel(flow.provenance_state)
+                        : flow.provenance_state || '未知'
+                }`,
+                `数据来源：${(flow.data_sources || []).join(', ') || '用户输入'}`,
+                `来源祖先：${(flow.provenance_ancestors || []).join(', ') || '-'}`,
+                `来源提醒：${
+                    (flow.provenance_warnings || [])
+                        .map(item => riskLabels.warningLabel
+                            ? riskLabels.warningLabel(item)
+                            : '来源校验存在提醒')
+                        .join('；') || '无'
+                }`,
+            ].join(' · ')
+        );
+        setText('l2ConfirmationTool', request.tool_name);
+        setText(
+            'l2ConfirmationApp',
+            window.AgentTraceAppCatalog.appLabel(request.app || 'unknown')
+        );
+        setText(
+            'l2ConfirmationPlan',
+            [
+                `${request.plan_id || '-'} / r${request.plan_revision || '?'}`,
+                request.plan_hash
+                    ? `hash ${String(request.plan_hash).replace(/^sha256:/, '').slice(0, 16)}`
+                    : '',
+            ].filter(Boolean).join(' · ')
+        );
+        setText(
+            'l2ConfirmationArgs',
+            JSON.stringify(request.args || {}, null, 2)
+        );
+        this._renderL2Evidence(
+            flow.field_sources || [],
+            flow.parameter_generation || {},
+            request.args || {}
+        );
+        if (isNewRequest && typeof GRAPH !== 'undefined') {
+            GRAPH.loadData()
+                .then(() => GRAPH.focusConfirmationEvidence(request))
+                .catch(() => {});
+        }
+    },
+
+    _renderL2Evidence(
+        fieldSources,
+        parameterGeneration = {},
+        finalArgs = {}
+    ) {
+        const container = document.getElementById('l2ConfirmationEvidence');
+        if (!container) return;
+        const escape = value => String(value == null ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+        const safeRender = (value, limit = 0) => {
+            let text = String(value == null ? '' : value).trim();
+            if (limit > 0 && text.length > limit) {
+                text = `${text.slice(0, limit)}…`;
+            }
+            if (window.AgentTraceContent?.render) {
+                return window.AgentTraceContent.render(text);
+            }
+            return escape(text).replace(/\n/g, '<br>');
+        };
+        const sources = Array.isArray(fieldSources) ? fieldSources : [];
+        const generationByParameter = parameterGeneration || {};
+        const parameters = [];
+        const addParameter = (name) => {
+            const parameter = String(name || '').trim();
+            if (parameter && !parameters.includes(parameter)) {
+                parameters.push(parameter);
+            }
+        };
+        Object.keys(finalArgs || {}).forEach(addParameter);
+        Object.keys(generationByParameter).forEach(addParameter);
+        sources.forEach(item => addParameter(item.parameter));
+
+        if (parameters.length === 0) {
+            container.innerHTML = `
+                <div class="confirmation-evidence-title">外发参数与溯源证据</div>
+                <div class="confirmation-evidence-item">
+                    当前调用没有可展示的参数或字段级来源，请结合左侧执行链判断。
+                </div>`;
+            return;
+        }
+
+        const formatFinalValue = (value) => {
+            if (typeof value === 'string') return value;
+            try {
+                return JSON.stringify(value, null, 2);
+            } catch (err) {
+                return String(value);
+            }
+        };
+        const generationKindLabel = (kind) => {
+            if (!kind) return '未记录';
+            return window.AgentTraceRiskLabels?.generationKindLabel
+                ? window.AgentTraceRiskLabels.generationKindLabel(kind)
+                : kind;
+        };
+        const semanticLabel = (generation) => {
+            if (generation.validation_mode === 'natural_language_manual') {
+                return '自然语言内容，仅人工核对来源与风险';
+            }
+            if (typeof generation.semantic_supported !== 'boolean') {
+                return '未记录';
+            }
+            return generation.semantic_supported
+                ? '已在来源内容或动态键中定位'
+                : '未直接定位，需核对语义推导';
+        };
+
+        container.innerHTML = `
+            <div class="confirmation-evidence-title">
+                外发参数、生成说明与来源证据（${parameters.length} 个参数）
+            </div>
+            ${parameters.map((parameter, parameterIndex) => {
+                const generation = generationByParameter[parameter] || {};
+                const parameterSources = sources.filter(
+                    item => String(item.parameter || '') === parameter
+                );
+                const confidence = Number(generation.confidence);
+                const confidenceLabel = (
+                    generation.generation_kind === 'copy'
+                        ? '控制器置信度'
+                        : '模型自报置信度'
+                );
+                const finalValue = Object.prototype.hasOwnProperty.call(
+                    finalArgs || {},
+                    parameter
+                ) ? formatFinalValue(finalArgs[parameter]) : '未记录';
+                return `
+                    <div class="confirmation-parameter-card">
+                        <div class="confirmation-parameter-header">
+                            <span class="confirmation-parameter-name">
+                                ${parameterIndex + 1}. ${escape(parameter)}
+                            </span>
+                            <span class="confirmation-parameter-kind">
+                                ${escape(generationKindLabel(
+                                    generation.generation_kind
+                                ))}
+                            </span>
+                        </div>
+                        <div class="confirmation-parameter-value">
+                            <span>最终参数值</span>
+                            <pre>${escape(finalValue)}</pre>
+                        </div>
+                        <div class="confirmation-parameter-meta">
+                            <span>${escape(confidenceLabel)}：${
+                                Number.isFinite(confidence)
+                                    ? `${Math.round(confidence * 100)}%`
+                                    : '未记录'
+                            }</span>
+                            <span>语义支持：${escape(
+                                semanticLabel(generation)
+                            )}</span>
+                            <span>来源字段：${parameterSources.length}</span>
+                        </div>
+                        <div class="confirmation-parameter-explanation">
+                            <div class="confirmation-evidence-meta">生成说明</div>
+                            <div class="confirmation-parameter-explanation-text">
+                                ${
+                                    generation.explanation
+                                        ? safeRender(generation.explanation)
+                                        : '控制器未记录额外生成说明，请核对最终值。'
+                                }
+                            </div>
+                        </div>
+                        ${parameterSources.length > 0
+                            ? parameterSources.map((item, sourceIndex) => {
+                                const source = item.source
+                                    || [
+                                        item.app,
+                                        item.entity,
+                                    ].filter(Boolean).join(':')
+                                    || '未知来源';
+                                const action = item.source_action
+                                    || '未知动作';
+                                const path = item.source_path || '$';
+                                const refId = item.ref_id
+                                    || item.source_id
+                                    || '';
+                                const span = (
+                                    item.start != null
+                                    && item.end != null
+                                ) ? ` · 字符区间 ${item.start}:${item.end}` : '';
+                                const quote = String(
+                                    item.extracted_text || ''
+                                ).trim();
+                                return `
+                                    <div class="confirmation-evidence-item">
+                                        <div class="confirmation-evidence-source">
+                                            证据 ${sourceIndex + 1} · ${escape(source)}
+                                            · ${escape(action)}
+                                        </div>
+                                        <div class="confirmation-evidence-meta">
+                                            ${escape(path)}${escape(span)}
+                                            ${refId ? ` · ${escape(refId)}` : ''}
+                                        </div>
+                                        ${quote ? `
+                                            <div class="confirmation-evidence-quote">
+                                                ${safeRender(quote, 360)}
+                                            </div>` : ''}
+                                    </div>`;
+                            }).join('')
+                            : `
+                                <div class="confirmation-evidence-item">
+                                    该参数没有字段级来源证据；若它是用户直接提供的
+                                    固定参数，请核对上方最终值。
+                                </div>`}
+                    </div>`;
+            }).join('')}`;
+    },
+
+    async _resolveL2Confirmation(approved) {
+        if (!this._activeConfirmationId || this._confirmationResolving) return;
+        this._confirmationResolving = true;
+        const buttons = this._confirmationOverlay.querySelectorAll('button');
+        buttons.forEach((button) => { button.disabled = true; });
+        try {
+            await API.resolveConfirmation(this._activeConfirmationId, approved);
+            this._confirmationOverlay.hidden = true;
+            this._confirmationOverlay.classList.remove('reviewing-graph');
+            document.body.classList.remove('l2-review-active');
+            this._activeConfirmationId = null;
+            this._activeConfirmationRequest = null;
+        } catch (err) {
+            console.error('[confirmation] resolve failed', err);
+        } finally {
+            this._confirmationResolving = false;
+            buttons.forEach((button) => { button.disabled = false; });
+        }
+    },
+
     _showLoading() {
         const container = document.getElementById('graph-container');
         if (!container) return;
@@ -204,7 +708,7 @@ const APP = {
             if (mainContainer) mainContainer.style.display = 'none';
             if (timelinePanel) timelinePanel.style.display = 'none';
             if (storageView) storageView.hidden = false;
-            document.getElementById('statusText').textContent = '存储';
+            document.getElementById('statusText').textContent = '环境变更';
             document.querySelector('.status-dot').className = 'status-dot';
             const hp = document.getElementById('historyListPanel');
             if (hp) hp.classList.remove('visible');
@@ -290,9 +794,19 @@ const APP = {
             panel.appendChild(empty);
         } else {
             for (const trace of data.traces) {
+                const taskState = String(
+                    trace.task_outcome?.state || ''
+                ).toUpperCase();
+                const incomplete = taskState === 'INCOMPLETE';
                 const item = document.createElement('button');
                 item.type = 'button';
-                item.className = `history-item ${trace.blocked ? 'history-item-blocked' : 'history-item-ok'}`;
+                item.className = `history-item ${
+                    trace.blocked
+                        ? 'history-item-blocked'
+                        : incomplete
+                            ? 'history-item-incomplete'
+                            : 'history-item-ok'
+                }`;
                 item.dataset.traceId = trace.trace_id;
 
                 const title = document.createElement('span');
@@ -305,7 +819,9 @@ const APP = {
                     trace.timestamp,
                     trace.app_name,
                     trace.total_steps ? `${trace.total_steps} 步` : '',
-                    trace.blocked ? '已阻断' : ''
+                    trace.blocked ? '已阻断' : '',
+                    trace.has_environment_snapshots ? '含环境快照' : '',
+                    incomplete ? '未完成' : ''
                 ].filter(Boolean).join(' | ');
 
                 item.append(title, meta);
@@ -330,6 +846,7 @@ const APP = {
             this._showHistoryHint('历史记录加载失败，请刷新后重试');
             return;
         }
+        this._repairTraceStepNodeIds(trace);
 
         const listPanel = document.getElementById('historyListPanel');
         if (listPanel) listPanel.classList.remove('visible');
@@ -345,6 +862,7 @@ const APP = {
         }
         GRAPH.setData(nodes, links, { suite: this._resolveTraceSuite(trace) });
         GRAPH.render();
+        if (typeof STORAGE_VIEW !== 'undefined') STORAGE_VIEW.setTrace(trace);
 
         // 2. 执行时间线（合并生命周期步骤与真实事件内容）
         const events = Array.isArray(trace.events) ? trace.events : [];
@@ -370,6 +888,52 @@ const APP = {
         this._enterReplayMode(trace);
     },
 
+    _repairTraceStepNodeIds(trace) {
+        const nodes = Array.isArray(trace?.graph?.nodes) ? trace.graph.nodes : [];
+        const tools = nodes.filter(node => node.type === 'AgentTool');
+        const byName = new Map();
+        tools.forEach((node) => {
+            const candidates = [
+                node.label,
+                node.tool_intent,
+                node.tool_base_name,
+                node.tool_alias,
+            ];
+            const id = String(node.id || '');
+            if (id.startsWith('Activity_')) {
+                const raw = id.slice('Activity_'.length);
+                candidates.push(raw, raw.replace(/_[^_]+$/, ''));
+            }
+            candidates.filter(Boolean).forEach(name => {
+                if (!byName.has(String(name))) byName.set(String(name), node);
+            });
+        });
+        const findTool = (name) => {
+            const value = String(name || '');
+            const exact = byName.get(value);
+            if (exact) return exact;
+            if (value.includes('__')) {
+                return byName.get(value.split('__').slice(1).join('__')) || null;
+            }
+            return null;
+        };
+
+        (trace.steps || []).forEach((step) => {
+            if (step.nodeId) return;
+            const match = String(step.name || '').match(/^工具调用[:：]\s*(.+)$/);
+            const node = match ? findTool(match[1]) : null;
+            if (node) {
+                step.nodeId = node.id;
+                step.nodeType = 'AgentTool';
+            }
+        });
+        (trace.events || []).forEach((event) => {
+            const toolName = event.tool_intent || '';
+            const node = findTool(toolName);
+            if (node && node.app) event.target_app = node.app;
+        });
+    },
+
     /**
      * 解析历史记录所属 suite（新版记录使用 suite 字段，旧记录退回 app_name）。
      */
@@ -384,39 +948,57 @@ const APP = {
      * 新版记录直接带有 risk_cards；旧版记录退化为从风险事件推导。
      */
     _buildReplayRiskCards(trace) {
-        if (Array.isArray(trace.risk_cards) && trace.risk_cards.length > 0) {
-            return trace.risk_cards;
+        const normalizeRisk = card => {
+            const labels = window.AgentTraceRiskLabels;
+            return labels ? labels.normalizeCard(card) : card;
+        };
+        const savedRisks = Array.isArray(trace.risk_cards)
+            ? trace.risk_cards.map(normalizeRisk)
+            : [];
+        const savedPolicies = Array.isArray(trace.policy_events)
+            ? trace.policy_events.map(event => ({
+                ...event,
+                event_kind: 'policy',
+                title: event.title || `Ring ${event.ring || '?'}: 策略事件`,
+                defense_detail: event.detail || event.reason || '策略事件',
+            })).map(normalizeRisk)
+            : [];
+        if (savedRisks.length > 0 || savedPolicies.length > 0) {
+            return [...savedRisks, ...savedPolicies];
         }
 
         const events = Array.isArray(trace.events) ? trace.events : [];
-        const riskEvents = events.filter(e => e && e.type === 'risk');
+        const riskEvents = events.filter(
+            e => e && ['risk', 'policy'].includes(e.type)
+        );
         if (riskEvents.length === 0) return [];
 
-        const ringTitles = {
-            0: 'Ring 0: 安全事件',
-            1: 'Ring 1: 提示注入检测',
-            2: 'Ring 2: 意图一致性检查',
-            3: 'Ring 3: 数据过度暴露缓解',
-        };
-        const actions = { 0: '阻断', 1: '阻断', 2: '阻断', 3: '脱敏' };
-
-        return riskEvents.map((event) => {
-            const ring = Number.isFinite(event.ring) ? event.ring : 0;
-            const title = ringTitles[ring] || `Ring ${ring}: 安全事件`;
+        return riskEvents.flatMap((event) => {
             const detail = event.block_reason || event.content || '检测到风险事件';
             const suite = this._resolveTraceSuite(trace);
-            return {
-                ring,
-                title,
-                detail,
+            const risks = Array.isArray(event.risks) && event.risks.length
+                ? event.risks
+                : Array.isArray(event.risk_assessments) && event.risk_assessments.length
+                    ? event.risk_assessments
+                    : Array.isArray(event.policy_events) && event.policy_events.length
+                        ? event.policy_events
+                        : [{}];
+            return risks.map((risk) => normalizeRisk({
+                ring: Number.isFinite(risk.ring) ? risk.ring : event.ring || 0,
+                decision: risk.decision || 'ADVISORY',
+                severity: risk.severity || 'medium',
+                policy_id: risk.policy_id || '',
+                detail: risk.reason || detail,
+                defense_detail: risk.reason || detail,
+                evidence_entity_ids: risk.evidence_entity_ids || [],
+                source_ids: risk.source_ids || [],
+                sink_ids: risk.sink_ids || [],
+                fsm_before: risk.fsm_before || null,
+                fsm_after: risk.fsm_after || null,
                 agent: event.agent_id || 'unknown',
                 action: event.tool_intent || 'unknown',
                 app: this._canonicalAppName(event.target_app, suite) || 'unknown',
-                defense_ring: title,
-                defense_action: actions[ring] || '阻断',
-                defense_detail: detail,
-                defense_effect: '已由防御系统处理',
-            };
+            }));
         });
     },
 
@@ -424,25 +1006,7 @@ const APP = {
      * 兼容旧 trace 的模块级 APP 名。
      */
     _canonicalAppName(app, suite) {
-        const raw = String(app || '').trim();
-        if (!raw || raw === 'unknown') return raw || 'unknown';
-        if (['system', 'banking', 'workspace', 'slack', 'travel'].includes(raw)) return raw;
-
-        const moduleSuites = {
-            'banking': 'banking',
-            'banking_client': 'banking',
-            'file_reader': 'banking',
-            'user_account': 'banking',
-            'travel': 'travel',
-            'travel_booking_client': 'travel',
-        };
-        if (moduleSuites[raw]) return moduleSuites[raw];
-        if (['email', 'email_client', 'calendar', 'calendar_client'].includes(raw)) {
-            return suite || 'unified';
-        }
-        if (['cloud_drive', 'cloud_drive_client'].includes(raw)) return 'workspace';
-        if (['slack', 'web'].includes(raw)) return 'slack';
-        return raw;
+        return window.AgentTraceAppCatalog.canonicalApp(app, suite);
     },
 
     /**
@@ -471,6 +1035,7 @@ const APP = {
         if (!Store.get('replaying')) return;
 
         Store.set('replaying', false);
+        if (typeof STORAGE_VIEW !== 'undefined') STORAGE_VIEW.clearTrace();
         TIMELINE.clear();
 
         const statusText = document.getElementById('statusText');
@@ -559,21 +1124,6 @@ const APP = {
             console.error('[app] 导出 Trace 失败:', err);
             alert('导出失败，请稍后重试');
         }
-    },
-
-    _initModal() {
-        const modal = document.getElementById('nodeModal');
-        const closeBtn = modal.querySelector('.modal-close');
-        
-        closeBtn.addEventListener('click', () => {
-            modal.classList.remove('show');
-        });
-        
-        window.addEventListener('click', (event) => {
-            if (event.target === modal) {
-                modal.classList.remove('show');
-            }
-        });
     },
 
     /**
@@ -680,158 +1230,6 @@ const APP = {
     /**
      * 显示节点详情弹窗（增强版）
      */
-    showNodeModal(nodeDetail) {
-        const modal = document.getElementById('nodeModal');
-        const body = document.getElementById('modalBody');
-        
-        if (!nodeDetail) {
-            body.innerHTML = '<p>无法获取节点详情</p>';
-            modal.classList.add('show');
-            return;
-        }
-        
-        const typeLabels = {
-            'AIAgent': 'AI 智能体',
-            'AIModelInvocation': 'LLM 推理',
-            'AgentTool': '工具调用',
-            'Prompt': '提示内容',
-            'DomainData': '数据实体',
-        };
-
-        // 角色标签映射
-        const roleLabels = {
-            'input': { label: '输入参数', color: 'var(--accent-blue)' },
-            'output': { label: '输出结果', color: 'var(--accent-green)' },
-            'created': { label: '环境变更 - 创建', color: 'var(--accent-orange)' },
-            'updated': { label: '环境变更 - 更新', color: 'var(--accent-yellow)' },
-        };
-
-        let html = `
-            <h2>
-                ${typeLabels[nodeDetail.type] || nodeDetail.type}: ${nodeDetail.label || nodeDetail.id}
-            </h2>
-            <div class="detail-field">
-                <span class="label">ID</span>
-                <div class="value">${nodeDetail.id}</div>
-            </div>
-            <div class="detail-field">
-                <span class="label">类型</span>
-                <div class="value">${typeLabels[nodeDetail.type] || nodeDetail.type}</div>
-            </div>
-        `;
-
-        // DomainData 显示角色
-        if (nodeDetail.type === 'DomainData' && nodeDetail.operation) {
-            const role = roleLabels[nodeDetail.operation] || { label: '数据', color: 'var(--text-primary)' };
-            html += `
-                <div class="detail-field">
-                    <span class="label">角色</span>
-                    <div class="value" style="color:${role.color};font-weight:600;">${role.label}</div>
-                </div>
-            `;
-        }
-
-        // 输出结果节点不显示名称
-        if (!(nodeDetail.type === 'DomainData' && nodeDetail.operation === 'output')) {
-            html += `
-                <div class="detail-field">
-                    <span class="label">名称</span>
-                    <div class="value">${nodeDetail.label || nodeDetail.id}</div>
-                </div>
-            `;
-        }
-
-        if (nodeDetail.app) {
-            const appLabels = {
-                'system': '系统',
-                'banking': '银行',
-                'workspace': '办公',
-                'slack': '通讯',
-                'travel': '旅行',
-                'unified': '统一',
-            };
-            html += `
-                <div class="detail-field">
-                    <span class="label">APP 域</span>
-                    <div class="value">${appLabels[nodeDetail.app] || nodeDetail.app}</div>
-                </div>
-            `;
-            if (nodeDetail.module) {
-                html += `
-                    <div class="detail-field">
-                        <span class="label">工具模块</span>
-                        <div class="value">${nodeDetail.module}</div>
-                    </div>
-                `;
-            }
-        }
-
-        if (nodeDetail.is_sensitive) {
-            html += `
-                <div class="detail-field">
-                    <span class="label">敏感数据</span>
-                    <div class="value" style="color:var(--accent-red);font-weight:600;">包含敏感信息</div>
-                </div>
-            `;
-        }
-
-        if (nodeDetail.blocked) {
-            html += `
-                <div class="detail-field">
-                    <span class="label">阻断状态</span>
-                    <div class="value blocked">已阻断</div>
-                </div>
-                <div class="detail-field">
-                    <span class="label">阻断原因</span>
-                    <div class="value blocked">${nodeDetail.block_reason || '未知'}</div>
-                </div>
-            `;
-        }
-
-        if (nodeDetail.inputs) {
-            html += `
-                <div class="detail-field">
-                    <span class="label">输入参数</span>
-                    <div class="value detail-value-long">${nodeDetail.inputs}</div>
-                </div>
-            `;
-        }
-
-        if (nodeDetail.content) {
-            html += `
-                <div class="detail-field">
-                    <span class="label">内容</span>
-                    <div class="value">${nodeDetail.content}</div>
-                </div>
-            `;
-        }
-
-        if (nodeDetail.prompt) {
-            html += `
-                <div class="detail-field">
-                    <span class="label">Prompt</span>
-                    <div class="value detail-value-long">
-                        ${nodeDetail.prompt.substring(0, 200)}${nodeDetail.prompt.length > 200 ? '...' : ''}
-                    </div>
-                </div>
-            `;
-        }
-
-        if (nodeDetail.response) {
-            html += `
-                <div class="detail-field">
-                    <span class="label">LLM 响应</span>
-                    <div class="value detail-value-long">
-                        ${nodeDetail.response.substring(0, 200)}${nodeDetail.response.length > 200 ? '...' : ''}
-                    </div>
-                </div>
-            `;
-        }
-
-        body.innerHTML = html;
-        modal.classList.add('show');
-    },
-
     /**
      * 启动定时轮询（增量更新检测）
      */

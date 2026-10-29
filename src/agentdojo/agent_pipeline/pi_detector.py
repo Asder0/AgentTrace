@@ -5,6 +5,11 @@ from typing import Literal
 from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
 from agentdojo.agent_pipeline.errors import AbortAgentError
 from agentdojo.functions_runtime import EmptyEnv, Env, FunctionsRuntime
+from agentdojo.method.analysis.injection_scanner import DEFAULT_THRESHOLD
+from agentdojo.model_assets import (
+    DEFAULT_INJECTION_MODEL_ID,
+    resolve_injection_model_path,
+)
 from agentdojo.types import ChatMessage, MessageContentBlock, get_text_content_as_str, text_content_block_from_string
 
 
@@ -116,8 +121,7 @@ class PromptInjectionDetector(BasePipelineElement):
 
 
 class TransformersBasedPIDetector(PromptInjectionDetector):
-    """Uses [`protectai/deberta-v3-base-prompt-injection-v2`](https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2)
-    to detect prompt injections.
+    """Uses the local multilingual prompt-injection guard model.
 
     Args:
         model_name: The name of the model to use for prompt injection detection.
@@ -130,9 +134,9 @@ class TransformersBasedPIDetector(PromptInjectionDetector):
 
     def __init__(
         self,
-        model_name: str = "protectai/deberta-v3-base-prompt-injection-v2",
+        model_name: str = DEFAULT_INJECTION_MODEL_ID,
         safe_label: str = "SAFE",
-        threshold: float = 0.5,
+        threshold: float = DEFAULT_THRESHOLD,
         mode: Literal["message", "full_conversation"] = "message",
         raise_on_injection: bool = False,
     ) -> None:
@@ -150,8 +154,14 @@ class TransformersBasedPIDetector(PromptInjectionDetector):
         self.model_name = model_name
         self.safe_label = safe_label
         self.threshold = threshold
+        self.model_path = resolve_injection_model_path(model_name)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.pipeline = pipeline("text-classification", model=self.model_name, device=device)
+        self.pipeline = pipeline(
+            "text-classification",
+            model=self.model_path,
+            device=device,
+            local_files_only=True,
+        )
 
     def detect(self, tool_output: str) -> tuple[bool, float]:
         result: dict = self.pipeline(tool_output)[0]  # type: ignore

@@ -24,7 +24,7 @@ class CloudDrive(BaseModel):
 
     def _get_next_id(self) -> CloudDriveFileID:
         largest_id = max((int(key) for key in self.files.keys()), default=0)
-        return CloudDriveFileID(largest_id + 1)
+        return CloudDriveFileID(str(largest_id + 1))
 
     def get_file_by_id(self, file_id: CloudDriveFileID) -> CloudDriveFile:
         if file_id not in self.files:
