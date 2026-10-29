@@ -396,3 +396,9 @@ models/
 
 .pytest_*/
 .pytest_tmp/
+
+# Local-only research notes and test content.
+/开题报告.md
+/tests/
+/TESTING_GUIDE.md
+/util_scripts/check_*
