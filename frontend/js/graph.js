@@ -575,7 +575,11 @@ const GRAPH = {
             } else if (node.type === 'HumanAuthorization') {
                 const status = String(node.status || 'pending').toLowerCase();
                 const statusLabel = this._authorizationStatusLabel(status);
-                title = `人工授权 · ${statusLabel}`;
+                title = (
+                    node.confirmation_kind === 'sensitive_data_exposure'
+                        ? `敏感数据读取授权 · ${statusLabel}`
+                        : `人工授权 · ${statusLabel}`
+                );
                 subtitle = status === 'pending'
                     ? `点击节点处理 · ${node.tool_name || node.request_id || ''}`
                     : (node.tool_name || node.request_id || statusLabel);
@@ -772,6 +776,10 @@ const GRAPH = {
     },
 
     _authorizationStatusLabel(status) {
+        const normalizedStatus = String(status || 'pending').toLowerCase();
+        if (normalizedStatus === 'resolved') {
+            return '\u5df2\u5b8c\u6210\u8981\u6c42\u51b3\u7b56';
+        }
         const labels = {
             pending: '待确认',
             approved: '已批准',
@@ -2422,9 +2430,12 @@ const GRAPH = {
             const manualReviewNotes = Array.isArray(chain.manual_review_notes)
                 ? chain.manual_review_notes
                 : [];
+            const chainLabel = chain.kind === 'sensitive_data_exposure'
+                ? '敏感数据读取判定'
+                : 'L2 调用链判断';
             html += `
                 <div class="detail-field">
-                    <span class="label">L2 调用链判断</span>
+                    <span class="label">${chainLabel}</span>
                     <div class="value">${this._escapeHtml(
                         chain.consistent ? '一致' : '不一致'
                     )} · ${this._escapeHtml(
@@ -2490,9 +2501,14 @@ const GRAPH = {
             `;
         }
         if (d.l2_confirmation) {
+            const confirmationLabel = (
+                d.l2_confirmation.confirmation_kind === 'sensitive_data_exposure'
+                    ? '敏感数据读取授权'
+                    : 'L2 操作授权'
+            );
             html += `
                 <div class="detail-field">
-                    <span class="label">用户确认</span>
+                    <span class="label">${confirmationLabel}</span>
                     <div class="value">${this._escapeHtml(
                         this._authorizationStatusLabel(
                             d.l2_confirmation.status || 'pending'
@@ -2531,6 +2547,8 @@ const GRAPH = {
                 const semanticSupport = (
                     generation.validation_mode === 'natural_language_manual'
                         ? '自然语言内容，仅人工核对'
+                        : generation.validation_mode === 'natural_language_source'
+                        ? '直接来源已核验，自然语言内容供人工核对'
                         : typeof generation.semantic_supported === 'boolean'
                         ? (
                             generation.semantic_supported
@@ -2646,6 +2664,33 @@ const GRAPH = {
             const authStatus = String(d.status || 'pending').toLowerCase();
             const chain = d.chain_check || {};
             const flow = d.flow_check || {};
+            if (d.confirmation_kind === 'requirement_resolution') {
+                const decision = d.decision || {};
+                const payload = d.payload || {};
+                const unmet = Array.isArray(payload.unmet_requirements)
+                    ? payload.unmet_requirements
+                    : [];
+                html += `
+                    <div class="detail-field">
+                        <span class="label">任务要求决策</span>
+                        <div class="value">${this._escapeHtml(
+                            payload.summary || '存在无法继续自动验证的业务要求。'
+                        )}</div>
+                    </div>
+                    <div class="detail-field">
+                        <span class="label">未满足要求</span>
+                        <div class="value">${unmet.map(item => this._escapeHtml(
+                            `${item.id || '-'}：${item.description || '-'}（${item.status || '-'}）`
+                        )).join('<br>') || '-'}</div>
+                    </div>
+                    <div class="detail-field">
+                        <span class="label">用户决策</span>
+                        <div class="value">${this._escapeHtml(
+                            decision.decision || '尚未提交'
+                        )}</div>
+                    </div>
+                `;
+            }
             html += `
                 <div class="detail-field">
                     <span class="label">人工授权状态</span>
@@ -2678,7 +2723,17 @@ const GRAPH = {
                     )}</div>
                 </div>
             `;
-            if (authStatus === 'pending') {
+            if (
+                authStatus === 'pending'
+                && d.confirmation_kind === 'requirement_resolution'
+            ) {
+                html += `
+                    <div class="manual-authorization-box">
+                        <div class="manual-authorization-title">等待任务要求决策</div>
+                        <p>请在要求决策弹窗中放宽或修改业务要求；该决定将创建新的计划版本。</p>
+                    </div>
+                `;
+            } else if (authStatus === 'pending') {
                 html += `
                     <div class="manual-authorization-box" data-request-id="${this._escapeHtml(d.request_id || '')}">
                         <div class="manual-authorization-title">等待人工决策</div>
@@ -3057,7 +3112,11 @@ const GRAPH = {
                 await API.resolveConfirmation(requestId, approved);
                 node.status = approved ? 'approved' : 'rejected';
                 node.approved = approved;
-                node.label = `人工授权：${this._authorizationStatusLabel(node.status)}`;
+                node.label = (
+                    node.confirmation_kind === 'sensitive_data_exposure'
+                        ? `敏感数据读取授权：${this._authorizationStatusLabel(node.status)}`
+                        : `人工授权：${this._authorizationStatusLabel(node.status)}`
+                );
                 body.querySelector('.manual-authorization-box')?.remove();
                 this.g.selectAll('.node')
                     .filter(item => item.id === node.id)

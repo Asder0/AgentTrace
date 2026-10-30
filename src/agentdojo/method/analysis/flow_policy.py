@@ -12,11 +12,22 @@ import copy
 from typing import Any, Mapping
 
 from ..app_domains import domain_for_tool
+from ..modeling.data_sensitivity import (
+    canonical_entity_name,
+    normalize_data_path,
+    source_level,
+)
 from ..modeling.labels import (
     CONFIDENTIALITY_LEVELS,
     join_confidentiality,
 )
 from ..modeling.policy import base_tool_name, is_egress_tool, tool_effect
+from ..modeling.sensitive_ner import ensure_sensitivity_detector_ready
+from .data_access import (
+    action_data_access,
+    action_resource_access,
+    validate_resource_access,
+)
 from .defense_config import effective_method_enabled, effective_ring_enabled
 from .parameter_binding import (
     action_flow_contract,
@@ -242,12 +253,6 @@ def check_task_scope(
     effect = policy.effect
     plan = event.get("task_data_plan")
     if not isinstance(plan, Mapping) or not plan.get("valid", True):
-        if effect == "read":
-            result.update(
-                reason="task_scope_unavailable",
-                advisory=True,
-            )
-            return result
         result.update(
             passed=False,
             reason="task_scope_unavailable",
@@ -256,7 +261,7 @@ def check_task_scope(
             2,
             DECISION_BLOCK,
             "The task authorization contract is unavailable for a "
-            "write, privilege, egress or unknown-effect action.",
+            "tool action.",
             severity="high",
             event_kind="policy",
             policy_id="ring2.task_scope_unavailable",
@@ -337,8 +342,17 @@ def check_task_scope(
         else {}
     )
     control_arguments = _control_arguments(event)
+    risk_arguments = list(control_arguments)
+    if effect in {"write", "privilege"}:
+        inputs = event.get("inputs")
+        if isinstance(inputs, Mapping):
+            risk_arguments = sorted(
+                str(name)
+                for name, value in inputs.items()
+                if _has_egress_value(value)
+            )
     risky_control_arguments, risky_entities, source_risk_evidence = (
-        _risky_control_arguments(event, control_arguments)
+        _risky_control_arguments(event, risk_arguments)
     )
     source_flagged = bool(risky_control_arguments)
     result["source_flagged"] = source_flagged
@@ -398,6 +412,134 @@ def check_task_scope(
             plan,
             tool_name=tool_name,
             decision=DECISION_BLOCK,
+        )
+
+    access_contract = action_data_access(
+        plan,
+        tool_name,
+        str(event.get("plan_step_id", "")),
+    )
+    resource_failures = validate_resource_access(
+        access_contract,
+        event,
+    )
+    result["data_access"] = access_contract
+    result["resource_access_failures"] = resource_failures
+    if (
+        not isinstance(access_contract, Mapping)
+        or not access_contract.get("valid", False)
+        or resource_failures
+    ):
+        result.update(
+            passed=False,
+            reason=(
+                resource_failures[0]
+                if resource_failures
+                else "data_access_contract_invalid"
+            ),
+        )
+        return _ring2_decision(
+            event,
+            result,
+            plan,
+            tool_name=tool_name,
+            decision=DECISION_BLOCK,
+        )
+    if (
+        effect != "read"
+        and access_contract.get("visible_fields")
+    ):
+        try:
+            ensure_sensitivity_detector_ready()
+        except Exception as exc:
+            result.update(
+                passed=False,
+                reason=f"sensitivity_detector_unavailable:{exc}",
+            )
+            return _ring2_decision(
+                event,
+                result,
+                plan,
+                tool_name=tool_name,
+                decision=DECISION_BLOCK,
+            )
+    if effect != "read" and policy.resource_fields:
+        access_contract = action_resource_access(
+            plan,
+            tool_name,
+            str(event.get("plan_step_id", "")),
+        )
+        resource_failures = validate_resource_access(
+            access_contract,
+            event,
+        )
+        result["resource_access"] = access_contract
+        result["resource_access_failures"] = resource_failures
+        if (
+            not isinstance(access_contract, Mapping)
+            or not access_contract.get("valid", False)
+            or resource_failures
+        ):
+            result.update(
+                passed=False,
+                reason=(
+                    resource_failures[0]
+                    if resource_failures
+                    else "resource_access_contract_invalid"
+                ),
+            )
+            return _ring2_decision(
+                event,
+                result,
+                plan,
+                tool_name=tool_name,
+                decision=DECISION_BLOCK,
+            )
+
+    if (
+        effect in {"read", "write"}
+        and policy.risk_level != "L2"
+        and access_contract.get(
+            "requires_exposure_authorization",
+            False,
+        )
+    ):
+        exposure_check = {
+            "action": tool_name,
+            "inspection_fields": list(
+                access_contract.get(
+                    "protected_visible_fields",
+                    [],
+                )
+            ),
+            "opaque_fields": list(
+                access_contract.get("opaque_fields", [])
+            ),
+            "max_exposure_level": str(
+                access_contract.get(
+                    "max_exposure_level",
+                    "internal",
+                )
+            ),
+            "field_policies": copy.deepcopy(
+                access_contract.get("exposure_modes", {})
+            ),
+        }
+        result.update(
+            reason="sensitive_data_exposure_authorization_required",
+            confirmation_required=True,
+            confirmation_kind="sensitive_data_exposure",
+            exposure_check=exposure_check,
+            exposure_authorization_required=True,
+        )
+        return _ring2_decision(
+            event,
+            result,
+            plan,
+            tool_name=tool_name,
+            decision=DECISION_HOLD,
+            event_kind="policy",
+            policy_id="ring2.sensitive_data_exposure_confirmation",
         )
 
     result.update(
@@ -524,6 +666,22 @@ def check_task_scope(
             event_kind="policy",
             policy_id="ring2.l2_confirmation",
         )
+    if source_flagged and effect == "write":
+        result.update(
+            reason="source_risk_confirmation_required",
+            confirmation_required=True,
+            source_risk=True,
+            source_risk_reason="write_from_source_risk",
+        )
+        return _ring2_decision(
+            event,
+            result,
+            plan,
+            tool_name=tool_name,
+            decision=DECISION_HOLD,
+            event_kind="policy",
+            policy_id="ring2.source_risk_confirmation",
+        )
     if source_flagged:
         result.update(
             source_risk=True,
@@ -543,6 +701,7 @@ def _ring2_decision(
     policy_id: str = "ring2.task_scope",
 ) -> dict[str, Any]:
     reason_code = str(result.get("reason", ""))
+    reason_key = reason_code.split(":", 1)[0]
     reason_descriptions = {
         "forbidden_effect": "the requested effect is explicitly forbidden by the task",
         "action_not_bound_to_task_scope": "the tool is not included in the current task plan",
@@ -551,6 +710,24 @@ def _ring2_decision(
         "l2_dependencies_unmet": "required earlier task steps have not completed",
         "l2_call_limit_exceeded": "the L2 call limit from the initial grant was exceeded",
         "task_scope_unavailable": "the task authorization plan is unavailable or invalid",
+        "data_access_contract_invalid": (
+            "the read action has no valid resource or field exposure grant"
+        ),
+        "resource_access_contract_invalid": (
+            "the action has no valid resource-scope grant"
+        ),
+        "resource_not_authorized": (
+            "the requested resource identifier is outside the task grant"
+        ),
+        "resource_value_missing": (
+            "a resource selector required by the action is missing"
+        ),
+        "resource_source_not_authorized": (
+            "the resource selector was derived from an unauthorized source"
+        ),
+        "resource_required_source_missing": (
+            "the required source for the resource selector was not evidenced"
+        ),
     }
     if decision == DECISION_ADVISORY:
         reason = (
@@ -561,8 +738,77 @@ def _ring2_decision(
         fsm_before = "ACTION_PROPOSED"
         fsm_after = "ADVISED"
     elif decision == DECISION_HOLD:
+        if result.get("confirmation_kind") == "sensitive_data_exposure":
+            exposure = result.get("exposure_check", {})
+            protected_fields = ", ".join(
+                str(item)
+                for item in exposure.get(
+                    "inspection_fields",
+                    [],
+                )
+            ) or "计划声明的敏感字段"
+            reason = (
+                f"Tool {tool_name} would expose {protected_fields} to the "
+                "Agent for task-required comparison or analysis; explicit "
+                "user authorization is required before the read executes."
+            )
+            severity = "high"
+            fsm_before = "ACTION_PROPOSED"
+            fsm_after = "HELD"
+            hold_risk = make_risk(
+                2,
+                decision,
+                reason,
+                severity=severity,
+                event_kind=event_kind,
+                policy_id=policy_id,
+                activity_id=event.get("activity_id"),
+                sink_ids=[tool_name],
+                fsm_before=fsm_before,
+                fsm_after=fsm_after,
+            )
+            hold_risk.update(
+                {
+                    "plan_id": str(plan.get("plan_id", "")),
+                    "plan_hash": str(plan.get("plan_hash", "")),
+                    "matched_step": result.get(
+                        "matched_step",
+                        "",
+                    ),
+                    "actual_action": tool_name,
+                    "actual_effect": result.get(
+                        "authorization",
+                        {},
+                    ).get("effect", ""),
+                    "exposure_fields": list(
+                        exposure.get("inspection_fields", [])
+                    ),
+                }
+            )
+            return {
+                **result,
+                "passed": True,
+                "decision": decision,
+                "reason": reason,
+                "reason_code": reason_code,
+                "severity": severity,
+                "fsm_before": fsm_before,
+                "fsm_after": fsm_after,
+                "confirmation_required": True,
+                "confirmation_kind": "sensitive_data_exposure",
+                "exposure_check": exposure,
+                "event_kind": event_kind,
+                "policy_id": policy_id,
+                "risk": hold_risk,
+            }
+        risk_level = str(
+            result.get("authorization", {}).get(
+                "risk_level",
+                "L2",
+            )
+        )
         reason = (
-            f"L2 tool {tool_name} is in the authorized call chain "
+            f"{risk_level} tool {tool_name} is in the authorized call chain "
             "and requires explicit user confirmation."
         )
         if result.get("source_risk"):
@@ -577,7 +823,7 @@ def _ring2_decision(
         fsm_after = "HELD"
     else:
         detail = reason_descriptions.get(
-            reason_code,
+            reason_key,
             reason_code or "an unspecified Ring 2 policy condition",
         )
         reason = (
@@ -688,6 +934,7 @@ def check_sensitive_egress(
         "provenance_ancestors": [],
         "field_sources": [],
         "data_fields": [],
+        "data_field_levels": [],
         "provenance_refs": [],
         "parameter_provenance": {},
         "parameter_generation": {},
@@ -712,6 +959,11 @@ def check_sensitive_egress(
         return result
 
     result["executed"] = True
+    binding_paths: dict[str, set[str]] = {}
+    binding_source_refs: dict[
+        str,
+        set[tuple[str, str, str, str]],
+    ] = {}
     task_plan = event.get("task_data_plan")
     contract = action_flow_contract(
         task_plan,
@@ -990,6 +1242,24 @@ def check_sensitive_egress(
                         "value_hash": str(
                             evidence.get("value_hash", "")
                         ),
+                        "confidentiality": str(
+                            matching_ref.get(
+                                "confidentiality",
+                                evidence.get("confidentiality", ""),
+                            )
+                        ),
+                        "categories": list(
+                            matching_ref.get(
+                                "categories",
+                                evidence.get("categories", []),
+                            )
+                        ),
+                        "sensitivity_policy": copy.deepcopy(
+                            matching_ref.get(
+                                "sensitivity_policy",
+                                evidence.get("sensitivity_policy", {}),
+                            )
+                        ),
                     }
                 )
         provenance_refs = list(
@@ -1016,6 +1286,188 @@ def check_sensitive_egress(
             }
             for item in provenance_refs
         ]
+        data_field_levels = [
+            {
+                "parameter": str(item.get("parameter", "")),
+                "source": str(item.get("source", "")),
+                "source_entity_id": str(
+                    item.get("source_entity_id", "")
+                ),
+                "source_path": str(item.get("source_path", "")),
+                "level": str(
+                    item.get(
+                        "confidentiality",
+                        source_level(
+                            str(item.get("source", ""))
+                        ),
+                    )
+                ),
+                "categories": list(item.get("categories", [])),
+            }
+            for item in field_sources
+        ]
+        implicit_data_fields: list[str] = []
+        for item in implicit_egress:
+            source = (
+                item.get("source", {})
+                if isinstance(item.get("source"), Mapping)
+                else {}
+            )
+            content_levels = (
+                item.get("content_field_levels", {})
+                if isinstance(
+                    item.get("content_field_levels"),
+                    Mapping,
+                )
+                else {}
+            )
+            content_policies = (
+                item.get("content_field_policies", {})
+                if isinstance(
+                    item.get("content_field_policies"),
+                    Mapping,
+                )
+                else {}
+            )
+            for field, field_confidentiality in content_levels.items():
+                source_path = f"$.{field}"
+                parameter = str(item.get("id_parameter", ""))
+                implicit_data_fields.append(
+                    f"{parameter}:{source_path}"
+                )
+                policy = (
+                    content_policies.get(field, {})
+                    if isinstance(
+                        content_policies.get(field),
+                        Mapping,
+                    )
+                    else {}
+                )
+                data_field_levels.append(
+                    {
+                        "parameter": parameter,
+                        "source": (
+                            f"{source.get('app', '')}:"
+                            f"{source.get('entity', '')}"
+                        ),
+                        "source_entity_id": str(
+                            source.get("entity_id", "")
+                        ),
+                        "source_path": source_path,
+                        "level": str(field_confidentiality),
+                        "categories": list(
+                            policy.get("categories", [])
+                        ),
+                        "implicit_resource": True,
+                    }
+                )
+        parameter_bindings = contract.get("parameter_bindings", {})
+        if isinstance(parameter_bindings, Mapping):
+            contract_source_bindings = contract.get("source_bindings", {})
+            contract_source_bindings = (
+                contract_source_bindings
+                if isinstance(contract_source_bindings, Mapping)
+                else {}
+            )
+            for parameter, raw_binding in parameter_bindings.items():
+                if not isinstance(raw_binding, Mapping):
+                    continue
+                paths = {
+                    normalize_data_path(item)
+                    for item in raw_binding.get(
+                        "allowed_source_paths",
+                        [],
+                    )
+                    if str(item).strip()
+                }
+                copy_path = raw_binding.get("source_path")
+                if copy_path and str(copy_path) != "sources":
+                    paths.add(normalize_data_path(str(copy_path)))
+                for source_ref in raw_binding.get(
+                    "allowed_source_refs",
+                    [],
+                ):
+                    if isinstance(source_ref, Mapping) and source_ref.get(
+                        "source_path"
+                    ):
+                        paths.add(
+                            normalize_data_path(
+                                str(source_ref["source_path"])
+                            )
+                        )
+                if paths:
+                    binding_paths[str(parameter)] = paths
+                allowed_refs = {
+                    (
+                        str(source_ref.get("app", "")).lower(),
+                        canonical_entity_name(
+                            str(source_ref.get("app", "")),
+                            str(source_ref.get("entity", "")),
+                        ),
+                        base_tool_name(
+                            str(source_ref.get("source_action", ""))
+                        ),
+                        normalize_data_path(
+                            str(source_ref.get("source_path", ""))
+                        ),
+                    )
+                    for source_ref in raw_binding.get(
+                        "allowed_source_refs",
+                        [],
+                    )
+                    if isinstance(source_ref, Mapping)
+                    and source_ref.get("source_action")
+                    and source_ref.get("source_path")
+                }
+                copy_action = str(
+                    raw_binding.get(
+                        "source_action",
+                        raw_binding.get("source_tool", ""),
+                    )
+                ).strip()
+                copy_source = contract_source_bindings.get(
+                    str(raw_binding.get("source_id", "")),
+                    {},
+                )
+                copy_source = (
+                    copy_source
+                    if isinstance(copy_source, Mapping)
+                    else {}
+                )
+                copy_app = str(
+                    copy_source.get("app")
+                    or raw_binding.get("app", "")
+                )
+                copy_entity = str(
+                    copy_source.get("entity")
+                    or raw_binding.get("entity", "")
+                )
+                copy_action = str(
+                    copy_source.get("source_action")
+                    or copy_action
+                )
+                raw_copy_path = str(
+                    raw_binding.get("source_path", "")
+                ).strip()
+                copy_path = normalize_data_path(raw_copy_path)
+                if (
+                    copy_action
+                    and raw_copy_path
+                    and raw_copy_path != "sources"
+                ):
+                    allowed_refs.add(
+                        (
+                            copy_app.lower(),
+                            canonical_entity_name(
+                                copy_app,
+                                copy_entity,
+                            ),
+                            base_tool_name(copy_action),
+                            copy_path,
+                        )
+                    )
+                if allowed_refs:
+                    binding_source_refs[str(parameter)] = allowed_refs
         direct_source_entities = sorted(
             {
                 str(item.get("source", ""))
@@ -1077,7 +1529,9 @@ def check_sensitive_egress(
                     for item in field_sources
                     if item.get("source_path")
                 }
+                | set(implicit_data_fields)
             ),
+            data_field_levels=data_field_levels,
             implicit_egress=implicit_egress,
             allowed_data_sources=sorted(allowed_sources),
             max_confidentiality=max_level,
@@ -1095,6 +1549,42 @@ def check_sensitive_egress(
         ]
         if binding_errors:
             failures.extend(binding_errors)
+        field_path_failures = []
+        for source in field_sources:
+            parameter = str(source.get("parameter", ""))
+            allowed_paths = binding_paths.get(parameter)
+            allowed_refs = binding_source_refs.get(parameter, set())
+            source_path = normalize_data_path(
+                str(source.get("source_path", ""))
+            )
+            source_action = str(source.get("source_action", "")).strip()
+            actual_ref = (
+                str(source.get("source", "")).split(":", 1)[0].lower(),
+                canonical_entity_name(
+                    str(source.get("source", "")).split(":", 1)[0],
+                    str(source.get("source", "")).partition(":")[2],
+                ),
+                base_tool_name(source_action),
+                source_path,
+            )
+            if not source_path:
+                field_path_failures.append(
+                    f"parameter_source_path_missing:{parameter}"
+                )
+            elif not allowed_paths:
+                field_path_failures.append(
+                    f"parameter_source_path_scope_missing:{parameter}"
+                )
+            elif not source_action:
+                field_path_failures.append(
+                    f"parameter_source_action_missing:{parameter}"
+                )
+            elif actual_ref not in allowed_refs:
+                field_path_failures.append(
+                    f"parameter_source_ref_not_allowed:"
+                    f"{parameter}:{source_action}:{source_path}"
+                )
+        failures.extend(field_path_failures)
         if contains_placeholder(inputs):
             failures.append("unresolved_placeholder_in_payload")
         unverified_arguments: list[str] = []
@@ -1183,6 +1673,11 @@ def check_sensitive_egress(
                 "parameter_generation": parameter_generation,
                 "data_field_refs": data_field_refs,
                 "data_fields": result["data_fields"],
+                "data_field_levels": data_field_levels,
+                "allowed_parameter_source_paths": {
+                    parameter: sorted(paths)
+                    for parameter, paths in binding_paths.items()
+                },
                 "unverified_arguments": unverified_arguments,
                 "implicit_egress": implicit_egress,
                 "allowed_data_sources": sorted(allowed_sources),
@@ -1216,6 +1711,11 @@ def check_sensitive_egress(
             ),
             "data_field_refs": result.get("data_field_refs", []),
             "data_fields": result.get("data_fields", []),
+            "data_field_levels": result.get("data_field_levels", []),
+            "allowed_parameter_source_paths": {
+                parameter: sorted(paths)
+                for parameter, paths in binding_paths.items()
+            },
             "unverified_arguments": result.get(
                 "unverified_arguments",
                 [],

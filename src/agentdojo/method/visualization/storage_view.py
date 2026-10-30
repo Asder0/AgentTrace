@@ -13,7 +13,12 @@ import re
 import time
 from typing import Any, Iterable, Optional
 
-from ..modeling.data_sensitivity import APP_LEVELS, entity_level
+from ..modeling.data_sensitivity import (
+    APP_LEVELS,
+    entity_level,
+    field_categories,
+    field_level,
+)
 from . import mock_apps
 from .app_domains import APP_DOMAINS
 
@@ -231,12 +236,20 @@ def _change_metadata(suite_name: str, path: str) -> dict:
     leaf = re.split(r"\.(?=[^.]+$)", path or "", maxsplit=1)
     field = leaf[-1] if len(leaf) > 1 else ""
     field = re.sub(r"\[\d+\]", "", field or "")
+    field_path = f"$.{field}" if field else "$"
     return {
         "entity": entity,
         "field": field,
         "sensitivity": {
-            "level": entity_level(suite_name, entity),
+            "level": field_level(suite_name, entity, field_path),
+            "categories": field_categories(
+                suite_name,
+                entity,
+                field_path,
+            ),
+            "field_path": field_path,
             "entity": entity,
+            "entity_level": entity_level(suite_name, entity),
         },
     }
 
@@ -271,7 +284,7 @@ def _deduplicate_changes(changes: list) -> list:
             source_path,
         ]))
         if (
-            f".emails." in canonical
+            ".emails." in canonical
             and source_path == canonical
         ):
             deduplicated[key] = candidate

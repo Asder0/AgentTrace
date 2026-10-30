@@ -22,12 +22,12 @@ Or programmatically:
 """
 
 import json
-import re
-import time
-import threading
-import uuid
 import os
+import re
 import sys
+import threading
+import time
+import uuid
 from functools import wraps
 from typing import Any, Dict, List, Optional
 
@@ -38,58 +38,58 @@ except Exception:
     pass
 
 from flask import Flask, jsonify, request
+
 try:
     from flask_cors import CORS
 except ImportError:  # Optional convenience dependency.
     def CORS(app):
         return app
 
+from agentdojo.types import get_text_content_as_str
+
+from ..analysis.defense_config import (
+    RING_METHODS,
+    get_config,
+    set_direct_injection_mode,
+    set_method_enabled,
+    set_ring_enabled,
+    set_user_anchor_mode,
+)
+from ..analysis.l2_chain import ConfirmationBroker
+from ..analysis.outcome_audit import audit_task_outcomes
 from ..capture.interceptor import (
     PromptInjectionBlockedError,
     TaskStoppedError,
     TrackingContext,
     _defense_enabled,
 )
-from ..analysis.defense_config import (
-    RING_METHODS,
-    get_config,
-    set_ring_enabled,
-    set_method_enabled,
-    set_direct_injection_mode,
-    set_user_anchor_mode,
-)
-from ..analysis.l2_chain import ConfirmationBroker
-from ..analysis.outcome_audit import audit_task_outcomes
 from ..modeling.graph_db import (
+    KnowledgeGraph,
     finalize_task_outcome,
     get_graph_data,
     get_graph_summary,
-    KnowledgeGraph,
     reset_graph,
 )
 from ..modeling.policy import base_tool_name
 from ..modeling.provenance import backward_ancestors, taint_ancestors
-from agentdojo.types import get_text_content_as_str
-
-
-from .mock_apps import (
-    apply_scenario_fixtures,
-    build_injected_environment,
-    get_runtime_and_env,
-    reset_all_environments,
-    set_current_env,
-    MOCK_SCENARIOS,
-    get_original_user_tasks,
-    get_original_injection_tasks,
-    get_attack_scenarios,
-    AVAILABLE_ATTACK_TYPES,
-)
 from .app_domains import (
     APP_DOMAINS,
     domain_for_module,
     domain_for_tool,
     infer_suite,
     normalize_graph_nodes,
+)
+from .mock_apps import (
+    AVAILABLE_ATTACK_TYPES,
+    MOCK_SCENARIOS,
+    apply_scenario_fixtures,
+    build_injected_environment,
+    get_attack_scenarios,
+    get_original_injection_tasks,
+    get_original_user_tasks,
+    get_runtime_and_env,
+    reset_all_environments,
+    set_current_env,
 )
 from .storage_view import (
     capture_task_baseline,
@@ -232,16 +232,17 @@ def _build_pipeline(app_name: str) -> Any:
     if not _llm_config["api_key"]:
         return None
 
+    from google import genai
+
     from agentdojo.agent_pipeline.agent_pipeline import (
         AgentPipeline,
         PipelineConfig,
     )
-    from agentdojo.agent_pipeline.llms.google_llm import GoogleLLM
-    from agentdojo.agent_pipeline.llms.openai_llm import OpenAILLM
     from agentdojo.agent_pipeline.llms.anthropic_llm import AnthropicLLM
-    from agentdojo.agent_pipeline.llms.local_llm import LocalLLM
     from agentdojo.agent_pipeline.llms.deepseek_llm import DeepSeekLLM
-    from google import genai
+    from agentdojo.agent_pipeline.llms.google_llm import GoogleLLM
+    from agentdojo.agent_pipeline.llms.local_llm import LocalLLM
+    from agentdojo.agent_pipeline.llms.openai_llm import OpenAILLM
 
     runtime, env = get_runtime_and_env(app_name)
 
@@ -351,7 +352,7 @@ def api_get_status():
         # 检查 Analysis Layer
         analysis_ok = False
         try:
-            from ..analysis.pipeline import process_before_execution, process_after_execution
+            from ..analysis.pipeline import process_after_execution, process_before_execution
             analysis_ok = callable(process_before_execution) and callable(process_after_execution)
         except Exception:
             pass
@@ -429,20 +430,43 @@ def api_get_status():
 
 @app.route('/api/confirmations', methods=['GET'])
 def api_list_confirmations():
-    """Return L2 actions currently waiting for explicit user approval."""
+    """Return actions or requirement decisions awaiting explicit user input."""
     return jsonify(ConfirmationBroker().list_pending())
 
 
 @app.route('/api/confirmations/<request_id>', methods=['POST'])
 def api_resolve_confirmation(request_id: str):
     data = request.get_json(silent=True) or {}
-    if not isinstance(data.get("approved"), bool):
-        return jsonify({"error": "approved must be provided"}), 400
+    approved = data.get("approved")
+    decision = data.get("decision")
+    if not isinstance(approved, bool) and not isinstance(decision, dict):
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "approved or a structured decision must be provided"
+                    )
+                }
+            ),
+            400,
+        )
     result = ConfirmationBroker().resolve(
         request_id,
-        bool(data.get("approved")),
+        approved if isinstance(approved, bool) else None,
+        decision if isinstance(decision, dict) else None,
     )
     if result is None:
+        if isinstance(decision, dict):
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "decision is invalid, stale, or not allowed"
+                        )
+                    }
+                ),
+                400,
+            )
         return jsonify({"error": "confirmation request not found"}), 404
     return jsonify(result)
 
@@ -718,7 +742,9 @@ def api_set_defense_config():
 # ============================================================
 
 # ---- 历史回放 & 审计 API ----
-import os as _os, glob as _glob
+import glob as _glob
+import os as _os
+
 _in_memory_traces = []
 
 def _get_traces_dir():
@@ -915,6 +941,13 @@ def _to_timeline_event(event: dict, suite: Optional[str] = None) -> dict:
             'plan_update_warnings',
             [],
         )
+        item['final_response_audit'] = event.get(
+            'final_response_audit'
+        )
+        item['injection_scan'] = event.get('injection_scan')
+        item['quarantine_metrics'] = (
+            (event.get('injection_scan') or {}).get('quarantine_metrics')
+        )
     elif event_type in ('api_call_start', 'api_call_end'):
         tool_intent = event.get('tool_intent', '')
         item['tool_intent'] = event.get('tool_intent', '')
@@ -929,6 +962,19 @@ def _to_timeline_event(event: dict, suite: Optional[str] = None) -> dict:
         item['block_reason'] = event.get('block_reason', '')
         item['access_plan'] = event.get('access_plan')
         item['task_data_plan'] = event.get('task_data_plan')
+        item['ring2_check'] = event.get('ring2_check')
+        item['requirement_audit'] = event.get('requirement_audit')
+        item['requirement_decision'] = event.get('requirement_decision')
+        item['ring3_check'] = event.get('ring3_check')
+        item['data_access_check'] = event.get('data_access_check')
+        item['injection_scan'] = event.get('injection_scan')
+        item['quarantine_metrics'] = (
+            (event.get('injection_scan') or {}).get('quarantine_metrics')
+            or (event.get('defense_diagnostics') or {})
+            .get('after', {})
+            .get('ring_1', {})
+            .get('quarantine_metrics')
+        )
         item['egress_checks'] = (
             (event.get('defense_diagnostics') or {})
             .get('before', {})
@@ -1042,12 +1088,22 @@ def _get_ring_title(ring: int) -> str:
 
 def _get_risk_title(ring: int, policy_id: str = "") -> str:
     """Return an event-specific title without inferring from free text."""
+    if policy_id == "ring2.requirement_coverage":
+        return "Ring 2: \u4efb\u52a1\u8981\u6c42\u8986\u76d6\u68c0\u67e5"
     if policy_id == "ring1.indirect_prompt_injection":
         return "Ring 1: 间接提示注入隔离"
     if policy_id == "ring1.untrusted_control":
         return "Ring 1: 不可信控制流提醒"
     if policy_id == "ring2.l2_chain_inconsistent":
         return "Ring 2: L2 调用链检查"
+    if policy_id == "ring2.sensitive_field_withheld":
+        return "Ring 2: 敏感字段已隔离"
+    if policy_id == "ring2.sensitive_data_exposure_confirmation":
+        return "Ring 2: 敏感数据读取授权"
+    if policy_id == "ring2.sensitive_data_exposure_rejected":
+        return "Ring 2: 敏感数据读取拒绝"
+    if policy_id == "ring2.sensitive_data_exposure_stale":
+        return "Ring 2: 敏感数据授权失效"
     if policy_id.startswith("ring2."):
         return "Ring 2: 任务工具范围检查"
     if policy_id == "ring3.sensitive_egress":
@@ -1057,8 +1113,12 @@ def _get_risk_title(ring: int, policy_id: str = "") -> str:
 
 def _get_policy_title(ring: int, policy_id: str = "") -> str:
     """Return a policy-event title derived from its structured policy id."""
+    if policy_id == "ring2.requirement_coverage":
+        return "Ring 2: \u4efb\u52a1\u8981\u6c42\u8986\u76d6\u68c0\u67e5"
     if policy_id == "ring2.l2_confirmation":
         return "Ring 2: L2 人工确认"
+    if policy_id == "ring2.sensitive_data_exposure_confirmation":
+        return "Ring 2: 敏感数据读取授权"
     if policy_id == "ring2.l2_confirmation_rejected":
         return "Ring 2: L2 授权结果"
     if policy_id.startswith("ring2.task_scope"):
@@ -1225,6 +1285,7 @@ def _build_policy_events_from_events(
                     ),
                     "fsm_before": risk.get("fsm_before"),
                     "fsm_after": risk.get("fsm_after"),
+                    "phase": risk.get("phase", ""),
                     "source_ids": risk.get("source_ids", []),
                     "occurrence_count": int(
                         risk.get("occurrence_count", 1)
@@ -1721,7 +1782,6 @@ def _execute_with_real_llm(
         'untrusted_views': untrusted_views,
         'execution_error': execution_error,
         'trace_error': trace_error,
-        'trace_error': trace_error,
         'action': f"LLM自主决策: {', '.join(actual_tools) if actual_tools else '未知'}",
         'blocked': blocked,
         'block_reason': block_reason,
@@ -1860,7 +1920,7 @@ def _build_trace_steps_from_messages(
             "step": 3,
             "name": "后端接收",
             "status": "completed",
-            "detail": f"后端接收请求，将通过 AgentPipeline 调用真实 LLM 自主决策",
+            "detail": "后端接收请求，将通过 AgentPipeline 调用真实 LLM 自主决策",
             "timestamp": _format_timestamp(now + 0.2),
         },
     ]
@@ -2960,15 +3020,23 @@ def start_server(host: str = '0.0.0.0', port: int = 5000, debug: bool = False, u
             from ..analysis.injection_scanner import get_injection_scanner
 
             config = get_config()
-            if not (
+            injection_enabled = (
                 effective_method_enabled("ring_0", "small_model", config)
                 or effective_method_enabled("ring_1", "chunk_scanner", config)
-            ):
-                return
-            get_injection_scanner().warmup()
-            _safe_print("[startup] Prompt-injection classifier warmed up.")
+            )
+            if injection_enabled:
+                get_injection_scanner().warmup()
+                _safe_print(
+                    "[startup] Prompt-injection classifier warmed up."
+                )
+            from ..modeling.sensitive_ner import (
+                ensure_sensitivity_detector_ready,
+            )
+
+            ensure_sensitivity_detector_ready()
+            _safe_print("[startup] GLiNER sensitivity detector warmed up.")
         except Exception as exc:
-            _safe_print(f"[startup] Prompt-injection classifier warmup failed: {exc}")
+            _safe_print(f"[startup] Security model warmup failed: {exc}")
 
     from threading import Thread
 
@@ -2979,23 +3047,23 @@ def start_server(host: str = '0.0.0.0', port: int = 5000, debug: bool = False, u
     ).start()
 
     print(f"🛡️ AgentDojo Visualization API Server starting on http://{host}:{port}")
-    print(f"   API Endpoints:")
-    print(f"   - GET /api/graph       - 获取图谱数据")
-    print(f"   - GET /api/events      - 获取事件历史")
-    print(f"   - GET /api/risk-cards  - 获取风险卡片")
-    print(f"   - GET /api/node/<id>   - 获取节点详情")
-    print(f"   - GET /api/apps        - 获取 APP 列表")
-    print(f"   - GET /api/health      - 健康检查")
-    print(f"   - GET /api/config/llm  - 获取 LLM 配置")
-    print(f"   - POST /api/config/llm - 设置 LLM 配置")
-    print(f"   - POST /api/execute    - 通过 AgentPipeline 执行操作")
-    print(f"   - POST /api/execute/custom - 执行自定义指令")
-    print(f"   - POST /api/execute/attack - 执行攻击场景（带注入）")
-    print(f"   - POST /api/reset      - 重置所有数据")
-    print(f"   - GET /api/scenarios   - 获取可用场景列表")
-    print(f"   - GET /api/attack-types - 获取攻击类型列表")
-    print(f"   - GET /api/attack-scenarios - 获取攻击场景列表")
-    print(f"   Frontend: open frontend/index.html in browser")
+    print("   API Endpoints:")
+    print("   - GET /api/graph       - 获取图谱数据")
+    print("   - GET /api/events      - 获取事件历史")
+    print("   - GET /api/risk-cards  - 获取风险卡片")
+    print("   - GET /api/node/<id>   - 获取节点详情")
+    print("   - GET /api/apps        - 获取 APP 列表")
+    print("   - GET /api/health      - 健康检查")
+    print("   - GET /api/config/llm  - 获取 LLM 配置")
+    print("   - POST /api/config/llm - 设置 LLM 配置")
+    print("   - POST /api/execute    - 通过 AgentPipeline 执行操作")
+    print("   - POST /api/execute/custom - 执行自定义指令")
+    print("   - POST /api/execute/attack - 执行攻击场景（带注入）")
+    print("   - POST /api/reset      - 重置所有数据")
+    print("   - GET /api/scenarios   - 获取可用场景列表")
+    print("   - GET /api/attack-types - 获取攻击类型列表")
+    print("   - GET /api/attack-scenarios - 获取攻击场景列表")
+    print("   Frontend: open frontend/index.html in browser")
     app.run(
         host=host,
         port=port,

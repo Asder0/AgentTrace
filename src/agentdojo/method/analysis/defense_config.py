@@ -30,7 +30,9 @@ RING_METHODS: Dict[str, Dict[str, str]] = {
         "untrusted_flow": "将外部不可信数据对控制参数的影响标记为黄色提醒",
     },
     "ring_2": {
-        "task_scope": "检查工具、APP 和 effect 是否属于本次任务授权",
+        "task_scope": (
+            "检查工具、APP、effect、资源选择器和输出字段是否属于本次任务授权"
+        ),
     },
     "ring_3": {
         "sensitive_egress": "检查敏感类别、机密等级和外发目的地",

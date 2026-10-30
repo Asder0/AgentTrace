@@ -15,12 +15,19 @@ from dateutil import parser as date_parser
 
 from ..modeling.data_sensitivity import (
     ValueOrigin,
+    canonical_entity_name,
+    normalize_data_path,
     origins_for_entity_refs,
     value_key,
 )
 from ..modeling.policy import base_tool_name, tool_effect
+from ..modeling.sensitive_ner import elevate_policy_for_content
 from .access_plan import parse_plan_json
-
+from .data_access import (
+    SENSITIVE_REFERENCE_PATTERN,
+    action_data_access,
+    action_resource_access,
+)
 
 PLACEHOLDER_PATTERN = re.compile(
     r"__CTRL_SLOT_[A-Za-z0-9]+_[A-Za-z0-9_]+__"
@@ -59,8 +66,9 @@ Return JSON only:
       "source_evidence": [
         {
           "source_id": "SourceRef ID from source_bindings",
-          "source_path": "exact field path from entity_catalog",
-          "quote": "exact substring of that field used as evidence"
+          "entity_id": "optional concrete source entity ID",
+          "source_path": "direct field path from entity_catalog; prefer a concrete indexed path",
+          "quote": "optional exact substring for structured verification"
         }
       ]
     }
@@ -75,8 +83,17 @@ Rules:
   paraphrased alternative. Presentation parameters are free-form; do not
   compare or replace their proposed text.
 - Include every source field used in the derivation; do not omit inputs.
-- source_evidence is mandatory for every derived value. Every item must use a
-  valid source_id and an exact quote from the sanitized source field.
+- source_evidence is mandatory for every derived value. Every item must identify
+  the direct source with a valid source_id, entity_id or concrete indexed
+  source_path, and the sanitized source_path used.
+- For a structured parameter whose binding declares semantic_type, include an
+  exact quote or exact structured token from the source field. The controller
+  must be able to verify its type, normalized value and source.
+- For an unstructured extraction, selection, summary or presentation parameter,
+  identifying the direct source field is sufficient. A quote is optional; the
+  controller will not require the returned natural-language value to be a
+  verbatim substring of the source. The explanation, confidence and source
+  evidence are shown to the human reviewer.
 - The controller computes character spans itself. Do not return start or end.
 - explanation is mandatory. It must describe the exact returned value and how
   the required sources affected it, not a different candidate. Do not claim
@@ -246,8 +263,6 @@ def all_placeholder_bindings(
 
 def placeholder_notice(plan: Mapping[str, Any] | None) -> str:
     bindings = all_placeholder_bindings(plan)
-    if not bindings:
-        return ""
     lines = [
         PLACEHOLDER_NOTICE_PREFIX,
         (
@@ -259,7 +274,16 @@ def placeholder_notice(plan: Mapping[str, Any] | None) -> str:
             "verify the concrete value against the cited source entities "
             "before policy checks and execution."
         ),
+        (
+            "Values formatted as [[SENSITIVE_REF:...]] are opaque "
+            "controller references. Never reconstruct or guess the hidden "
+            "value. An authorized parameter may pass the exact reference "
+            "token; the controller validates its source and resolves it "
+            "after policy checks."
+        ),
     ]
+    if not bindings:
+        return "\n".join(lines)
     for binding in bindings:
         if str(binding.get("mode", "copy")) == "derived_sources":
             source_description = "allowed_source_refs={refs}".format(
@@ -323,11 +347,27 @@ def placeholder_notice(plan: Mapping[str, Any] | None) -> str:
 
 def contains_placeholder(value: Any) -> bool:
     if isinstance(value, str):
-        return bool(PLACEHOLDER_PATTERN.search(value))
+        return bool(
+            PLACEHOLDER_PATTERN.search(value)
+            or SENSITIVE_REFERENCE_PATTERN.search(value)
+        )
     if isinstance(value, Mapping):
         return any(contains_placeholder(item) for item in value.values())
     if isinstance(value, (list, tuple, set)):
         return any(contains_placeholder(item) for item in value)
+    return False
+
+
+def _contains_controller_slot(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(PLACEHOLDER_PATTERN.search(value))
+    if isinstance(value, Mapping):
+        return any(
+            _contains_controller_slot(item)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_controller_slot(item) for item in value)
     return False
 
 
@@ -345,6 +385,66 @@ def _replace_exact(value: Any, symbol: str, replacement: Any) -> Any:
         return tuple(_replace_exact(child, symbol, replacement) for child in value)
     if isinstance(value, set):
         return {_replace_exact(child, symbol, replacement) for child in value}
+    return value
+
+
+def _collect_sensitive_references(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return list(
+            dict.fromkeys(
+                match.group(0)
+                for match in SENSITIVE_REFERENCE_PATTERN.finditer(value)
+            )
+        )
+    if isinstance(value, Mapping):
+        return [
+            reference
+            for item in value.values()
+            for reference in _collect_sensitive_references(item)
+        ]
+    if isinstance(value, (list, tuple, set)):
+        return [
+            reference
+            for item in value
+            for reference in _collect_sensitive_references(item)
+        ]
+    return []
+
+
+def _replace_sensitive_references(
+    value: Any,
+    replacements: Mapping[str, Any],
+) -> Any:
+    if isinstance(value, str):
+        if value in replacements:
+            return copy.deepcopy(replacements[value])
+        result = value
+        for reference, replacement in replacements.items():
+            result = result.replace(
+                str(reference),
+                str(replacement),
+            )
+        return result
+    if isinstance(value, Mapping):
+        return {
+            key: _replace_sensitive_references(child, replacements)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _replace_sensitive_references(child, replacements)
+            for child in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _replace_sensitive_references(child, replacements)
+            for child in value
+        )
+    if isinstance(value, set):
+        return {
+            _replace_sensitive_references(child, replacements)
+            for child in value
+        }
     return value
 
 
@@ -601,6 +701,75 @@ def _locate_value_spans(
     return spans
 
 
+def _locate_typed_value_spans(
+    value: Any,
+    text: str,
+    semantic_type: str = "",
+) -> list[tuple[int, int, str]]:
+    if isinstance(value, (list, tuple, set)):
+        return [
+            span
+            for item in value
+            for span in _locate_typed_value_spans(
+                item,
+                text,
+                semantic_type,
+            )
+        ]
+    if isinstance(value, Mapping):
+        return [
+            span
+            for item in value.values()
+            for span in _locate_typed_value_spans(
+                item,
+                text,
+                semantic_type,
+            )
+        ]
+    return _locate_value_spans(value, text, semantic_type)
+
+
+def _typed_value_supported_by_text(
+    value: Any,
+    text: str,
+    semantic_type: str,
+    context_text: str = "",
+) -> bool:
+    if isinstance(value, (list, tuple, set)):
+        return len(value) > 0 and all(
+            _typed_value_supported_by_text(
+                item,
+                text,
+                semantic_type,
+                context_text,
+            )
+            for item in value
+        )
+    if isinstance(value, Mapping):
+        return len(value) > 0 and all(
+            _typed_value_supported_by_text(
+                item,
+                text,
+                semantic_type,
+                context_text,
+            )
+            for item in value.values()
+        )
+    return bool(
+        _value_supported_by_text(
+            value,
+            text,
+            semantic_type,
+            context_text,
+        )
+        or _locate_value_spans(
+            value,
+            text,
+            semantic_type,
+        )
+    )
+
+
 def _value_is_selection_candidate(
     value: Any,
     origin: ValueOrigin,
@@ -632,6 +801,34 @@ def _value_is_selection_candidate(
             if target and target == candidate:
                 return True
     return False
+
+
+def _dynamic_key_candidates(
+    candidates: list[ValueOrigin],
+    value: Any,
+) -> list[ValueOrigin]:
+    """Select entity-key map entries by their structured container key."""
+    values = (
+        list(value)
+        if isinstance(value, (list, tuple, set))
+        else [value]
+    )
+    keys = {
+        " ".join(str(item).strip().casefold().split())
+        for item in values
+        if item is not None
+    }
+    if not keys:
+        return candidates
+    matches = [
+        origin
+        for origin in candidates
+        if " ".join(
+            str(origin.container_key).strip().casefold().split()
+        )
+        in keys
+    ]
+    return matches or candidates
 
 
 def parameter_values_equal(left: Any, right: Any) -> bool:
@@ -687,6 +884,7 @@ def resolve_parameter_bindings(
     derive_resolver: Callable[[str], str] | None = None,
     user_prompt: str = "",
     context_messages: Iterable[dict[str, Any]] = (),
+    sensitive_references: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[
     dict[str, Any],
     list[dict[str, Any]],
@@ -696,23 +894,26 @@ def resolve_parameter_bindings(
     """Resolve only controller-owned symbols and validate concrete values."""
     contract = action_flow_contract(plan, tool_name, step_id=step_id)
     bindings = (
-        contract.get("parameter_bindings", {})
+        dict(contract.get("parameter_bindings", {}))
         if isinstance(contract, Mapping)
+        and isinstance(contract.get("parameter_bindings", {}), Mapping)
         else {}
     )
-    if not isinstance(bindings, Mapping) or not bindings:
-        unresolved = contains_placeholder(args)
-        return (
-            dict(args),
-            [],
-            ["unregistered_placeholder"] if unresolved else [],
-            [],
-        )
-
     origins = list(value_origins)
     required_source_refs = []
     required_source_ids = []
     source_bindings: dict[str, dict[str, Any]] = {}
+    if isinstance(plan, Mapping) and isinstance(
+        plan.get("source_refs"),
+        Mapping,
+    ):
+        source_bindings.update(
+            {
+                str(source_id): dict(source)
+                for source_id, source in plan["source_refs"].items()
+                if isinstance(source, Mapping)
+            }
+        )
     if isinstance(contract, Mapping):
         raw_required_sources = contract.get("required_source_refs", [])
         if isinstance(raw_required_sources, list):
@@ -743,11 +944,117 @@ def resolve_parameter_bindings(
             ]
         raw_source_bindings = contract.get("source_bindings", {})
         if isinstance(raw_source_bindings, Mapping):
-            source_bindings = {
-                str(source_id): dict(source_ref)
-                for source_id, source_ref in raw_source_bindings.items()
-                if isinstance(source_ref, Mapping)
-            }
+            source_bindings.update(
+                {
+                    str(source_id): dict(source_ref)
+                    for source_id, source_ref in raw_source_bindings.items()
+                    if isinstance(source_ref, Mapping)
+                }
+            )
+    resource_contract = action_data_access(
+        plan,
+        tool_name,
+        step_id=step_id,
+    )
+    if not isinstance(resource_contract, Mapping):
+        resource_contract = action_resource_access(
+            plan,
+            tool_name,
+            step_id=step_id,
+        )
+    if isinstance(resource_contract, Mapping):
+        resource_parameters = resource_contract.get(
+            "resource_parameters",
+            {},
+        )
+        if isinstance(resource_parameters, Mapping):
+            for parameter, raw_rule in resource_parameters.items():
+                parameter = str(parameter)
+                if (
+                    parameter in bindings
+                    or not isinstance(raw_rule, Mapping)
+                    or str(raw_rule.get("mode", "")).lower() != "derived"
+                ):
+                    continue
+                required_refs = []
+                for source_id in raw_rule.get(
+                    "required_sources",
+                    [],
+                ):
+                    source_ref = source_bindings.get(str(source_id), {})
+                    if not isinstance(source_ref, Mapping):
+                        continue
+                    required_refs.append(
+                        {
+                            "app": str(
+                                source_ref.get("app", "")
+                            ).lower(),
+                            "entity": canonical_entity_name(
+                                str(source_ref.get("app", "")),
+                                str(source_ref.get("entity", "")),
+                            ),
+                            "source_action": str(
+                                source_ref.get("source_action", "")
+                            ),
+                        }
+                    )
+                allowed_refs = [
+                    {
+                        "app": str(item.get("app", "")).lower(),
+                        "entity": canonical_entity_name(
+                            str(item.get("app", "")),
+                            str(item.get("entity", "")),
+                        ),
+                        "source_action": str(
+                            item.get("source_action", "")
+                        ),
+                        "source_path": str(
+                            item.get("source_path", "")
+                        ),
+                    }
+                    for item in raw_rule.get(
+                        "allowed_source_refs",
+                        [],
+                    )
+                    if isinstance(item, Mapping)
+                ]
+                bindings[parameter] = {
+                    "mode": "derived_sources",
+                    "generation_kind": "extraction",
+                    "parameter_role": "control",
+                    "semantic_type": (
+                        str(
+                            tool_effect(tool_name).semantic_types.get(
+                                parameter,
+                                "",
+                            )
+                        ).strip().lower()
+                        or "identifier"
+                    ),
+                    "direct_source_only": True,
+                    "allowed_source_refs": allowed_refs,
+                    "required_source_refs": required_refs,
+                    "allowed_source_paths": sorted(
+                        {
+                            normalize_source_path(
+                                str(item.get("source_path", ""))
+                            )
+                            for item in allowed_refs
+                            if item.get("source_path")
+                        }
+                    ),
+                    "source_tool": "derived_sources",
+                    "source_path": "sources",
+                    "symbol": "",
+                }
+    if not bindings:
+        unresolved = contains_placeholder(args)
+        return (
+            dict(args),
+            [],
+            ["unregistered_placeholder"] if unresolved else [],
+            [],
+        )
     def source_ids_for_fields(
         app: str,
         entity: str,
@@ -777,11 +1084,237 @@ def resolve_parameter_bindings(
     resolutions: list[dict[str, Any]] = []
     errors: list[str] = []
     warnings: list[str] = []
+    reference_resolutions: dict[str, dict[str, Any]] = {}
+    deferred_sensitive_references: dict[
+        str,
+        list[Mapping[str, Any]],
+    ] = {}
+    sensitive_references = sensitive_references or {}
+    for parameter, actual in list(resolved.items()):
+        references = _collect_sensitive_references(actual)
+        if not references:
+            continue
+        raw_binding = bindings.get(parameter)
+        if not isinstance(raw_binding, Mapping):
+            errors.append(
+                f"sensitive_reference_without_binding:{parameter}"
+            )
+            continue
+        allowed_paths = {
+            normalize_source_path(str(item))
+            for item in raw_binding.get("allowed_source_paths", [])
+            if str(item).strip()
+        }
+        copy_path = str(raw_binding.get("source_path", "")).strip()
+        if copy_path and copy_path != "sources":
+            allowed_paths.add(normalize_source_path(copy_path))
+        allowed_refs = [
+            item
+            for item in raw_binding.get("allowed_source_refs", [])
+            if isinstance(item, Mapping)
+        ]
+        copy_action = str(
+            raw_binding.get(
+                "source_action",
+                raw_binding.get("source_tool", ""),
+            )
+        ).strip()
+        binding_mode = str(
+            raw_binding.get("mode", "copy")
+        ).lower()
+
+        def reference_allowed(metadata: Mapping[str, Any]) -> bool:
+            path = normalize_source_path(
+                str(metadata.get("source_path", ""))
+            )
+            if not allowed_paths or path not in allowed_paths:
+                return False
+            app = str(metadata.get("app", "")).lower()
+            entity = str(metadata.get("entity", "")).lower()
+            action = str(metadata.get("source_action", ""))
+            if binding_mode == "derived_sources":
+                return any(
+                    str(item.get("app", "")).lower() == app
+                    and str(item.get("entity", "")).lower() == entity
+                    and (
+                        not item.get("source_action")
+                        or base_tool_name(
+                            str(item.get("source_action", ""))
+                        )
+                        == base_tool_name(action)
+                    )
+                    and (
+                        not item.get("source_path")
+                        or normalize_source_path(
+                            str(item.get("source_path", ""))
+                        )
+                        == path
+                    )
+                    for item in allowed_refs
+                )
+            if copy_action:
+                return base_tool_name(action) == base_tool_name(copy_action)
+            return any(
+                str(item.get("app", "")).lower() == app
+                and str(item.get("entity", "")).lower() == entity
+                and (
+                    not item.get("source_action")
+                    or base_tool_name(str(item.get("source_action", "")))
+                    == base_tool_name(action)
+                )
+                for item in allowed_refs
+            )
+
+        replacements: dict[str, Any] = {}
+        metadata_items: list[Mapping[str, Any]] = []
+        for reference in references:
+            metadata = sensitive_references.get(reference)
+            if not isinstance(metadata, Mapping) or not reference_allowed(
+                metadata
+            ):
+                errors.append(
+                    f"sensitive_reference_not_authorized:{parameter}"
+                )
+                continue
+            try:
+                policy = elevate_policy_for_content(
+                    {
+                        "level": str(
+                            metadata.get("confidentiality", "secret")
+                        ),
+                        "categories": list(
+                            metadata.get("categories", [])
+                        ),
+                        "source": "sensitive_reference",
+                    },
+                    metadata.get("value"),
+                )
+            except Exception as exc:
+                errors.append(
+                    f"sensitive_reference_scan_failed:{parameter}:{exc}"
+                )
+                continue
+            replacements[reference] = copy.deepcopy(metadata.get("value"))
+            metadata_items.append(
+                {
+                    **dict(metadata),
+                    "controller_reference": reference,
+                    "confidentiality": str(
+                        policy.get("level", "secret")
+                    ),
+                    "categories": list(
+                        policy.get("categories", [])
+                    ),
+                }
+            )
+        missing_required = []
+        for required_id in required_source_ids:
+            source_ref = source_bindings.get(required_id, {})
+            if not any(
+                str(item.get("app", "")).lower()
+                == str(source_ref.get("app", "")).lower()
+                and str(item.get("entity", "")).lower()
+                == str(source_ref.get("entity", "")).lower()
+                and base_tool_name(
+                    str(item.get("source_action", ""))
+                )
+                == base_tool_name(
+                    str(source_ref.get("source_action", ""))
+                )
+                for item in metadata_items
+            ):
+                missing_required.append(required_id)
+        if missing_required and binding_mode != "derived_sources":
+            errors.extend(
+                f"sensitive_reference_required_source_missing:"
+                f"{parameter}:{source_id}"
+                for source_id in missing_required
+            )
+            continue
+        if not replacements or len(replacements) != len(set(references)):
+            continue
+        if binding_mode == "derived_sources":
+            deferred_sensitive_references[parameter] = metadata_items
+            continue
+        actual = _replace_sensitive_references(actual, replacements)
+        resolved[parameter] = actual
+        refs = [
+            {
+                "app": str(item.get("app", "")),
+                "entity": str(item.get("entity", "")),
+                "source_action": str(item.get("source_action", "")),
+            }
+            for item in metadata_items
+        ]
+        reference_resolutions[parameter] = {
+            "parameter": parameter,
+            "status": "resolved",
+            "used_symbol": True,
+            "generation_kind": "copy",
+            "parameter_role": str(
+                raw_binding.get("parameter_role", "")
+            ),
+            "semantic_type": _binding_semantic_type(
+                tool_name,
+                parameter,
+                raw_binding,
+            ),
+            "explanation": "控制器将敏感字段引用解析为已授权的真实值。",
+            "confidence": 1.0,
+            "semantic_supported": True,
+            "source_paths": sorted(
+                {
+                    str(item.get("source_path", ""))
+                    for item in metadata_items
+                    if item.get("source_path")
+                }
+            ),
+            "source_refs": refs,
+            "provenance_refs": [
+                {
+                    "ref_id": _provenance_ref_id(
+                        source_id=f"opaque:{parameter}",
+                        activity_id=str(
+                            item.get("source_activity_id", "")
+                        ),
+                        entity_id=str(
+                            item.get("source_entity_id", "")
+                        ),
+                        source_path=str(item.get("source_path", "")),
+                        start=None,
+                        end=None,
+                    ),
+                    "source_id": f"opaque:{parameter}",
+                    "app": str(item.get("app", "")),
+                    "entity": str(item.get("entity", "")),
+                    "source_action": str(
+                        item.get("source_action", "")
+                    ),
+                    "activity_id": str(
+                        item.get("source_activity_id", "")
+                    ),
+                    "entity_id": str(
+                        item.get("source_entity_id", "")
+                    ),
+                    "source_path": str(item.get("source_path", "")),
+                    "confidentiality": str(
+                        (
+                            item.get("confidentiality")
+                            or item.get("level")
+                            or "secret"
+                        )
+                    ),
+                    "categories": list(item.get("categories", [])),
+                }
+                for item in metadata_items
+            ],
+        }
     derived_bindings = {
         str(parameter): raw
         for parameter, raw in bindings.items()
         if isinstance(raw, Mapping)
         and str(raw.get("mode", "copy")).lower() == "derived_sources"
+        and str(parameter) not in reference_resolutions
     }
     derived_results: dict[str, dict[str, Any]] = {}
     if derived_bindings:
@@ -849,6 +1382,9 @@ def resolve_parameter_bindings(
         if not isinstance(raw_binding, Mapping):
             errors.append(f"invalid_binding:{parameter}")
             continue
+        if parameter in reference_resolutions:
+            resolutions.append(reference_resolutions[parameter])
+            continue
         parameter_error_start = len(errors)
         symbol = str(raw_binding.get("symbol", ""))
         mode = str(raw_binding.get("mode", "copy")).lower()
@@ -866,7 +1402,16 @@ def resolve_parameter_bindings(
                 expected_generation_kind == "presentation"
                 or parameter_role == "presentation"
             )
-            if contains_placeholder(actual):
+            semantic_type = _binding_semantic_type(
+                tool_name,
+                parameter,
+                raw_binding,
+            )
+            natural_source_validation = (
+                natural_language_validation
+                or not semantic_type
+            )
+            if _contains_controller_slot(actual):
                 if "value" not in model_result:
                     errors.append(f"derived_value_missing:{parameter}")
                     continue
@@ -887,13 +1432,10 @@ def resolve_parameter_bindings(
                     continue
             value = resolved.get(parameter)
             derivation_type = str(
-                model_result.get("derivation_type", "semantic")
+                model_result.get("derivation_type")
+                or expected_generation_kind
+                or "semantic"
             ).lower()
-            semantic_type = _binding_semantic_type(
-                tool_name,
-                parameter,
-                raw_binding,
-            )
             explanation = str(
                 model_result.get("explanation")
                 or model_result.get("reason")
@@ -962,7 +1504,7 @@ def resolve_parameter_bindings(
                             ),
                         ),
                     }
-                    if source_id and not ref["entity_id"]:
+                    if not ref["entity_id"]:
                         candidates = [
                             origin
                             for origin in origins
@@ -984,14 +1526,28 @@ def resolve_parameter_bindings(
                             )
                         )
                     invalid.extend(ref_invalid)
-                    path = normalize_source_path(
-                        str(raw_item.get("source_path", ""))
-                    )
+                    raw_path = str(
+                        raw_item.get("source_path", "")
+                    ).strip()
+                    path = normalize_source_path(raw_path)
                     candidates = [
                         origin
                         for origin in candidates
                         if _path_matches(origin.source_path, path)
                     ]
+                    if raw_path:
+                        exact_path_candidates = [
+                            origin
+                            for origin in candidates
+                            if origin.source_path == raw_path
+                        ]
+                        if exact_path_candidates:
+                            candidates = exact_path_candidates
+                    if len(candidates) > 1:
+                        candidates = _dynamic_key_candidates(
+                            candidates,
+                            value,
+                        )
                     if not candidates:
                         errors.append(
                             f"derived_source_evidence_not_found:"
@@ -1008,6 +1564,7 @@ def resolve_parameter_bindings(
                         or raw_item.get("quote", "")
                     )
                     origin = None
+                    quote_located = False
                     for candidate in candidates:
                         source_text = _origin_text(candidate)
                         if (
@@ -1017,6 +1574,7 @@ def resolve_parameter_bindings(
                             and extracted_text == source_text[start:end]
                         ):
                             origin = candidate
+                            quote_located = True
                             break
                     if origin is None and extracted_text:
                         located = []
@@ -1043,6 +1601,37 @@ def resolve_parameter_bindings(
                                 )
                         if len(located) == 1:
                             origin, start, end = located[0]
+                            quote_located = True
+                        elif located and natural_source_validation:
+                            for candidate, found, found_end in located:
+                                matched.append(candidate)
+                                evidence.append(
+                                    {
+                                        "app": candidate.app,
+                                        "entity": candidate.entity,
+                                        "entity_id": candidate.entity_id,
+                                        "source_action": candidate.source_tool,
+                                        "source_path": candidate.source_path,
+                                        "start": found,
+                                        "end": found_end,
+                                        "extracted_text": extracted_text,
+                                        **(
+                                            {"source_id": source_id}
+                                            if source_id
+                                            else {}
+                                        ),
+                                    }
+                                )
+                            continue
+                    if (
+                        origin is None
+                        and len(candidates) == 1
+                    ):
+                        origin = candidates[0]
+                        start = end = None
+                    if extracted_text and not quote_located:
+                        extracted_text = ""
+                        start = end = None
                     if origin is None:
                         errors.append(
                             (
@@ -1055,18 +1644,24 @@ def resolve_parameter_bindings(
                         )
                         continue
                     typed_context = _origin_text(origin)
-                    if derivation_type in {
-                        "extraction",
-                        "normalization",
-                    }:
-                        typed_supported = _value_supported_by_text(
+                    if (
+                        derivation_type
+                        in {
+                            "extraction",
+                            "normalization",
+                            "selection",
+                        }
+                        and semantic_type
+                    ):
+                        evidence_text = extracted_text or typed_context
+                        typed_supported = _typed_value_supported_by_text(
                             value,
-                            extracted_text,
+                            evidence_text,
                             semantic_type,
                             typed_context,
                         )
                         if typed_supported and semantic_type:
-                            located = _locate_value_spans(
+                            located = _locate_typed_value_spans(
                                 value,
                                 typed_context,
                                 semantic_type,
@@ -1083,6 +1678,7 @@ def resolve_parameter_bindings(
                     evidence.append(
                         {
                             **ref,
+                            "entity_id": origin.entity_id,
                             **(
                                 {"source_id": source_id}
                                 if source_id
@@ -1101,7 +1697,8 @@ def resolve_parameter_bindings(
                 )
                 if (
                     derivation_type
-                    in {"extraction", "normalization"}
+                    in {"extraction", "normalization", "selection"}
+                    and semantic_type
                     and len(matched) >= 1
                 ):
                     located: list[tuple[ValueOrigin, int, int, str]] = []
@@ -1115,7 +1712,7 @@ def resolve_parameter_bindings(
                             continue
                         seen_origins.add(origin_key)
                         source_text = _origin_text(origin)
-                        for start, end, text in _locate_value_spans(
+                        for start, end, text in _locate_typed_value_spans(
                             value,
                             source_text,
                             semantic_type,
@@ -1136,11 +1733,113 @@ def resolve_parameter_bindings(
                                 "extracted_text": text,
                             }
                         )
+                    elif located and natural_language_validation:
+                        evidence.extend(
+                            {
+                                "app": origin.app,
+                                "entity": origin.entity,
+                                "entity_id": origin.entity_id,
+                                "source_action": origin.source_tool,
+                                "source_path": origin.source_path,
+                                "start": start,
+                                "end": end,
+                                "extracted_text": text,
+                            }
+                            for origin, start, end, text in located
+                        )
                     elif located:
                         errors.append(
                             f"derived_source_evidence_ambiguous:{parameter}"
                         )
                         continue
+                elif matched:
+                    evidence.extend(
+                        {
+                            "app": origin.app,
+                            "entity": origin.entity,
+                            "entity_id": origin.entity_id,
+                            "source_action": origin.source_tool,
+                            "source_path": origin.source_path,
+                            "start": None,
+                            "end": None,
+                            "extracted_text": "",
+                        }
+                        for origin in {
+                            (
+                                item.source_activity_id,
+                                item.entity_id,
+                                item.source_path,
+                                item.source_tool,
+                            ): item
+                            for item in matched
+                        }.values()
+                    )
+            for metadata in deferred_sensitive_references.get(
+                parameter,
+                [],
+            ):
+                metadata_path = str(
+                    metadata.get("source_path", "")
+                ).strip()
+                metadata_action = str(
+                    metadata.get("source_action", "")
+                )
+                metadata_entity_id = str(
+                    metadata.get("source_entity_id", "")
+                )
+                origin = next(
+                    (
+                        item
+                        for item in origins
+                        if item.app.lower()
+                        == str(metadata.get("app", "")).lower()
+                        and item.entity.lower()
+                        == str(metadata.get("entity", "")).lower()
+                        and base_tool_name(item.source_tool)
+                        == base_tool_name(metadata_action)
+                        and (
+                            not metadata_entity_id
+                            or item.entity_id == metadata_entity_id
+                        )
+                        and str(item.source_path) == metadata_path
+                    ),
+                    None,
+                )
+                if origin is None:
+                    errors.append(
+                        f"sensitive_reference_origin_missing:"
+                        f"{parameter}:{metadata_path}"
+                    )
+                    continue
+                if origin not in matched:
+                    matched.append(origin)
+                if not any(
+                    item.get("app") == origin.app
+                    and item.get("entity") == origin.entity
+                    and item.get("entity_id") == origin.entity_id
+                    and item.get("source_action")
+                    == origin.source_tool
+                    and item.get("source_path") == origin.source_path
+                    for item in evidence
+                ):
+                    source_ids = source_ids_for_origin(origin)
+                    evidence.append(
+                        {
+                            "app": origin.app,
+                            "entity": origin.entity,
+                            "entity_id": origin.entity_id,
+                            "source_action": origin.source_tool,
+                            "source_path": origin.source_path,
+                            "start": None,
+                            "end": None,
+                            "extracted_text": _origin_text(origin),
+                            **(
+                                {"source_id": source_ids[0]}
+                                if source_ids
+                                else {}
+                            ),
+                        }
+                    )
             if invalid:
                 errors.extend(
                     f"invalid_source_ref:{parameter}:{item['source_ref']}"
@@ -1174,6 +1873,7 @@ def resolve_parameter_bindings(
                     "app": str(item.get("app", "")).lower(),
                     "entity": str(item.get("entity", "")).lower(),
                     "source_action": str(item.get("source_action", "")),
+                    "source_path": str(item.get("source_path", "")),
                 }
                 for item in raw_binding.get("allowed_source_refs", [])
                 if isinstance(item, Mapping)
@@ -1187,6 +1887,13 @@ def resolve_parameter_bindings(
                         not allowed["source_action"]
                         or base_tool_name(origin.source_tool)
                         == base_tool_name(allowed["source_action"])
+                    )
+                    and (
+                        not allowed.get("source_path")
+                        or normalize_data_path(origin.source_path)
+                        == normalize_data_path(
+                            str(allowed["source_path"])
+                        )
                     )
                     for allowed in allowed_refs
                 )
@@ -1205,6 +1912,87 @@ def resolve_parameter_bindings(
                 for item in raw_binding.get("required_source_refs", [])
                 if isinstance(item, Mapping)
             ]
+            ancestor_source_entities = {
+                str(source)
+                for origin in matched
+                for source in (
+                    origin.label.get("confidentiality", {})
+                    if isinstance(origin.label, Mapping)
+                    else {}
+                ).get("source_entities", [])
+                if source
+            }
+            direct_source_ids = {
+                source_id
+                for origin in matched
+                for source_id in source_ids_for_origin(origin)
+                if source_id
+            }
+            ancestor_source_ids: list[str] = []
+            ancestor_source_refs: list[dict[str, str]] = []
+            source_ids_by_entity: dict[str, list[str]] = {}
+            for candidate_id, candidate_ref in source_bindings.items():
+                candidate_entity = (
+                    f"{str(candidate_ref.get('app', '')).lower()}:"
+                    f"{canonical_entity_name(
+                        str(candidate_ref.get('app', '')),
+                        str(candidate_ref.get('entity', '')),
+                    )}"
+                )
+                source_ids_by_entity.setdefault(
+                    candidate_entity,
+                    [],
+                ).append(str(candidate_id))
+            for source_id, source_ref in source_bindings.items():
+                if source_id in direct_source_ids:
+                    continue
+                entity_source = (
+                    f"{str(source_ref.get('app', '')).lower()}:"
+                    f"{canonical_entity_name(
+                        str(source_ref.get('app', '')),
+                        str(source_ref.get('entity', '')),
+                    )}"
+                )
+                if entity_source not in ancestor_source_entities:
+                    continue
+                if len(source_ids_by_entity.get(entity_source, [])) > 1:
+                    continue
+                required_by_id = source_id in required_source_ids
+                required_by_ref = any(
+                    str(item.get("app", "")).lower()
+                    == str(source_ref.get("app", "")).lower()
+                    and canonical_entity_name(
+                        str(item.get("app", "")),
+                        str(item.get("entity", "")),
+                    )
+                    == canonical_entity_name(
+                        str(source_ref.get("app", "")),
+                        str(source_ref.get("entity", "")),
+                    )
+                    and base_tool_name(
+                        str(item.get("source_action", ""))
+                    )
+                    == base_tool_name(
+                        str(source_ref.get("source_action", ""))
+                    )
+                    for item in required_refs
+                )
+                if not required_by_id and not required_by_ref:
+                    continue
+                ancestor_source_ids.append(str(source_id))
+                ancestor_source_refs.append(
+                    {
+                        "app": str(source_ref.get("app", "")),
+                        "entity": canonical_entity_name(
+                            str(source_ref.get("app", "")),
+                            str(source_ref.get("entity", "")),
+                        ),
+                        "source_action": str(
+                            source_ref.get("source_action", "")
+                        ),
+                    }
+                )
+            ancestor_source_id_set = set(ancestor_source_ids)
 
             def required_source_present(
                 required: Mapping[str, str],
@@ -1218,6 +2006,15 @@ def resolve_parameter_bindings(
                         == base_tool_name(required["source_action"])
                     )
                     for origin in matched
+                ) or bool(
+                    set(
+                        source_ids_for_fields(
+                            required["app"],
+                            required["entity"],
+                            required["source_action"],
+                        )
+                    )
+                    & ancestor_source_id_set
                 )
 
             missing_parameter_sources = [
@@ -1248,9 +2045,26 @@ def resolve_parameter_bindings(
                             f"{parameter}:{item['source_action']}"
                         )
                 continue
+            deferred = deferred_sensitive_references.get(
+                parameter,
+                [],
+            )
+            if deferred:
+                value = _replace_sensitive_references(
+                    value,
+                    {
+                        str(item.get("controller_reference", "")): (
+                            copy.deepcopy(item.get("value"))
+                        )
+                        for item in deferred
+                        if item.get("controller_reference")
+                    },
+                )
+                resolved[parameter] = value
             semantic_supported = (
                 None
                 if natural_language_validation
+                or not semantic_type
                 else any(
                     _value_is_selection_candidate(
                         value,
@@ -1268,6 +2082,15 @@ def resolve_parameter_bindings(
             allowed_sources = {
                 str(item) for item in contract.get("data_sources", []) if item
             }
+            if not allowed_sources and isinstance(
+                resource_contract,
+                Mapping,
+            ):
+                allowed_sources = {
+                    f"{item['app']}:{item['entity']}"
+                    for item in allowed_refs
+                    if item.get("app") and item.get("entity")
+                }
             referenced_sources = {
                 f"{origin.app}:{origin.entity}" for origin in matched
             }
@@ -1357,6 +2180,20 @@ def resolve_parameter_bindings(
                             "value_hash": hashlib.sha256(
                                 str(origin.value_key).encode("utf-8")
                             ).hexdigest()[:16],
+                            "confidentiality": origin.level,
+                            "categories": list(
+                                (
+                                    origin.label.get(
+                                        "confidentiality",
+                                        {},
+                                    )
+                                    if isinstance(origin.label, Mapping)
+                                    else {}
+                                ).get("categories", [])
+                            ),
+                            "sensitivity_policy": copy.deepcopy(
+                                origin.sensitivity_policy
+                            ),
                         }
                     )
             if len(errors) > parameter_error_start:
@@ -1376,7 +2213,11 @@ def resolve_parameter_bindings(
                     "validation_mode": (
                         "natural_language_manual"
                         if natural_language_validation
-                        else "structured"
+                        else (
+                            "natural_language_source"
+                            if not semantic_type
+                            else "structured"
+                        )
                     ),
                     "semantic_type": semantic_type,
                     "parameter_role": parameter_role,
@@ -1395,6 +2236,10 @@ def resolve_parameter_bindings(
                         }
                     ),
                     "source_refs": source_refs,
+                    "ancestor_source_ids": sorted(
+                        set(ancestor_source_ids)
+                    ),
+                    "ancestor_source_refs": ancestor_source_refs,
                     "provenance_refs": provenance_refs,
                     "used_source_ids": sorted(
                         {
@@ -1521,6 +2366,20 @@ def resolve_parameter_bindings(
                         "value_hash": hashlib.sha256(
                             str(origin.value_key).encode("utf-8")
                         ).hexdigest()[:16],
+                        "confidentiality": origin.level,
+                        "categories": list(
+                            (
+                                origin.label.get(
+                                    "confidentiality",
+                                    {},
+                                )
+                                if isinstance(origin.label, Mapping)
+                                else {}
+                            ).get("categories", [])
+                        ),
+                        "sensitivity_policy": copy.deepcopy(
+                            origin.sensitivity_policy
+                        ),
                     }
                 )
         resolutions.append(
@@ -1596,12 +2455,30 @@ def resolve_parameter_bindings(
         for source_ref in resolution.get("source_refs", [])
         if isinstance(source_ref, Mapping)
     ]
+    for resolution in resolutions:
+        actual_source_refs.extend(
+            source_ref
+            for source_ref in resolution.get(
+                "ancestor_source_refs",
+                [],
+            )
+            if isinstance(source_ref, Mapping)
+        )
     actual_source_ids = {
         str(source_id)
         for resolution in resolutions
         for source_id in resolution.get("used_source_ids", [])
         if source_id
     }
+    for resolution in resolutions:
+        actual_source_ids.update(
+            str(source_id)
+            for source_id in resolution.get(
+                "ancestor_source_ids",
+                [],
+            )
+            if source_id
+        )
     for source_id in required_source_ids:
         if source_id not in actual_source_ids:
             if any(

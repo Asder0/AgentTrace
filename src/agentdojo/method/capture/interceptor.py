@@ -8,27 +8,28 @@ Provides:
 """
 
 import copy
-import time
 import functools
-import uuid
-import sys
 import hashlib
+import json
+import sys
+import time
+import uuid
 from contextvars import ContextVar
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dataclass_field
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
 from agentdojo.types import ChatSystemMessage, text_content_block_from_string
 
-from ..app_domains import domain_for_tool
-from ..analysis.pipeline import (
-    process_after_execution_with_details,
-    process_before_execution,
+from ..analysis.data_access import (
+    action_data_access,
+    project_agent_exposure,
+    resolve_resource_parameter_resolutions,
 )
 from ..analysis.defense_config import (
     effective_method_enabled,
     effective_ring_enabled,
     get_config,
 )
-from ..analysis.risk_types import DECISION_BLOCK, make_risk
 from ..analysis.injection_scanner import (
     SECURITY_PLACEHOLDER_NOTICE,
     contains_security_placeholder,
@@ -39,34 +40,52 @@ from ..analysis.parameter_binding import (
     placeholder_notice,
     resolve_parameter_bindings,
 )
+from ..analysis.pipeline import (
+    process_after_execution_with_details,
+    process_before_execution,
+)
+from ..analysis.risk_types import (
+    DECISION_BLOCK,
+    DECISION_HOLD,
+    DECISION_MITIGATE,
+    make_risk,
+)
+from ..app_domains import domain_for_tool
 from ..modeling.data_sensitivity import (
     ValueOrigin,
     collect_value_origins,
     entity_level,
     entity_source,
+    field_level,
+    field_policy,
+    field_sensitivity_catalog,
     flow_label_for_origins,
     index_value_origins,
     max_source_level,
+    normalize_data_path,
     origins_for_entity_refs,
     tool_output_entity,
 )
+from ..modeling.graph_db import (
+    mark_activity_denied,
+    record_task_start,
+    update_activity_outcome,
+)
 from ..modeling.labels import (
+    CONFIDENTIALITY_LEVELS,
     aggregate_flow_labels,
     derive_flow_label,
     join_confidentiality,
-    make_flow_label,
     make_confidentiality,
+    make_flow_label,
     make_injection,
     make_integrity,
 )
+from ..modeling.sensitive_ner import elevate_policy_for_content
 from ..modeling.policy import (
     base_tool_name,
     split_qualified_tool_name,
     tool_effect,
-)
-from ..modeling.graph_db import (
-    mark_activity_blocked,
-    record_task_start,
 )
 from .environment_snapshot import snapshot_environment
 
@@ -131,10 +150,10 @@ class ReasoningContext:
     thought_id: str
     prompt: str  # The prompt sent to the LLM
     response: str  # The LLM's response (thought + action)
-    tool_calls: List[Dict[str, Any]] = field(default_factory=list)  # Tool calls decided by this reasoning
+    tool_calls: List[Dict[str, Any]] = dataclass_field(default_factory=list)  # Tool calls decided by this reasoning
     timestamp: float = 0.0
-    flow_label: Dict[str, Any] = field(default_factory=dict)
-    context_messages: List[Dict[str, Any]] = field(default_factory=list)
+    flow_label: Dict[str, Any] = dataclass_field(default_factory=dict)
+    context_messages: List[Dict[str, Any]] = dataclass_field(default_factory=list)
 
 
 class TrackingContext:
@@ -164,6 +183,10 @@ class TrackingContext:
             cls._instance.message_flow_labels: Dict[str, Dict[str, Any]] = {}
             cls._instance.tool_value_origins: List[ValueOrigin] = []
             cls._instance.tool_value_index: Dict[str, List[ValueOrigin]] = {}
+            cls._instance.sensitive_reference_values: Dict[
+                str,
+                Dict[str, Any],
+            ] = {}
             cls._instance.partial_messages: List[Any] = []
         return cls._instance
 
@@ -180,6 +203,7 @@ class TrackingContext:
         self.message_flow_labels = {}
         self.tool_value_origins = []
         self.tool_value_index = {}
+        self.sensitive_reference_values = {}
         self.partial_messages = []
         self.reasoning_history = []
         self.current_reasoning = None
@@ -239,6 +263,7 @@ class TrackingContext:
         self.message_flow_labels = {}
         self.tool_value_origins = []
         self.tool_value_index = {}
+        self.sensitive_reference_values = {}
         self.partial_messages = []
 
     def log_event(self, event: Dict[str, Any]):
@@ -766,6 +791,39 @@ def _inject_parameter_binding_notice(
     ]
 
 
+def _inject_task_plan_notice(
+    messages: Sequence[Any],
+    plan: Optional[Dict[str, Any]],
+) -> Sequence[Any]:
+    """Inject the latest controller-owned plan and remove stale versions."""
+    from ..analysis.data_need import (
+        TASK_PLAN_NOTICE_PREFIX,
+        task_plan_notice,
+    )
+
+    notice = task_plan_notice(plan)
+    retained = [
+        message
+        for message in messages
+        if not (
+            isinstance(message, dict)
+            and message.get("role") == "system"
+            and _message_content_text(message)
+            .strip()
+            .startswith(TASK_PLAN_NOTICE_PREFIX)
+        )
+    ]
+    if not notice:
+        return retained
+    return [
+        ChatSystemMessage(
+            role="system",
+            content=[text_content_block_from_string(notice)],
+        ),
+        *retained,
+    ]
+
+
 def _argument_flow_labels(
     inputs: Dict[str, Any],
     *,
@@ -840,19 +898,71 @@ def _argument_flow_labels(
                 control_influence=True,
             )
         else:
-            from_user = str(name) in destination_parameters
-            labels[str(name)] = make_flow_label(
-                confidentiality=make_confidentiality(
-                    level="internal",
-                    source_entities=(
-                        ["user_prompt"] if from_user else []
+            provenance_refs = [
+                item
+                for item in resolution.get("provenance_refs", [])
+                if isinstance(item, dict)
+            ]
+            if provenance_refs:
+                confidentiality = join_confidentiality(
+                    [
+                        make_confidentiality(
+                            level=str(
+                                item.get("confidentiality", "secret")
+                            ),
+                            categories=item.get("categories", []),
+                            source_ids=[
+                                f"{item.get('activity_id', '')}:"
+                                f"{item.get('source_path', '')}"
+                            ],
+                            source_entities=[
+                                f"{item.get('app', '')}:"
+                                f"{item.get('entity', '')}"
+                            ],
+                        )
+                        for item in provenance_refs
+                    ]
+                )
+                labels[str(name)] = make_flow_label(
+                    confidentiality=confidentiality,
+                    integrity=make_integrity(kind="trusted"),
+                    data_influence=True,
+                    control_influence=True,
+                )
+                for item in provenance_refs:
+                    sources.append(
+                        {
+                            "argument_root": str(name),
+                            "source_kind": "tool_output",
+                            "source_app": str(item.get("app", "")),
+                            "source_entity": str(
+                                item.get("entity", "")
+                            ),
+                            "source": (
+                                f"{item.get('app', '')}:"
+                                f"{item.get('entity', '')}"
+                            ),
+                            "source_path": str(
+                                item.get("source_path", "")
+                            ),
+                            "source_risk": False,
+                            "risky_entities": [],
+                        }
+                    )
+            else:
+                from_user = str(name) in destination_parameters
+                labels[str(name)] = make_flow_label(
+                    confidentiality=make_confidentiality(
+                        level="internal",
+                        source_entities=(
+                            ["user_prompt"] if from_user else []
+                        ),
                     ),
-                ),
-                integrity=make_integrity(kind="trusted"),
-                data_influence=True,
-                control_influence=True,
-            )
-            if from_user:
+                    integrity=make_integrity(kind="trusted"),
+                    data_influence=True,
+                    control_influence=True,
+                )
+            if not provenance_refs and from_user:
                 sources.append(
                     {
                         "argument_root": str(name),
@@ -864,7 +974,7 @@ def _argument_flow_labels(
                         "risky_entities": [],
                     }
                 )
-            else:
+            elif not provenance_refs:
                 sources.append(
                     {
                         "argument_root": str(name),
@@ -986,6 +1096,54 @@ def _infer_suite_from_environment(environment: Any) -> Optional[str]:
     return None
 
 
+def _apply_schema_semantic_types(
+    schema: dict[str, Any],
+    semantic_types: Mapping[str, str],
+) -> dict[str, Any]:
+    """Attach declarative semantic types to structured output schema paths."""
+    result = copy.deepcopy(schema)
+    for raw_path, raw_semantic_type in semantic_types.items():
+        path = str(raw_path or "")
+        semantic_type = str(raw_semantic_type or "").strip()
+        if not path.startswith("$") or not semantic_type:
+            continue
+        node: Any = result
+        rest = path[1:]
+        valid = True
+        while rest:
+            if rest.startswith("[*]"):
+                if not isinstance(node, dict):
+                    valid = False
+                    break
+                node = node.setdefault("items", {})
+                rest = rest[3:]
+            elif rest.startswith("."):
+                name, separator, tail = rest[1:].partition(".")
+                if not name or not isinstance(node, dict):
+                    valid = False
+                    break
+                fields = node.setdefault("fields", {})
+                if not isinstance(fields, dict):
+                    valid = False
+                    break
+                field_schema = fields.setdefault(name, {})
+                if not isinstance(field_schema, dict):
+                    valid = False
+                    break
+                node = field_schema.setdefault("type_schema", {})
+                rest = (
+                    f".{tail}"
+                    if separator
+                    else tail
+                )
+            else:
+                valid = False
+                break
+        if valid and isinstance(node, dict):
+            node["semantic_type"] = semantic_type
+    return result
+
+
 def _build_tool_catalog(runtime: Any) -> List[Dict[str, Any]]:
     """Describe available tools for task-level planning without data values."""
     functions = getattr(runtime, "functions", {}) or {}
@@ -993,6 +1151,7 @@ def _build_tool_catalog(runtime: Any) -> List[Dict[str, Any]]:
         return []
     from ..analysis.access_plan import schema_for_type
 
+    field_catalog = field_sensitivity_catalog()
     tool_app_map = {}
     if hasattr(runtime, "tool_app_map"):
         try:
@@ -1009,6 +1168,10 @@ def _build_tool_catalog(runtime: Any) -> List[Dict[str, Any]]:
             or str(tool_app_map.get(str(name), "") or "")
             or domain_for_tool(base_name)
             or ""
+        )
+        output_entity = tool_output_entity(str(name))
+        output_entity_policies = (
+            field_catalog.get(tool_suite, {}).get(output_entity, {})
         )
         input_schema = (
             schema_for_type(parameters)
@@ -1058,6 +1221,10 @@ def _build_tool_catalog(runtime: Any) -> List[Dict[str, Any]]:
                         field_schema["semantic_type"] = policy.semantic_types[
                             str(field_name)
                         ]
+        output_schema = _apply_schema_semantic_types(
+            schema_for_type(getattr(function, "return_type", None)),
+            policy.output_semantic_types,
+        )
         catalog.append(
             {
                 "name": str(name),
@@ -1070,6 +1237,7 @@ def _build_tool_catalog(runtime: Any) -> List[Dict[str, Any]]:
                 "confidentiality": policy.confidentiality,
                 "categories": sorted(policy.categories),
                 "control_fields": sorted(policy.control_fields),
+                "resource_fields": sorted(policy.resource_fields),
                 "destination_fields": sorted(policy.destination_fields),
                 "content_fields": sorted(policy.content_fields),
                 "parameter_roles": parameter_roles,
@@ -1080,14 +1248,25 @@ def _build_tool_catalog(runtime: Any) -> List[Dict[str, Any]]:
                     key: dict(value)
                     for key, value in policy.authoritative_parameters.items()
                 },
-                "input_schema": input_schema,
-                "output_schema": schema_for_type(
-                    getattr(function, "return_type", None)
+                "dynamic_entity_map": bool(
+                    policy.dynamic_entity_map
                 ),
-                "output_entity": tool_output_entity(str(name)),
+                "content_detection": bool(
+                    policy.content_detection
+                ),
+                "input_schema": input_schema,
+                "output_schema": output_schema,
+                "output_entity": output_entity,
+                "output_entity_fields": sorted(
+                    output_entity_policies.keys()
+                ),
+                "output_entity_field_levels": {
+                    path: str(policy.get("level", "secret")).lower()
+                    for path, policy in output_entity_policies.items()
+                },
             }
         )
-    return catalog[:100]
+    return catalog
 
 
 def capture_llm_interaction(func: Callable):
@@ -1223,6 +1402,10 @@ def capture_llm_interaction(func: Callable):
                     effective_messages,
                     ctx.task_data_plan,
                 )
+                effective_messages = _inject_task_plan_notice(
+                    effective_messages,
+                    ctx.task_data_plan,
+                )
                 context_messages = _serialize_messages(effective_messages)
                 context_labels = _context_flow_labels(
                     context_messages,
@@ -1260,6 +1443,7 @@ def capture_llm_interaction(func: Callable):
             extra_args,
         )
         response_text = ""
+        final_response_audit: Optional[Dict[str, Any]] = None
         plan_updates: List[Dict[str, Any]] = []
         plan_update_warnings: List[str] = []
         if len(result) >= 4:
@@ -1271,6 +1455,68 @@ def capture_llm_interaction(func: Callable):
                     content = last_msg.get("content", "")
                     response_text = _content_to_text(content)
                 tool_calls = _extract_tool_calls(updated_messages)
+                if (
+                    not tool_calls
+                    and response_text
+                    and isinstance(ctx.task_data_plan, dict)
+                    and ctx.task_data_plan_provider is not None
+                ):
+                    from ..analysis.outcome_audit import (
+                        audit_final_response_claims,
+                    )
+
+                    final_response_audit = audit_final_response_claims(
+                        user_prompt=effective_prompt,
+                        plan=ctx.task_data_plan,
+                        events=ctx.events,
+                        final_response=response_text,
+                        provider=ctx.task_data_plan_provider,
+                    )
+                    ctx.plan_usage["final_response_audit"] = (
+                        final_response_audit
+                    )
+                    if (
+                        final_response_audit.get("applicable")
+                        and not final_response_audit.get("safe")
+                    ):
+                        corrected_response = str(
+                            final_response_audit.get(
+                                "corrected_response"
+                            )
+                            or ""
+                        ).strip()
+                        if not corrected_response:
+                            corrected_response = (
+                                "任务执行流程已结束，但最终回答包含未通过"
+                                "证据校验的表述，已停止展示原文。请查看"
+                                "完成审计和溯源图谱。"
+                            )
+                        corrected_audit = audit_final_response_claims(
+                            user_prompt=effective_prompt,
+                            plan=ctx.task_data_plan,
+                            events=ctx.events,
+                            final_response=corrected_response,
+                            provider=ctx.task_data_plan_provider,
+                        )
+                        ctx.plan_usage[
+                            "final_response_correction_audit"
+                        ] = corrected_audit
+                        if (
+                            corrected_audit.get("applicable")
+                            and not corrected_audit.get("safe")
+                        ):
+                            corrected_response = (
+                                "任务执行流程已结束，但修正后的回答仍未通过"
+                                "证据校验，已停止展示文本。请查看完成审计和"
+                                "溯源图谱。"
+                            )
+                        response_text = corrected_response
+                        if isinstance(last_msg, dict):
+                            last_msg["content"] = [
+                                text_content_block_from_string(
+                                    corrected_response
+                                )
+                            ]
                 if (
                     tool_calls
                     and isinstance(ctx.task_data_plan, dict)
@@ -1375,6 +1621,7 @@ def capture_llm_interaction(func: Callable):
                         tool_calls,
                         ctx.task_data_plan_provider,
                         catalog,
+                        execution_context=context_messages,
                     )
                     if updated_plan is not None:
                         ctx.task_data_plan = updated_plan
@@ -1441,6 +1688,9 @@ def capture_llm_interaction(func: Callable):
             "injection_scan": injection_scan,
             "plan_updates": plan_updates,
             "plan_update_warnings": plan_update_warnings,
+            "final_response_audit": (
+                final_response_audit
+            ),
             "task_data_plan": (
                 ctx.task_data_plan
                 if _task_planning_required(current_options)
@@ -1523,105 +1773,232 @@ def _resolve_implicit_egress(
     app: str,
 ) -> list[dict[str, Any]]:
     """Resolve declared resource-backed external receivers and payloads."""
+    def flat_values(value: Any) -> list[Any]:
+        if isinstance(value, Mapping):
+            return [
+                child
+                for item in value.values()
+                for child in flat_values(item)
+            ]
+        if isinstance(value, list | tuple | set):
+            return [
+                child
+                for item in value
+                for child in flat_values(item)
+            ]
+        return [] if value in (None, "") else [value]
+
+    def input_resource_ids(
+        spec: Mapping[str, Any],
+    ) -> tuple[list[str], bool]:
+        parameter = str(spec.get("id_parameter", ""))
+        raw = inputs.get(parameter)
+        mode = str(spec.get("id_mode", "scalar")).lower()
+        id_field = str(spec.get("id_field", "")).strip()
+        type_field = str(spec.get("item_type_field", "")).strip()
+        type_value = str(spec.get("item_type_value", "")).strip()
+        if mode != "collection":
+            value = (
+                _get_attribute_path(raw, id_field)
+                if id_field and isinstance(raw, Mapping)
+                else raw
+            )
+            return [str(item) for item in flat_values(value)], False
+        if raw is None:
+            return [], False
+        if not isinstance(raw, list | tuple):
+            return [], True
+        ids: list[str] = []
+        invalid = False
+        for item in raw:
+            if type_field and isinstance(item, Mapping):
+                type_matches = (
+                    str(item.get(type_field, "")) == type_value
+                )
+                id_present = bool(
+                    id_field
+                    and _get_attribute_path(item, id_field)
+                    not in (None, "")
+                )
+                if not type_matches and not id_present:
+                    continue
+            value = (
+                _get_attribute_path(item, id_field)
+                if id_field
+                else item
+            )
+            values = [str(child) for child in flat_values(value)]
+            if values:
+                ids.extend(values)
+            else:
+                invalid = True
+        return list(dict.fromkeys(ids)), invalid
+
     resolved: list[dict[str, Any]] = []
     for spec in tool_effect(tool_name).implicit_egress:
-        resource_id = str(
-            inputs.get(str(spec.get("id_parameter", "")), "") or ""
-        )
+        resource_ids, invalid_input = input_resource_ids(spec)
+        if invalid_input:
+            resolved.append(
+                {
+                    "resolved": False,
+                    "resource_id": "",
+                    "id_parameter": str(
+                        spec.get("id_parameter", "")
+                    ),
+                    "error": "implicit_egress_input_invalid",
+                }
+            )
+        if not resource_ids:
+            continue
         collection = _get_attribute_path(
             env,
             str(spec.get("resource_path", "")),
         )
-        resource = None
-        if isinstance(collection, Mapping):
-            resource = collection.get(resource_id)
-        elif isinstance(collection, (list, tuple)):
-            resource = next(
-                (
-                    item
-                    for item in collection
-                    if str(
-                        getattr(
-                            item,
-                            "id_",
-                            item.get("id_", "")
-                            if isinstance(item, Mapping)
-                            else "",
+        for resource_id in resource_ids:
+            resource = None
+            if isinstance(collection, Mapping):
+                resource = collection.get(resource_id)
+            elif isinstance(collection, list | tuple):
+                resource = next(
+                    (
+                        item
+                        for item in collection
+                        if str(
+                            getattr(
+                                item,
+                                "id_",
+                                item.get("id_", "")
+                                if isinstance(item, Mapping)
+                                else "",
+                            )
                         )
-                    )
-                    == resource_id
-                ),
-                None,
+                        == resource_id
+                    ),
+                    None,
+                )
+            if hasattr(resource, "model_dump"):
+                resource = resource.model_dump(mode="json")
+            elif resource is not None and hasattr(resource, "__dict__"):
+                resource = copy.deepcopy(vars(resource))
+            if not isinstance(resource, Mapping):
+                resolved.append(
+                    {
+                        "resolved": False,
+                        "resource_id": resource_id,
+                        "id_parameter": str(
+                            spec.get("id_parameter", "")
+                        ),
+                        "error": "implicit_egress_resource_not_found",
+                    }
+                )
+                continue
+            recipient_field = str(spec.get("recipient_field", ""))
+            content_fields = [
+                str(item)
+                for item in spec.get("content_fields", [])
+                if str(item) in resource
+            ]
+            recipient_values = flat_values(
+                resource.get(recipient_field)
             )
-        if hasattr(resource, "model_dump"):
-            resource = resource.model_dump(mode="json")
-        elif resource is not None and hasattr(resource, "__dict__"):
-            resource = copy.deepcopy(vars(resource))
-        if not isinstance(resource, Mapping):
+            for parameter in spec.get("recipient_parameters", []):
+                recipient_values.extend(
+                    flat_values(inputs.get(str(parameter)))
+                )
+            recipients = sorted(
+                {
+                    str(item)
+                    for item in recipient_values
+                    if item
+                }
+            )
+            entity = str(spec.get("entity", "unknown"))
+            source_entity = entity_source(app, entity)
+            field_policies: dict[str, dict[str, Any]] = {}
+            try:
+                for field in content_fields:
+                    field_policies[field] = elevate_policy_for_content(
+                        field_policy(
+                            app,
+                            entity,
+                            f"$.{field}",
+                        ),
+                        resource.get(field),
+                    )
+            except Exception as exc:
+                resolved.append(
+                    {
+                        "resolved": False,
+                        "resource_id": resource_id,
+                        "id_parameter": str(
+                            spec.get("id_parameter", "")
+                        ),
+                        "error": (
+                            "implicit_egress_sensitivity_unavailable:"
+                            f"{exc}"
+                        ),
+                    }
+                )
+                continue
+            field_levels = {
+                field: str(
+                    policy.get(
+                        "level",
+                        field_level(app, entity, f"$.{field}"),
+                    )
+                )
+                for field, policy in field_policies.items()
+            }
+            level = max(
+                field_levels.values(),
+                key=lambda item: CONFIDENTIALITY_LEVELS.get(item, 3),
+                default=entity_level(app, entity),
+            )
+            categories = sorted(
+                {
+                    str(category)
+                    for policy in field_policies.values()
+                    for category in policy.get("categories", [])
+                }
+            )
             resolved.append(
                 {
-                    "resolved": False,
+                    "resolved": bool(recipients),
                     "resource_id": resource_id,
                     "id_parameter": str(
                         spec.get("id_parameter", "")
                     ),
-                    "error": "implicit_egress_resource_not_found",
+                    "recipients": recipients,
+                    "recipient_field": recipient_field,
+                    "content": {
+                        field: copy.deepcopy(resource.get(field))
+                        for field in content_fields
+                    },
+                    "content_field_levels": field_levels,
+                    "content_field_policies": field_policies,
+                    "source": {
+                        "app": app,
+                        "entity": entity,
+                        "entity_id": resource_id,
+                    },
+                    "flow_label": make_flow_label(
+                        confidentiality=make_confidentiality(
+                            level=level,
+                            categories=categories,
+                            source_ids=[
+                                f"implicit_egress:{resource_id}"
+                            ],
+                            source_entities=[source_entity],
+                        ),
+                        integrity=make_integrity(
+                            kind="untrusted",
+                            taint_roots=[source_entity],
+                        ),
+                        data_influence=True,
+                        control_influence=True,
+                    ),
                 }
             )
-            continue
-        recipient_field = str(spec.get("recipient_field", ""))
-        content_fields = [
-            str(item)
-            for item in spec.get("content_fields", [])
-            if str(item) in resource
-        ]
-        recipients = sorted(
-            {
-                str(item)
-                for item in (
-                    resource.get(recipient_field, [])
-                    if isinstance(
-                        resource.get(recipient_field),
-                        (list, tuple, set),
-                    )
-                    else [resource.get(recipient_field)]
-                )
-                if item
-            }
-        )
-        entity = str(spec.get("entity", "unknown"))
-        source_entity = entity_source(app, entity)
-        resolved.append(
-            {
-                "resolved": bool(recipients),
-                "resource_id": resource_id,
-                "id_parameter": str(spec.get("id_parameter", "")),
-                "recipients": recipients,
-                "recipient_field": recipient_field,
-                "content": {
-                    field: copy.deepcopy(resource.get(field))
-                    for field in content_fields
-                },
-                "source": {
-                    "app": app,
-                    "entity": entity,
-                    "entity_id": resource_id,
-                },
-                "flow_label": make_flow_label(
-                    confidentiality=make_confidentiality(
-                        level=entity_level(app, entity),
-                        source_ids=[f"implicit_egress:{resource_id}"],
-                        source_entities=[source_entity],
-                    ),
-                    integrity=make_integrity(
-                        kind="untrusted",
-                        taint_roots=[source_entity],
-                    ),
-                    data_influence=True,
-                    control_influence=True,
-                ),
-            }
-        )
     return resolved
 
     # 已知的 APP 前缀映射
@@ -1712,8 +2089,26 @@ def capture_tool_call(func: Callable):
                     if ctx.current_reasoning
                     else []
                 ),
+                sensitive_references=ctx.sensitive_reference_values,
             )
             kwargs = resolved_kwargs
+            resolved_parameters = {
+                str(item.get("parameter", ""))
+                for item in parameter_resolutions
+                if isinstance(item, dict)
+            }
+            for resolution in resolve_resource_parameter_resolutions(
+                ctx.task_data_plan,
+                tracked_function,
+                plan_step_id,
+                dict(kwargs),
+                ctx.tool_value_index,
+            ):
+                if (
+                    str(resolution.get("parameter", ""))
+                    not in resolved_parameters
+                ):
+                    parameter_resolutions.append(resolution)
         argument_sources: List[Dict[str, Any]] = []
         argument_source_error = ";".join(parameter_resolution_errors)
         task_plan_active = (
@@ -1829,17 +2224,205 @@ def capture_tool_call(func: Callable):
             if ctx.current_reasoning and ctx.current_reasoning.prompt
             else ctx.user_prompt
         )
+        requirement_audit: Optional[Dict[str, Any]] = None
+        if (
+            effect.risk_level == "L2"
+            and isinstance(ctx.task_data_plan, dict)
+            and ctx.task_data_plan_provider is not None
+        ):
+            from ..analysis.requirement_audit import (
+                audit_requirements,
+                apply_requirement_decision,
+                requirement_resolution_options,
+                record_requirement_audit,
+            )
+
+            requirement_audit = audit_requirements(
+                user_prompt=user_prompt or "",
+                plan=ctx.task_data_plan,
+                proposed_tool=tracked_function,
+                proposed_args=dict(kwargs),
+                events=ctx.events,
+                available_tools=_build_tool_catalog(self),
+                provider=ctx.task_data_plan_provider,
+            )
+            ctx.task_data_plan = record_requirement_audit(
+                ctx.task_data_plan,
+                requirement_audit,
+            )
+            task_plan_active = ctx.task_data_plan
+            event_record["task_data_plan"] = task_plan_active
+            event_record["requirement_audit"] = requirement_audit
         defense_diagnostics = {"ring_2": {}, "ring_3": {}}
         intended_data_categories = set()
-        if _defense_enabled:
+        requirement_failed = bool(
+            requirement_audit is not None
+            and not requirement_audit.get("passed")
+        )
+        requirement_decision: Optional[Dict[str, Any]] = None
+        requirement_decision_applied = False
+        if requirement_failed:
+            allow = False
+            modified_kwargs = kwargs
+            unmet_requirements = [
+                item
+                for item in requirement_audit.get(
+                    "unmet_requirements",
+                    [],
+                )
+                if isinstance(item, Mapping)
+            ]
+            recommended_reads = list(
+                requirement_audit.get("recommended_reads", [])
+            )
+            if unmet_requirements and not recommended_reads:
+                from ..analysis.l2_chain import ConfirmationBroker
+                from ..modeling.graph_db import record_human_authorization
+
+                options = requirement_resolution_options(
+                    requirement_audit
+                )
+                requirement_field_sources = [
+                    {
+                        "parameter": "requirement",
+                        "source_activity_id": activity_id,
+                        "source_action": "",
+                        "source_path": "",
+                    }
+                    for requirement in unmet_requirements
+                    for activity_id in requirement.get(
+                        "source_activity_ids",
+                        [],
+                    )
+                    if str(activity_id).strip()
+                ]
+                requirement_decision = ConfirmationBroker().request(
+                    task_id=ctx.task_id or "",
+                    tool_name=tracked_function,
+                    app=app_domain,
+                    risk_level=effect.risk_level,
+                    args=dict(kwargs),
+                    plan=ctx.task_data_plan or {},
+                    chain_check={
+                        "requirement_audit": requirement_audit,
+                    },
+                    flow_check={
+                        "field_sources": requirement_field_sources,
+                    },
+                    confirmation_kind="requirement_resolution",
+                    decision_kind="requirement_resolution",
+                    options=options,
+                    payload={
+                        "requirements": requirement_audit.get(
+                            "requirements",
+                            [],
+                        ),
+                        "unmet_requirements": unmet_requirements,
+                        "summary": requirement_audit.get("summary", ""),
+                        "warnings": requirement_audit.get(
+                            "warnings",
+                            [],
+                        ),
+                    },
+                    on_pending=lambda pending: record_human_authorization(
+                        str(event_record.get("activity_id", "")),
+                        pending,
+                    ),
+                )
+                record_human_authorization(
+                    str(event_record.get("activity_id", "")),
+                    requirement_decision,
+                )
+                event_record["requirement_decision"] = (
+                    requirement_decision
+                )
+                decision = requirement_decision.get("decision")
+                current_plan_hash = str(
+                    (ctx.task_data_plan or {}).get("plan_hash") or ""
+                )
+                approved_plan_hash = str(
+                    requirement_decision.get("plan_hash") or ""
+                )
+                if (
+                    current_plan_hash
+                    and approved_plan_hash
+                    and current_plan_hash != approved_plan_hash
+                ):
+                    requirement_decision["application_error"] = (
+                        "requirement_decision_plan_stale"
+                    )
+                elif isinstance(decision, Mapping):
+                    try:
+                        ctx.task_data_plan = apply_requirement_decision(
+                            ctx.task_data_plan or {},
+                            decision,
+                            request_id=str(
+                                requirement_decision.get("request_id") or ""
+                            ),
+                            decision_hash=str(
+                                requirement_decision.get("decision_hash")
+                                or ""
+                            ),
+                        )
+                        task_plan_active = ctx.task_data_plan
+                        event_record["task_data_plan"] = task_plan_active
+                        requirement_decision_applied = True
+                    except (TypeError, ValueError) as exc:
+                        requirement_decision["application_error"] = str(exc)
+            defense_diagnostics["ring_2"] = {
+                "passed": False,
+                "requirement_audit": requirement_audit,
+            }
+            event_record["ring2_check"] = copy.deepcopy(
+                defense_diagnostics["ring_2"]
+            )
+            event_record["ring3_check"] = {}
+        elif _defense_enabled:
             allow, modified_kwargs, defense_diagnostics, intended_data_categories = process_before_execution(
                 event_record, prompt=None, options=get_config()
             )
             event_record["ring3_check"] = copy.deepcopy(
                 defense_diagnostics.get("ring_3", {})
             )
+            event_record["ring2_check"] = copy.deepcopy(
+                defense_diagnostics.get("ring_2", {})
+            )
+            if requirement_audit is not None:
+                defense_diagnostics["ring_2"][
+                    "requirement_audit"
+                ] = requirement_audit
         else:
             allow, modified_kwargs = True, kwargs
+
+        if requirement_audit is not None and not requirement_audit.get(
+            "passed"
+        ):
+            unmet_ids = [
+                str(item.get("id") or "")
+                for item in requirement_audit.get(
+                    "unmet_requirements",
+                    [],
+                )
+                if isinstance(item, Mapping) and item.get("id")
+            ]
+            event_record["block_reason"] = (
+                "Ring 2：L2 动作未通过任务要求覆盖检查；"
+                f"未满足要求={unmet_ids}。"
+            )
+            risk = make_risk(
+                2,
+                DECISION_BLOCK,
+                event_record["block_reason"],
+                severity="high",
+                event_kind="policy",
+                policy_id="ring2.requirement_coverage",
+                activity_id=event_record.get("activity_id"),
+                sink_ids=[tracked_function],
+                fsm_before="ACTION_PROPOSED",
+                fsm_after="BLOCKED",
+                confidence=requirement_audit.get("confidence"),
+            )
+            event_record.setdefault("risk_assessments", []).append(risk)
 
         if (
             allow
@@ -1848,64 +2431,116 @@ def capture_tool_call(func: Callable):
                 "confirmation_required"
             )
         ):
+            ring2_deterministic = defense_diagnostics.get(
+                "ring_2",
+                {},
+            )
+            confirmation_kind = str(
+                ring2_deterministic.get(
+                    "confirmation_kind",
+                    "l2_action",
+                )
+            )
             from ..analysis.l2_chain import (
                 ConfirmationBroker,
                 check_l2_chain_with_model,
+                confirmation_matches_request,
             )
 
-            chain_check = check_l2_chain_with_model(
-                user_prompt=user_prompt or "",
-                plan=ctx.task_data_plan or {},
-                agent_message=(
-                    ctx.current_reasoning.response
-                    if ctx.current_reasoning
-                    else ""
-                ),
-                tool_name=tracked_function,
-                tool_args=dict(kwargs),
-                plan_step_id=plan_step_id,
-                argument_flow_labels=argument_flow_labels,
-                parameter_resolutions=parameter_resolutions,
-                effective_egress=implicit_egress,
-                execution_history=[
-                    {
-                        "tool": called.get("tool_intent", ""),
-                        "status": called.get("status", ""),
-                        "risk_level": called.get("tool_risk_level", ""),
-                    }
-                    for called in ctx.events
-                    if called.get("type") == "api_call_end"
-                ],
-                plan_usage=ctx.plan_usage,
-                deterministic_checks={
-                    "ring_2": {
-                        key: defense_diagnostics.get("ring_2", {}).get(key)
-                        for key in (
-                            "passed",
-                            "reason",
-                            "matched_step",
-                            "effect",
-                            "risk_level",
-                            "confirmation_required",
+            if confirmation_kind == "sensitive_data_exposure":
+                exposure_check = dict(
+                    ring2_deterministic.get("exposure_check", {})
+                )
+                chain_check = {
+                    "consistent": True,
+                    "available": True,
+                    "executed": False,
+                    "kind": "sensitive_data_exposure",
+                    "reason": (
+                        "敏感字段读取计划已通过确定性字段、资源和任务范围"
+                        "检查，等待用户授权后再交给 Agent。"
+                    ),
+                    "checks": {},
+                    "violations": [],
+                    "evidence": [
+                        field
+                        for field in exposure_check.get(
+                            "inspection_fields",
+                            [],
                         )
+                        if field
+                    ],
+                    "confidence": 1.0,
+                    "exposure_check": exposure_check,
+                }
+            else:
+                chain_check = check_l2_chain_with_model(
+                    user_prompt=user_prompt or "",
+                    plan=ctx.task_data_plan or {},
+                    agent_message=(
+                        ctx.current_reasoning.response
+                        if ctx.current_reasoning
+                        else ""
+                    ),
+                    tool_name=tracked_function,
+                    tool_args=dict(kwargs),
+                    plan_step_id=plan_step_id,
+                    argument_flow_labels=argument_flow_labels,
+                    parameter_resolutions=parameter_resolutions,
+                    effective_egress=implicit_egress,
+                    execution_history=[
+                        {
+                            "tool": called.get("tool_intent", ""),
+                            "status": called.get("status", ""),
+                            "risk_level": called.get(
+                                "tool_risk_level",
+                                "",
+                            ),
+                        }
+                        for called in ctx.events
+                        if called.get("type") == "api_call_end"
+                    ],
+                    plan_usage=ctx.plan_usage,
+                    execution_context=(
+                        ctx.current_reasoning.context_messages
+                        if ctx.current_reasoning
+                        else []
+                    ),
+                    deterministic_checks={
+                        "ring_2": {
+                            key: ring2_deterministic.get(key)
+                            for key in (
+                                "passed",
+                                "reason",
+                                "matched_step",
+                                "effect",
+                                "risk_level",
+                                "confirmation_required",
+                                "data_access",
+                                "resource_access",
+                                "resource_access_failures",
+                            )
+                        },
+                        "ring_3": {
+                            key: defense_diagnostics.get(
+                                "ring_3",
+                                {},
+                            ).get(key)
+                            for key in (
+                                "passed",
+                                "reason",
+                                "destination_state",
+                                "destinations",
+                                "data_sources",
+                                "provenance_ancestors",
+                                "provenance_state",
+                                "confidentiality",
+                                "max_confidentiality",
+                            )
+                        },
                     },
-                    "ring_3": {
-                        key: defense_diagnostics.get("ring_3", {}).get(key)
-                        for key in (
-                            "passed",
-                            "reason",
-                            "destination_state",
-                            "destinations",
-                            "data_sources",
-                            "provenance_ancestors",
-                            "provenance_state",
-                            "confidentiality",
-                            "max_confidentiality",
-                        )
-                    },
-                },
-                planner=ctx.task_data_plan_provider,
-            )
+                    planner=ctx.task_data_plan_provider,
+                )
             event_record["l2_chain_check"] = chain_check
             defense_diagnostics["ring_2"]["chain_check"] = chain_check
             if not chain_check.get("consistent"):
@@ -1940,6 +2575,7 @@ def capture_tool_call(func: Callable):
                     plan=ctx.task_data_plan or {},
                     chain_check=chain_check,
                     flow_check=event_record.get("ring3_check", {}),
+                    confirmation_kind=confirmation_kind,
                     on_pending=lambda pending: record_human_authorization(
                         str(event_record.get("activity_id", "")),
                         pending,
@@ -1953,10 +2589,65 @@ def capture_tool_call(func: Callable):
                 defense_diagnostics["ring_2"][
                     "confirmation"
                 ] = confirmation
-                if confirmation.get("status") != "approved":
+                confirmation_current, confirmation_mismatches = (
+                    confirmation_matches_request(
+                        confirmation,
+                        tool_name=tracked_function,
+                        arguments=dict(kwargs),
+                        plan=ctx.task_data_plan or {},
+                    )
+                )
+                defense_diagnostics["ring_2"][
+                    "confirmation_binding"
+                ] = {
+                    "matched": confirmation_current,
+                    "mismatches": confirmation_mismatches,
+                }
+                if (
+                    confirmation.get("status") == "approved"
+                    and not confirmation_current
+                ):
                     allow = False
                     event_record["block_reason"] = (
-                        "Ring 2: L2 action was not approved by the user."
+                        "Ring 2: approval no longer matches the current "
+                        "plan, tool or arguments."
+                    )
+                    risk = make_risk(
+                        2,
+                        DECISION_BLOCK,
+                        event_record["block_reason"],
+                        severity="high",
+                        event_kind="security",
+                        policy_id=(
+                            "ring2.sensitive_data_exposure_stale"
+                            if confirmation_kind
+                            == "sensitive_data_exposure"
+                            else "ring2.l2_confirmation_stale"
+                        ),
+                        activity_id=event_record.get("activity_id"),
+                        sink_ids=[tracked_function],
+                        fsm_before="HELD",
+                        fsm_after="BLOCKED",
+                    )
+                    risk["confirmation_mismatches"] = (
+                        confirmation_mismatches
+                    )
+                    event_record.setdefault(
+                        "risk_assessments",
+                        [],
+                    ).append(risk)
+                elif confirmation.get("status") != "approved":
+                    allow = False
+                    event_record["block_reason"] = (
+                        (
+                            "Ring 2: sensitive data exposure was not "
+                            "approved by the user."
+                        )
+                        if confirmation_kind
+                        == "sensitive_data_exposure"
+                        else (
+                            "Ring 2: L2 action was not approved by the user."
+                        )
                     )
                     risk = make_risk(
                         2,
@@ -1964,7 +2655,12 @@ def capture_tool_call(func: Callable):
                         event_record["block_reason"],
                         severity="high",
                         event_kind="policy",
-                        policy_id="ring2.l2_confirmation_rejected",
+                        policy_id=(
+                            "ring2.sensitive_data_exposure_rejected"
+                            if confirmation_kind
+                            == "sensitive_data_exposure"
+                            else "ring2.l2_confirmation_rejected"
+                        ),
                         activity_id=event_record.get("activity_id"),
                         sink_ids=[tracked_function],
                         fsm_before="HELD",
@@ -2016,6 +2712,13 @@ def capture_tool_call(func: Callable):
                 "l2_chain_check": event_record.get("l2_chain_check"),
                 "l2_confirmation": event_record.get("l2_confirmation"),
                 "ring3_check": event_record.get("ring3_check"),
+                "ring2_check": event_record.get("ring2_check"),
+                "requirement_audit": event_record.get(
+                    "requirement_audit"
+                ),
+                "requirement_decision": event_record.get(
+                    "requirement_decision"
+                ),
                 "risk_assessments": event_record.get("risk_assessments", []),
                 "defense_diagnostics": {
                     "before": defense_diagnostics,
@@ -2023,14 +2726,72 @@ def capture_tool_call(func: Callable):
                 },
             }
             ctx.log_event(blocked_event)
-            mark_activity_blocked(blocked_event)
-            
-            # 抛出异常中断 AgentPipeline 执行循环，避免 LLM 陷入循环尝试
-            raise PromptInjectionBlockedError(
-                f"Tool call '{tracked_function}' was blocked by the Ring defense pipeline.",
-                block_reason=block_reason,
-                tool_intent=tracked_function,
+            mark_activity_denied(blocked_event)
+            requirement_audit = event_record.get("requirement_audit")
+            requirement_decision = event_record.get(
+                "requirement_decision"
             )
+            if isinstance(requirement_decision, Mapping):
+                selected_decision = requirement_decision.get(
+                    "decision"
+                )
+                decision_name = (
+                    str(selected_decision.get("decision") or "")
+                    if isinstance(selected_decision, Mapping)
+                    else ""
+                )
+                if (
+                    requirement_decision_applied
+                    and decision_name != "cancel_task"
+                ):
+                    denial_message = (
+                        "RequirementDecisionApplied: the user explicitly "
+                        f"resolved the unmet requirements with {decision_name}. "
+                        "The current L2 call was not executed. Replan from the "
+                        "new plan revision, re-run requirement coverage and "
+                        "then request the normal L2 confirmation."
+                    )
+                else:
+                    denial_message = (
+                        "RequirementDecisionCancelled: the user did not "
+                        "accept the unresolved business requirement. The "
+                        "current L2 call was not executed. Stop and report "
+                        "the cancelled requirement."
+                    )
+            elif isinstance(requirement_audit, Mapping):
+                reads = list(
+                    requirement_audit.get("recommended_reads", [])
+                )
+                denial_message = (
+                    "RequirementCoverageDenied: "
+                    f"{block_reason} The tool was not executed. "
+                    "Before retrying this L2 action, gather the required "
+                    "evidence with the recommended allowed L0/L1 reads: "
+                    + json.dumps(
+                        reads,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    + ". Do not retry a conflicting or unverifiable "
+                    "requirement; report it to the user instead."
+                )
+            else:
+                denial_message = (
+                    f"RingPolicyDenied: {block_reason} The tool was not "
+                    "executed. Do not retry this rejected call. Continue the "
+                    "task using only planned and authorized tools, or report "
+                    "the missing capability."
+                )
+            if raise_on_error:
+                raise PromptInjectionBlockedError(
+                    (
+                        f"Tool call '{tracked_function}' was blocked by "
+                        "the Ring defense pipeline."
+                    ),
+                    block_reason=block_reason,
+                    tool_intent=tracked_function,
+                )
+            return "", denial_message
         
         # Tool functions mutate the environment in place. Keep a rollback copy
         # so an exception cannot commit a partially completed side effect.
@@ -2062,32 +2823,433 @@ def capture_tool_call(func: Callable):
                 },
             }
             ctx.log_event(failure_event)
-            from ..modeling.graph_db import update_activity_outcome
-
             update_activity_outcome(failure_event)
             raise
         rollback_applied = False
         if error:
             rollback_applied = _restore_environment(env, execution_snapshot)
         end_time = time.time()
+        raw_domain_snapshot = None
+        if result is not None and not error:
+            try:
+                raw_domain_snapshot = str(result)
+            except Exception:
+                raw_domain_snapshot = "Unserializable Result"
+        data_access_check: dict[str, Any] = {
+            "passed": True,
+            "reason": "not_applicable",
+            "withheld_fields": [],
+            "opaque_fields": [],
+        }
+        agent_result = result
+        if (
+            _defense_enabled
+            and not error
+            and isinstance(ctx.task_data_plan, dict)
+            and effective_ring_enabled("ring_2", get_config())
+            and effective_method_enabled(
+                "ring_2",
+                "task_scope",
+                get_config(),
+            )
+        ):
+            access_contract = action_data_access(
+                ctx.task_data_plan,
+                tracked_function,
+                str(plan_step_id),
+            )
+            if access_contract is None:
+                data_access_check = {
+                    "passed": False,
+                    "reason": "data_access_contract_unavailable",
+                    "withheld_fields": [],
+                    "opaque_fields": [],
+                }
+            else:
+                agent_result, data_access_check = project_agent_exposure(
+                    result,
+                    access_contract,
+                    activity_id=str(
+                        event_record.get("activity_id", "")
+                    ),
+                )
+                visible_patterns = {
+                    normalize_data_path(str(item))
+                    for item in access_contract.get(
+                        "visible_fields",
+                        [],
+                    )
+                    if str(item).strip()
+                }
+
+                def requested_for_analysis(path: str) -> bool:
+                    normalized = normalize_data_path(path)
+                    return any(
+                        normalized == pattern
+                        or normalized.startswith(f"{pattern}.")
+                        or normalized.startswith(f"{pattern}[")
+                        for pattern in visible_patterns
+                    )
+
+                runtime_hidden = list(
+                    data_access_check.get(
+                        "runtime_hidden_sensitive_fields",
+                        [],
+                    )
+                )
+                requested_runtime_hidden = [
+                    path
+                    for path in runtime_hidden
+                    if requested_for_analysis(path)
+                ]
+                if requested_runtime_hidden:
+                    from ..analysis.l2_chain import (
+                        ConfirmationBroker,
+                        confirmation_matches_request,
+                        stable_arguments_hash,
+                    )
+                    from ..modeling.graph_db import (
+                        record_human_authorization,
+                    )
+
+                    visible_policies = data_access_check.get(
+                        "runtime_sensitive_policies",
+                        {},
+                    )
+                    actual_levels = [
+                        str(
+                            (
+                                visible_policies.get(path)
+                                if isinstance(visible_policies, Mapping)
+                                else {}
+                            ).get("level", "secret")
+                        )
+                        for path in requested_runtime_hidden
+                    ]
+                    authorized_level = max(
+                        actual_levels,
+                        key=lambda item: CONFIDENTIALITY_LEVELS.get(
+                            item,
+                            3,
+                        ),
+                        default="secret",
+                    )
+                    exposure_check = {
+                        "phase": "post_execution_runtime_detection",
+                        "action": tracked_function,
+                        "inspection_fields": requested_runtime_hidden,
+                        "opaque_fields": list(
+                            access_contract.get(
+                                "opaque_fields",
+                                [],
+                            )
+                        ),
+                        "previous_max_exposure_level": str(
+                            access_contract.get(
+                                "max_exposure_level",
+                                "internal",
+                            )
+                        ),
+                        "max_exposure_level": authorized_level,
+                        "field_policies": copy.deepcopy(
+                            {
+                                path: visible_policies.get(path, {})
+                                for path in requested_runtime_hidden
+                            }
+                        ),
+                    }
+                    chain_check = {
+                        "consistent": True,
+                        "available": True,
+                        "executed": False,
+                        "kind": "sensitive_data_exposure",
+                        "reason": (
+                            "读取结果中的自然语言内容被检测为高于原计划"
+                            "暴露上限；该字段属于任务声明的待分析字段，"
+                            "等待用户授权后再交给 Agent。"
+                        ),
+                        "checks": {},
+                        "violations": [],
+                        "evidence": requested_runtime_hidden,
+                        "confidence": 1.0,
+                        "exposure_check": exposure_check,
+                    }
+                    runtime_hold = make_risk(
+                        2,
+                        DECISION_HOLD,
+                        (
+                            "读取结果中的自然语言内容超出计划暴露上限，"
+                            "需要用户授权后才能交给 Agent。"
+                        ),
+                        severity="high",
+                        event_kind="policy",
+                        policy_id=(
+                            "ring2.sensitive_data_exposure_confirmation"
+                        ),
+                        activity_id=event_record.get("activity_id"),
+                        source_ids=requested_runtime_hidden,
+                        sink_ids=[tracked_function],
+                        fsm_before="OUTPUT_OBSERVED",
+                        fsm_after="HELD",
+                        confidence=1.0,
+                    )
+                    runtime_hold["phase"] = (
+                        "post_execution_runtime_detection"
+                    )
+                    runtime_hold["exposure_fields"] = list(
+                        requested_runtime_hidden
+                    )
+                    runtime_hold["occurrence_count"] = 1
+                    event_record.setdefault(
+                        "risk_assessments",
+                        [],
+                    ).append(runtime_hold)
+                    confirmation = ConfirmationBroker().request(
+                        task_id=ctx.task_id or "",
+                        tool_name=tracked_function,
+                        app=app_domain,
+                        risk_level="sensitive_data",
+                        args=dict(kwargs),
+                        plan=ctx.task_data_plan or {},
+                        chain_check=chain_check,
+                        flow_check={
+                            "passed": True,
+                            "reason": (
+                                "runtime_sensitive_content_requires_"
+                                "authorization"
+                            ),
+                            "exposure_check": exposure_check,
+                        },
+                        confirmation_kind="sensitive_data_exposure",
+                        on_pending=lambda pending: (
+                            record_human_authorization(
+                                str(
+                                    event_record.get(
+                                        "activity_id",
+                                        "",
+                                    )
+                                ),
+                                pending,
+                            )
+                        ),
+                    )
+                    (
+                        confirmation_current,
+                        confirmation_mismatches,
+                    ) = confirmation_matches_request(
+                        confirmation,
+                        tool_name=tracked_function,
+                        arguments=dict(kwargs),
+                        plan=ctx.task_data_plan or {},
+                    )
+                    record_human_authorization(
+                        str(event_record.get("activity_id", "")),
+                        confirmation,
+                    )
+                    event_record[
+                        "runtime_exposure_confirmation"
+                    ] = confirmation
+                    event_record["l2_confirmation"] = confirmation
+                    data_access_check[
+                        "runtime_exposure_authorization"
+                    ] = {
+                        "status": confirmation.get("status"),
+                        "request_id": confirmation.get("request_id"),
+                        "fields": requested_runtime_hidden,
+                        "max_exposure_level": authorized_level,
+                        "args_hash": stable_arguments_hash(kwargs),
+                        "confirmation_current": confirmation_current,
+                        "confirmation_mismatches": confirmation_mismatches,
+                    }
+                    if (
+                        confirmation.get("status") == "approved"
+                        and confirmation_current
+                    ):
+                        authorized_contract = copy.deepcopy(
+                            access_contract
+                        )
+                        authorized_contract[
+                            "max_exposure_level"
+                        ] = authorized_level
+                        agent_result, data_access_check = (
+                            project_agent_exposure(
+                                result,
+                                authorized_contract,
+                                activity_id=str(
+                                    event_record.get(
+                                        "activity_id",
+                                        "",
+                                    )
+                                ),
+                            )
+                        )
+                        data_access_check[
+                            "runtime_exposure_authorization"
+                        ] = {
+                            "status": "approved",
+                            "request_id": confirmation.get(
+                                "request_id"
+                            ),
+                            "fields": requested_runtime_hidden,
+                            "max_exposure_level": authorized_level,
+                        }
+                    elif (
+                        confirmation.get("status") == "approved"
+                        and not confirmation_current
+                    ):
+                        stale = make_risk(
+                            2,
+                            DECISION_MITIGATE,
+                            (
+                                "The user approved exposure, but the plan "
+                                "or arguments changed while the request was "
+                                "pending; the sensitive fields remain hidden."
+                            ),
+                            severity="medium",
+                            event_kind="policy",
+                            policy_id=(
+                                "ring2.sensitive_data_exposure_stale"
+                            ),
+                            activity_id=event_record.get(
+                                "activity_id"
+                            ),
+                            source_ids=requested_runtime_hidden,
+                            sink_ids=[tracked_function],
+                            fsm_before="HELD",
+                            fsm_after="SANITIZED",
+                        )
+                        stale["confirmation_mismatches"] = (
+                            confirmation_mismatches
+                        )
+                        event_record.setdefault(
+                            "risk_assessments",
+                            [],
+                        ).append(stale)
+                    elif confirmation.get("status") == "rejected":
+                        rejection = make_risk(
+                            2,
+                            DECISION_MITIGATE,
+                            (
+                                "The user rejected exposure of runtime-"
+                                "detected sensitive content; the affected "
+                                "fields remain hidden from the Agent."
+                            ),
+                            severity="medium",
+                            event_kind="policy",
+                            policy_id=(
+                                "ring2.sensitive_data_exposure_rejected"
+                            ),
+                            activity_id=event_record.get(
+                                "activity_id"
+                            ),
+                            source_ids=requested_runtime_hidden,
+                            sink_ids=[tracked_function],
+                            fsm_before="OUTPUT_OBSERVED",
+                            fsm_after="SANITIZED",
+                        )
+                        event_record.setdefault(
+                            "risk_assessments",
+                            [],
+                        ).append(rejection)
+                ctx.sensitive_reference_values.update(
+                    data_access_check.pop(
+                        "_sensitive_references",
+                        {},
+                    )
+                )
+                if data_access_check.get(
+                    "runtime_hidden_sensitive_fields"
+                ):
+                    risk = make_risk(
+                        2,
+                        DECISION_MITIGATE,
+                        (
+                            "Content-derived sensitivity exceeded the "
+                            f"tool-output exposure limit for {tracked_function}; "
+                            "the affected fields were withheld."
+                        ),
+                        severity="medium",
+                        event_kind="policy",
+                        policy_id="ring2.sensitive_field_withheld",
+                        activity_id=event_record.get("activity_id"),
+                        source_ids=data_access_check.get(
+                            "runtime_hidden_sensitive_fields",
+                            [],
+                        ),
+                        sink_ids=[tracked_function],
+                        fsm_before="OUTPUT_OBSERVED",
+                        fsm_after="SANITIZED",
+                    )
+                    event_record.setdefault(
+                        "risk_assessments",
+                        [],
+                    ).append(risk)
+            if not data_access_check.get("passed", False):
+                block_reason = (
+                    "Ring 2 data-exposure policy could not authorize the "
+                    f"read result for {tracked_function}: "
+                    f"{data_access_check.get('reason', 'unknown')}."
+                )
+                blocked_event = {
+                    **copy.deepcopy(event_record),
+                    "timestamp": end_time,
+                    "status": "blocked",
+                    "outputs": None,
+                    "error": None,
+                    "type": "api_call_end",
+                    "environment_delta": None,
+                    "block_reason": block_reason,
+                    "data_access_check": data_access_check,
+                }
+                risk = make_risk(
+                    2,
+                    DECISION_BLOCK,
+                    block_reason,
+                    severity="high",
+                    event_kind="security",
+                    policy_id="ring2.data_exposure_blocked",
+                    activity_id=event_record.get("activity_id"),
+                    sink_ids=[tracked_function],
+                    fsm_before="OUTPUT_OBSERVED",
+                    fsm_after="BLOCKED",
+                )
+                blocked_event.setdefault(
+                    "risk_assessments",
+                    [],
+                ).append(risk)
+                ctx.log_event(blocked_event)
+                update_activity_outcome(blocked_event)
+                raise PromptInjectionBlockedError(
+                    block_reason,
+                    block_reason=block_reason,
+                    tool_intent=tracked_function,
+                )
         
         # Post execution semantic extraction/snapshot
         out_domain_snapshot = None
-        if result is not None and not error:
+        if agent_result is not None and not error:
             try:
-                out_domain_snapshot = str(result)
+                out_domain_snapshot = str(agent_result)
             except Exception:
                 out_domain_snapshot = "Unserializable Result"
         output_origins: List[ValueOrigin] = []
-        if result is not None and not error:
+        if agent_result is not None and not error:
             output_origins = collect_value_origins(
-                result,
+                agent_result,
                 app=app_domain,
                 source_tool=tracked_function,
                 activity_id=str(event_record.get("activity_id", "")),
                 fallback_level=effect.confidentiality,
                 fallback_categories=effect.categories,
                 inherited_label=output_inherited_label,
+                dynamic_mapping_policy_paths=data_access_check.get(
+                    "dynamic_mapping_policy_paths",
+                    [],
+                ),
+                content_detection=data_access_check.get(
+                    "content_detection",
+                    True,
+                ),
             )
         output_source_entities = sorted(
             {
@@ -2199,6 +3361,10 @@ def capture_tool_call(func: Callable):
                 output_schema = schema_for_type(
                     getattr(function_obj, "return_type", None)
                 )
+                output_schema = _apply_schema_semantic_types(
+                    output_schema,
+                    effect.output_semantic_types,
+                )
         except Exception:
             output_schema = {}
         event_complete = {
@@ -2252,6 +3418,13 @@ def capture_tool_call(func: Callable):
             "l2_chain_check": event_record.get("l2_chain_check"),
             "l2_confirmation": event_record.get("l2_confirmation"),
             "ring3_check": event_record.get("ring3_check"),
+            "ring2_check": event_record.get("ring2_check"),
+            "requirement_audit": event_record.get("requirement_audit"),
+            "requirement_decision": event_record.get(
+                "requirement_decision"
+            ),
+            "data_access_check": data_access_check,
+            "raw_output_snapshot": raw_domain_snapshot,
             "risk_assessments": list(event_record.get("risk_assessments", [])),
         }
         
@@ -2261,12 +3434,12 @@ def capture_tool_call(func: Callable):
         try:
             if _defense_enabled:
                 final_result, after_diagnostics = process_after_execution_with_details(
-                    event_complete, result,
+                    event_complete, agent_result,
                     intent_data=intended_data_categories,
                     options=get_config(),
                 )
             else:
-                final_result = result
+                final_result = agent_result
             if final_result is not None and not error:
                 ring1_diagnostics = (
                     after_diagnostics.get("ring_1", {})
@@ -2284,6 +3457,14 @@ def capture_tool_call(func: Callable):
                         "risky_entities", []
                     ),
                     inherited_label=output_inherited_label,
+                    dynamic_mapping_policy_paths=data_access_check.get(
+                        "dynamic_mapping_policy_paths",
+                        [],
+                    ),
+                    content_detection=data_access_check.get(
+                        "content_detection",
+                        True,
+                    ),
                 )
                 ctx.tool_value_origins.extend(admitted_origins)
                 for key, records in index_value_origins(
@@ -2364,12 +3545,10 @@ def capture_tool_call(func: Callable):
                 ):
                     event_complete["risk_assessments"].append(risk)
             ctx.log_event(event_complete)
-            from ..modeling.graph_db import update_activity_outcome
             update_activity_outcome(event_complete)
             raise
         
         # Update Graph with outcome (移到 try 块之后，避免阻断时重复创建输出节点)
-        from ..modeling.graph_db import update_activity_outcome
         update_activity_outcome(event_complete)
         
         # Attach defense diagnostics to the event for trace file collection

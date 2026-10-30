@@ -211,7 +211,7 @@
 
     <div class="confirmation-overlay" id="l2ConfirmationOverlay" hidden>
         <div class="confirmation-dialog" role="dialog" aria-modal="false" aria-labelledby="l2ConfirmationTitle">
-            <div class="confirmation-kicker">L2 高风险操作确认</div>
+            <div class="confirmation-kicker" id="l2ConfirmationKicker">L2 高风险操作确认</div>
             <div class="confirmation-review-head">
                 <span>图谱审查模式：左侧图谱可缩放、拖动和查看节点</span>
                 <button type="button" class="confirmation-focus" id="btnFocusL2Graph">定位关键证据</button>
@@ -227,6 +227,11 @@
                 <dt>计划版本</dt><dd id="l2ConfirmationPlan">-</dd>
             </dl>
             <pre class="confirmation-args" id="l2ConfirmationArgs"></pre>
+            <div class="confirmation-requirement-decision" id="l2RequirementDecision" hidden>
+                <div class="confirmation-requirement-title">选择要放宽的要求</div>
+                <div id="l2RequirementDecisionOptions"></div>
+                <div class="confirmation-requirement-error" id="l2RequirementDecisionError" hidden></div>
+            </div>
             <div class="confirmation-actions">
                 <button type="button" class="confirmation-reject" id="btnRejectL2">拒绝并阻断</button>
                 <button type="button" class="confirmation-approve" id="btnApproveL2">确认执行</button>

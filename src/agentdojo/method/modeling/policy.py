@@ -22,10 +22,14 @@ class ToolEffectPolicy:
     effect: str
     risk_level: str = "L2"
     control_fields: set[str] = field(default_factory=set)
+    resource_fields: set[str] = field(default_factory=set)
     destination_fields: set[str] = field(default_factory=set)
     content_fields: set[str] = field(default_factory=set)
     parameter_roles: dict[str, str] = field(default_factory=dict)
     semantic_types: dict[str, str] = field(default_factory=dict)
+    output_semantic_types: dict[str, str] = field(default_factory=dict)
+    dynamic_entity_map: bool = False
+    content_detection: bool = True
     implicit_egress: tuple[dict[str, Any], ...] = ()
     authoritative_parameters: dict[str, dict[str, Any]] = field(
         default_factory=dict
@@ -43,10 +47,16 @@ class ToolEffectPolicy:
             "effect": self.effect,
             "risk_level": self.risk_level,
             "control_fields": sorted(self.control_fields),
+            "resource_fields": sorted(self.resource_fields),
             "destination_fields": sorted(self.destination_fields),
             "content_fields": sorted(self.content_fields),
             "parameter_roles": dict(self.parameter_roles),
             "semantic_types": dict(self.semantic_types),
+            "output_semantic_types": dict(
+                self.output_semantic_types
+            ),
+            "dynamic_entity_map": self.dynamic_entity_map,
+            "content_detection": self.content_detection,
             "implicit_egress": [
                 dict(item) for item in self.implicit_egress
             ],
@@ -146,6 +156,7 @@ def tool_effect(tool_name: str) -> ToolEffectPolicy:
         effect=effect,
         risk_level=risk_level,
         control_fields=merged_list("control_fields"),
+        resource_fields=merged_list("resource_fields"),
         destination_fields=merged_list("destination_fields"),
         content_fields=merged_list("content_fields"),
         parameter_roles={
@@ -162,6 +173,15 @@ def tool_effect(tool_name: str) -> ToolEffectPolicy:
             ).items()
             if str(value_type).strip()
         },
+        output_semantic_types={
+            str(path): str(value_type)
+            for path, value_type in (
+                raw.get("output_semantic_types", {}) or {}
+            ).items()
+            if str(value_type).strip()
+        },
+        dynamic_entity_map=bool(raw.get("dynamic_entity_map", False)),
+        content_detection=bool(raw.get("content_detection", True)),
         implicit_egress=tuple(
             dict(item)
             for item in (raw.get("implicit_egress", []) or [])
@@ -209,5 +229,5 @@ def category_required_level(categories: Iterable[str]) -> str:
 
 
 def sensitive_categories_in(value: Any) -> set[str]:
-    """Content-based sensitive categories are intentionally unsupported."""
+    """Legacy hook retained for callers that do not use trusted source labels."""
     return set()

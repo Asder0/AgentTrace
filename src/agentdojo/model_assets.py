@@ -10,8 +10,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-DEFAULT_INJECTION_MODEL_ID = "Horizon-Labs/prompt-injection-guard-small"
-DEFAULT_INJECTION_MODEL_DIRNAME = "prompt-injection-guard-small"
+DEFAULT_INJECTION_MODEL_ID = "Unplug-AI/unplug-tiny-v1"
+DEFAULT_INJECTION_MODEL_DIRNAME = "unplug-tiny-v1"
 INJECTION_MODEL_PATH_ENV = "AGENTDOJO_PI_MODEL_PATH"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

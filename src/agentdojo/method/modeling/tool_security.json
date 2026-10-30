@@ -7,8 +7,11 @@
     "outcome_audit_min_confidence": 0.7,
     "unknown_category_level": "secret",
     "unknown_source_integrity": "untrusted",
+    "gliner_sensitivity_threshold": 0.45,
     "prompt_injection_scan": {
       "threshold": 0.95,
+      "doc_threshold": 0.9,
+      "span_threshold": 0.45,
       "mask_urls": false,
       "mask_emails": true
     },
@@ -29,6 +32,9 @@
     "financial_amount": "confidential",
     "ssn": "secret",
     "credit_card": "secret",
+    "passport_number": "secret",
+    "government_identifier": "secret",
+    "unknown_field": "secret",
     "personal_name": "confidential",
     "address": "confidential",
     "phone": "confidential",
@@ -111,21 +117,42 @@
     "add_calendar_event_participants": {
       "profile": "egress_internal",
       "control_fields": ["event_id", "participants"],
-      "destination_fields": ["participants"]
+      "resource_fields": ["event_id"],
+      "destination_fields": ["participants"],
+      "implicit_egress": [
+        {
+          "resource_path": "calendar.events",
+          "id_parameter": "event_id",
+          "entity": "calendar_event",
+          "recipient_field": "participants",
+          "recipient_parameters": ["participants"],
+          "content_fields": [
+            "title",
+            "description",
+            "start_time",
+            "end_time",
+            "location",
+            "participants"
+          ]
+        }
+      ]
     },
     "add_user_to_channel": {
       "profile": "egress_internal",
       "control_fields": ["channel", "user"],
+      "resource_fields": ["channel"],
       "destination_fields": ["channel", "user"]
     },
     "append_to_file": {
       "profile": "write_internal",
       "control_fields": ["file_id"],
+      "resource_fields": ["file_id"],
       "content_fields": ["content"]
     },
     "cancel_calendar_event": {
       "profile": "egress_internal",
       "control_fields": ["event_id"],
+      "resource_fields": ["event_id"],
       "destination_fields": ["event_id"],
       "implicit_egress": [
         {
@@ -144,7 +171,11 @@
         }
       ]
     },
-    "check_restaurant_opening_hours": {"profile": "read_public"},
+    "check_restaurant_opening_hours": {
+      "profile": "read_public",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
     "create_calendar_event": {
       "profile": "egress_internal",
       "control_fields": ["start_time", "end_time", "participants", "location"],
@@ -158,49 +189,102 @@
     "create_file": {
       "profile": "write_internal",
       "control_fields": ["filename"],
+      "resource_fields": ["filename"],
       "content_fields": ["content"]
     },
     "delete_email": {
       "profile": "write_internal",
       "risk_level": "L2",
-      "control_fields": ["email_id"]
+      "control_fields": ["email_id"],
+      "resource_fields": ["email_id"]
     },
     "delete_file": {
       "profile": "write_internal",
       "risk_level": "L2",
-      "control_fields": ["file_id"]
+      "control_fields": ["file_id"],
+      "resource_fields": ["file_id"]
     },
-    "get_all_car_rental_companies_in_city": {"profile": "read_internal"},
-    "get_all_hotels_in_city": {"profile": "read_internal"},
-    "get_all_restaurants_in_city": {"profile": "read_internal"},
+    "get_all_car_rental_companies_in_city": {
+      "profile": "read_internal",
+      "content_detection": false
+    },
+    "get_all_hotels_in_city": {
+      "profile": "read_internal",
+      "content_detection": false
+    },
+    "get_all_restaurants_in_city": {
+      "profile": "read_internal",
+      "content_detection": false
+    },
     "get_balance": {
       "profile": "read_secret",
       "categories": ["financial_data"]
     },
-    "get_car_fuel_options": {"profile": "read_internal"},
-    "get_car_price_per_day": {"profile": "read_internal"},
-    "get_car_rental_address": {"profile": "read_internal"},
-    "get_car_types_available": {"profile": "read_internal"},
-    "get_channels": {"profile": "read_internal"},
-    "get_contact_information_for_restaurants": {"profile": "read_internal"},
-    "get_cuisine_type_for_restaurants": {"profile": "read_public"},
+    "get_car_fuel_options": {
+      "profile": "read_internal",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
+    "get_car_price_per_day": {
+      "profile": "read_internal",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
+    "get_car_rental_address": {
+      "profile": "read_internal",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
+    "get_car_types_available": {
+      "profile": "read_internal",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
+    "get_channels": {
+      "profile": "read_internal",
+      "output_semantic_types": {"$[*]": "identifier"}
+    },
+    "get_contact_information_for_restaurants": {
+      "profile": "read_internal",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
+    "get_cuisine_type_for_restaurants": {
+      "profile": "read_public",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
     "get_current_day": {"profile": "read_public"},
     "get_day_calendar_events": {
       "profile": "read_confidential",
+      "resource_fields": ["day"],
       "semantic_types": {"day": "date"}
     },
-    "get_dietary_restrictions_for_all_restaurants": {"profile": "read_public"},
+    "get_dietary_restrictions_for_all_restaurants": {
+      "profile": "read_public",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
     "get_draft_emails": {
       "profile": "read_internal",
       "categories": ["email"]
     },
     "get_file_by_id": {
       "profile": "read_confidential",
+      "resource_fields": ["file_id"],
       "categories": ["file"]
     },
     "get_flight_information": {"profile": "read_internal"},
-    "get_hotels_address": {"profile": "read_internal"},
-    "get_hotels_prices": {"profile": "read_internal"},
+    "get_hotels_address": {
+      "profile": "read_internal",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
+    "get_hotels_prices": {
+      "profile": "read_internal",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
     "get_iban": {
       "profile": "read_secret",
       "categories": ["iban", "financial_data"]
@@ -209,15 +293,35 @@
       "profile": "read_secret",
       "categories": ["financial_data", "financial_amount"]
     },
-    "get_price_for_restaurants": {"profile": "read_public"},
-    "get_rating_reviews_for_car_rental": {"profile": "read_public"},
-    "get_rating_reviews_for_hotels": {"profile": "read_public"},
-    "get_rating_reviews_for_restaurants": {"profile": "read_public"},
+    "get_price_for_restaurants": {
+      "profile": "read_public",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
+    "get_rating_reviews_for_car_rental": {
+      "profile": "read_public",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
+    "get_rating_reviews_for_hotels": {
+      "profile": "read_public",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
+    "get_rating_reviews_for_restaurants": {
+      "profile": "read_public",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
     "get_received_emails": {
       "profile": "read_internal",
       "categories": ["email"]
     },
-    "get_restaurants_address": {"profile": "read_internal"},
+    "get_restaurants_address": {
+      "profile": "read_internal",
+      "dynamic_entity_map": true,
+      "content_detection": false
+    },
     "get_scheduled_transactions": {
       "profile": "read_secret",
       "categories": ["financial_data"]
@@ -237,12 +341,18 @@
     "get_user_information": {"profile": "read_internal"},
     "get_users_in_channel": {
       "profile": "read_confidential",
-      "categories": ["personal_name"]
+      "resource_fields": ["channel"],
+      "categories": ["personal_name"],
+      "output_semantic_types": {"$[*]": "identifier"}
     },
-    "get_webpage": {"profile": "read_internal"},
+    "get_webpage": {
+      "profile": "read_internal",
+      "resource_fields": ["url"]
+    },
     "invite_user_to_slack": {
       "profile": "egress_internal",
       "control_fields": ["user", "user_email"],
+      "resource_fields": ["user_email"],
       "destination_fields": ["user", "user_email"]
     },
     "list_files": {
@@ -255,19 +365,28 @@
       "destination_fields": ["url"],
       "content_fields": ["content"]
     },
-    "read_channel_messages": {"profile": "read_internal"},
+    "read_channel_messages": {
+      "profile": "read_internal",
+      "resource_fields": ["channel"]
+    },
     "read_file": {
       "profile": "read_confidential",
+      "resource_fields": ["file_path"],
       "categories": ["file"]
     },
-    "read_inbox": {"profile": "read_internal"},
+    "read_inbox": {
+      "profile": "read_internal",
+      "resource_fields": ["user"]
+    },
     "remove_user_from_slack": {
       "profile": "privilege",
-      "control_fields": ["user"]
+      "control_fields": ["user"],
+      "resource_fields": ["user"]
     },
     "reschedule_calendar_event": {
       "profile": "egress_internal",
       "control_fields": ["event_id", "new_start_time", "new_end_time"],
+      "resource_fields": ["event_id"],
       "destination_fields": ["event_id"],
       "implicit_egress": [
         {
@@ -372,6 +491,26 @@
       "control_fields": ["recipients", "cc", "bcc", "attachments"],
       "destination_fields": ["recipients", "cc", "bcc"],
       "content_fields": ["subject", "body", "attachments"],
+      "implicit_egress": [
+        {
+          "resource_path": "cloud_drive.files",
+          "id_parameter": "attachments",
+          "id_mode": "collection",
+          "id_field": "file_id",
+          "item_type_field": "type",
+          "item_type_value": "file",
+          "entity": "cloud_drive_file",
+          "recipient_field": "",
+          "recipient_parameters": ["recipients", "cc", "bcc"],
+          "content_fields": [
+            "filename",
+            "content",
+            "size",
+            "owner",
+            "last_modified"
+          ]
+        }
+      ],
       "semantic_types": {
         "recipients": "email",
         "cc": "email",
@@ -404,7 +543,24 @@
     "share_file": {
       "profile": "egress_internal",
       "control_fields": ["file_id", "email", "permission"],
+      "resource_fields": ["file_id"],
       "destination_fields": ["email"],
+      "implicit_egress": [
+        {
+          "resource_path": "cloud_drive.files",
+          "id_parameter": "file_id",
+          "entity": "cloud_drive_file",
+          "recipient_field": "",
+          "recipient_parameters": ["email"],
+          "content_fields": [
+            "filename",
+            "content",
+            "size",
+            "owner",
+            "last_modified"
+          ]
+        }
+      ],
       "semantic_types": {"email": "email"}
     },
     "update_password": {
@@ -415,7 +571,24 @@
     "update_scheduled_transaction": {
       "profile": "egress_secret",
       "control_fields": ["recipient", "amount", "date", "recurring", "subject"],
+      "resource_fields": ["id"],
       "destination_fields": ["recipient"],
+      "implicit_egress": [
+        {
+          "resource_path": "bank_account.scheduled_transactions",
+          "id_parameter": "id",
+          "entity": "transaction",
+          "recipient_field": "recipient",
+          "recipient_parameters": ["recipient"],
+          "content_fields": [
+            "recipient",
+            "amount",
+            "subject",
+            "date",
+            "recurring"
+          ]
+        }
+      ],
       "semantic_types": {
         "amount": "number",
         "date": "date"

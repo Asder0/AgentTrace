@@ -147,17 +147,38 @@
         if (policyId === 'ring1.untrusted_control') {
             return 'Ring 1：不可信控制参数提醒';
         }
+        if (policyId === 'ring2.requirement_coverage') {
+            return 'Ring 2\uff1a\u4efb\u52a1\u8981\u6c42\u8986\u76d6\u68c0\u67e5';
+        }
         if (policyId === 'ring2.l2_chain_inconsistent') {
             return 'Ring 2：L2 调用链检查';
         }
         if (policyId === 'ring2.l2_confirmation') {
             return 'Ring 2：L2 人工确认';
         }
+        if (policyId === 'ring2.sensitive_data_exposure_confirmation') {
+            return 'Ring 2：敏感数据读取授权';
+        }
+        if (policyId === 'ring2.sensitive_data_exposure_rejected') {
+            return 'Ring 2：敏感数据读取拒绝';
+        }
+        if (policyId === 'ring2.sensitive_data_exposure_stale') {
+            return 'Ring 2：敏感数据授权失效';
+        }
         if (policyId === 'ring2.l2_confirmation_rejected') {
             return 'Ring 2：L2 人工授权结果';
         }
+        if (policyId === 'ring2.source_risk_confirmation') {
+            return 'Ring 2\uff1a\u53ef\u7591\u6765\u6e90\u5199\u64cd\u4f5c\u4eba\u5de5\u786e\u8ba4';
+        }
+        if (policyId === 'ring2.l2_confirmation_stale') {
+            return 'Ring 2\uff1a\u4eba\u5de5\u6388\u6743\u5df2\u5931\u6548';
+        }
         if (policyId === 'ring2.task_scope_unavailable') {
             return 'Ring 2：任务授权不可用';
+        }
+        if (policyId === 'ring2.sensitive_field_withheld') {
+            return 'Ring 2：敏感字段已隔离';
         }
         if (String(policyId).startsWith('ring2.task_scope')) {
             return 'Ring 2：任务范围策略';
@@ -226,14 +247,32 @@
         if (policyId === 'ring2.l2_confirmation') {
             return `“${action}”属于计划内 L2 操作，调用链检查通过，等待人工确认。`;
         }
+        if (policyId === 'ring2.sensitive_data_exposure_confirmation') {
+            return `“${action}”需要读取任务必需的敏感字段，等待用户授权。`;
+        }
+        if (policyId === 'ring2.sensitive_data_exposure_rejected') {
+            return `“${action}”的敏感字段读取未获授权，读取已阻断。`;
+        }
         if (policyId === 'ring2.l2_confirmation_rejected') {
             return `“${action}”未获得人工授权，操作已阻断。`;
+        }
+        if (policyId === 'ring2.source_risk_confirmation') {
+            return `\u201c${action}\u201d\u53d7\u53ef\u7591\u6765\u6e90\u5f71\u54cd\uff0c\u505c\u6b62\u6267\u884c\u5e76\u7b49\u5f85\u4eba\u5de5\u786e\u8ba4\u3002`;
+        }
+        if (policyId === 'ring2.l2_confirmation_stale') {
+            return `\u201c${action}\u201d\u7684\u8ba1\u5212\u6216\u53c2\u6570\u5df2\u53d1\u751f\u53d8\u5316\uff0c\u539f\u4eba\u5de5\u6388\u6743\u4e0d\u518d\u9002\u7528\u3002`;
+        }
+        if (policyId === 'ring2.requirement_coverage') {
+            return `\u201c${action}\u201d\u8fd8\u6709\u672a\u9a8c\u8bc1\u6216\u76f8\u4e92\u51b2\u7a81\u7684\u4efb\u52a1\u8981\u6c42\uff0c\u672c\u6b21 L2 \u64cd\u4f5c\u672a\u6267\u884c\u3002\u8bf7\u5148\u5b8c\u6210\u9700\u8981\u7684 L0/L1 \u53ea\u8bfb\u9a8c\u8bc1\uff0c\u6216\u5411\u7528\u6237\u8bf4\u660e\u65e0\u6cd5\u540c\u65f6\u6ee1\u8db3\u7684\u6761\u4ef6\u3002`;
         }
         if (policyId === 'ring2.l2_chain_inconsistent') {
             return `“${action}”与授权任务调用链不一致，操作已阻断。`;
         }
         if (policyId === 'ring2.task_scope_unavailable') {
             return '当前任务授权契约不可用，高风险操作已阻断。';
+        }
+        if (policyId === 'ring2.sensitive_field_withheld') {
+            return '字段内容触发敏感类别升级，超过本次读取允许范围，相关字段已在进入 Agent 前隔离。';
         }
         if (String(policyId).startsWith('ring2.task_scope')) {
             return decision === 'ADVISORY'
@@ -377,6 +416,9 @@
     function confirmationReason(request) {
         const chain = request?.chain_check || {};
         const flow = request?.flow_check || {};
+        if (request?.confirmation_kind === 'sensitive_data_exposure') {
+            return '该读取会把任务必需且需要比较分析的敏感字段交给 Agent。未列入待查看或搬运范围的字段已在进入 Agent 前隐藏；请结合左侧溯源图谱确认字段范围和任务必要性后决定是否授权。';
+        }
         if (chain.consistent === false) {
             return '调用链检查未通过。该操作与当前授权任务或计划步骤不一致，请拒绝执行并检查溯源证据。';
         }
@@ -392,6 +434,14 @@
     function confirmationSummary(request) {
         const chain = request?.chain_check || {};
         const flow = request?.flow_check || {};
+        if (request?.confirmation_kind === 'sensitive_data_exposure') {
+            const exposure = chain.exposure_check || {};
+            return [
+                `待查看字段：${(exposure.inspection_fields || []).join(', ') || '-'}`,
+                `占位符搬运字段：${(exposure.opaque_fields || []).join(', ') || '无'}`,
+                `暴露上限：${exposure.max_exposure_level || '-'}`,
+            ].join(' · ');
+        }
         const confidence = Number(chain.confidence);
         return [
             `调用链检查：${chain.consistent === false ? '未通过' : '通过'}`,

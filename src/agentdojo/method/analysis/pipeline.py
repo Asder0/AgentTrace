@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
+from ..modeling.data_sensitivity import tool_output_entity
+from .data_access import action_data_access
 from .defense_config import (
     direct_injection_mode,
     effective_method_enabled,
@@ -27,8 +29,7 @@ from .flow_policy import (
 )
 from .injection_scanner import (
     get_injection_scanner,
-    has_residual_instruction,
-    redact_injection_chunks,
+    redact_injection_chunks_with_metrics,
 )
 from .prompt_injection import check_prompt_for_injection_with_details
 from .risk_types import (
@@ -133,7 +134,11 @@ def process_before_execution(
             detected = (
                 not details.get("passed", True)
                 and details.get("detection_method")
-                in {"small_model_chunked", "main_llm_judge"}
+                in {
+                    "small_model_span",
+                    "small_model_chunked",
+                    "main_llm_judge",
+                }
             )
             details["mode"] = mode
             details["raw_prompt"] = prompt
@@ -144,20 +149,71 @@ def process_before_execution(
                 details["coverage_incomplete"] = True
             elif detected:
                 if mode == "quarantine":
-                    sanitized_prompt = redact_injection_chunks(
+                    sanitized_prompt, quarantine_metrics = (
+                        redact_injection_chunks_with_metrics(
                         prompt,
                         event.get("injection_scan") or {},
+                        )
                     )
+                    residual_scan = get_injection_scanner().scan(
+                        sanitized_prompt
+                    )
+                    quarantine_metrics.update(
+                        {
+                            "sanitized_rescan_available": (
+                                residual_scan.available
+                            ),
+                            "sanitized_rescan_score": residual_scan.score,
+                            "sanitized_residual_suspected": (
+                                residual_scan.suspected
+                            ),
+                            "sanitized_rescan_unavailable": (
+                                not residual_scan.available
+                            ),
+                        }
+                    )
+                    event.setdefault("injection_scan", {})[
+                        "quarantine_metrics"
+                    ] = quarantine_metrics
+                    details["quarantine_metrics"] = quarantine_metrics
+                    if residual_scan.suspected or not residual_scan.available:
+                        risk_decision = DECISION_BLOCK
+                        details["sanitized_residual_suspected"] = (
+                            residual_scan.suspected
+                        )
+                        details["sanitized_rescan_unavailable"] = (
+                            not residual_scan.available
+                        )
                     details["sanitized_prompt"] = sanitized_prompt
                     details["prompt_modified"] = sanitized_prompt != prompt
-                    if not has_residual_instruction(
-                        prompt,
-                        event.get("injection_scan") or {},
+                    if (
+                        int(
+                            quarantine_metrics.get(
+                                "invalid_spans_total",
+                                0,
+                            )
+                            or 0
+                        )
+                        > 0
+                        or not quarantine_metrics.get(
+                            "all_flagged_spans_replaced",
+                            False,
+                        )
                     ):
                         risk_decision = DECISION_BLOCK
-                        details["quarantine_empty"] = True
-                    else:
-                        risk_decision = DECISION_MITIGATE
+                        details["quarantine_incomplete"] = True
+                    if risk_decision is None:
+                        if int(
+                            quarantine_metrics.get(
+                                "uncovered_characters",
+                                1,
+                            )
+                            or 0
+                        ) == 0:
+                            risk_decision = DECISION_BLOCK
+                            details["quarantine_empty"] = True
+                        else:
+                            risk_decision = DECISION_MITIGATE
                 elif mode == "advisory":
                     risk_decision = DECISION_ADVISORY
                 else:
@@ -353,20 +409,43 @@ def process_after_execution_with_details(
         }
         return result, diagnostics
 
+    tool_name = str(event_complete.get("tool_intent", ""))
+    access_contract = action_data_access(
+        event_complete.get("task_data_plan"),
+        tool_name,
+        str(event_complete.get("plan_step_id", "")),
+    )
+    output_app = (
+        str(access_contract.get("app", ""))
+        if isinstance(access_contract, dict)
+        else ""
+    ) or str(
+        event_complete.get("target_app")
+        or event_complete.get("app_domain")
+        or ""
+    )
+    output_entity = (
+        str(access_contract.get("entity", ""))
+        if isinstance(access_contract, dict)
+        else ""
+    ) or tool_output_entity(tool_name)
     scan = scan_tool_output(
         result,
         scanner=get_injection_scanner(),
-        tool_name=str(event_complete.get("tool_intent", "")),
+        tool_name=tool_name,
         schema=(
             event_complete.get("output_schema")
             if isinstance(event_complete.get("output_schema"), dict)
             else None
         ),
+        app=output_app,
+        entity=output_entity,
     )
     diagnostics["ring_1"] = {
         "passed": scan.available,
         "executed": True,
         "mode": "chunk_scanner_quarantine",
+        "scan_scope": "natural_language_only",
         **scan.to_dict(),
     }
     event_complete["injection_scan"] = scan.to_dict()

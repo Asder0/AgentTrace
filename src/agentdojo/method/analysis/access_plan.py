@@ -269,7 +269,17 @@ def _actual_to_plan_path(path: str) -> str:
     value = str(path or "$")
     if not value.startswith("$"):
         value = f"${value}"
-    return re.sub(r"\[[0-9]+\]", "[*]", value)
+    value = re.sub(r"\[[0-9]+\]", "[*]", value)
+    return re.sub(
+        r"\.([^.\[]+)",
+        lambda match: "."
+        + re.sub(
+            r"[^a-zA-Z0-9_*]+",
+            "_",
+            match.group(1).strip(),
+        ).lower(),
+        value,
+    )
 
 
 def _is_descendant(path: str, parent: str) -> bool:
@@ -372,11 +382,17 @@ def project_with_plan(
     hidden_paths: list[str] = []
     opaque_paths: list[str] = []
 
+    def matches_hidden(actual_path: str, plan_path: str) -> bool:
+        return any(
+            actual_path == ref
+            or _is_descendant(actual_path, ref)
+            or _is_descendant(plan_path, ref)
+            for ref in hidden
+        )
+
     def walk(item: Any, path: str, *, in_object: bool = False) -> Any:
         plan_path = _actual_to_plan_path(path)
-        if plan_path != "$" and any(
-            _is_descendant(plan_path, ref) for ref in hidden
-        ):
+        if plan_path != "$" and matches_hidden(path, plan_path):
             hidden_paths.append(path)
             return "[HIDDEN]"
         if any(_is_descendant(plan_path, ref) for ref in opaque):
@@ -388,9 +404,9 @@ def project_with_plan(
             for key, child in item.items():
                 child_path = f"{path}.{key}"
                 child_plan_path = _actual_to_plan_path(child_path)
-                explicitly_hidden = any(
-                    _is_descendant(child_plan_path, ref)
-                    for ref in hidden
+                explicitly_hidden = matches_hidden(
+                    child_path,
+                    child_plan_path,
                 )
                 explicitly_visible = any(
                     _is_descendant(child_plan_path, ref)
@@ -438,6 +454,17 @@ def project_with_plan(
                 walk(child, f"{path}[{index}]")
                 for index, child in enumerate(item)
             ]
+        scalar_visible = (
+            "$" in visible
+            or any(
+                _is_descendant(plan_path, ref)
+                or _is_descendant(ref, plan_path)
+                for ref in visible
+            )
+        )
+        if not scalar_visible:
+            hidden_paths.append(path)
+            return "[HIDDEN]"
         return item
 
     return walk(value, "$"), hidden_paths, opaque_paths

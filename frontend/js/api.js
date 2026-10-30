@@ -322,6 +322,19 @@ const API = {
         return await response.json();
     },
 
+    async resolveRequirementDecision(requestId, decision) {
+        const response = await fetch(
+            `${this.BASE_URL}/confirmations/${encodeURIComponent(requestId)}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ decision }),
+            }
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json();
+    },
+
     // ============================================================
     // 攻击场景 API
     // ============================================================

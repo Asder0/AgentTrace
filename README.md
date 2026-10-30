@@ -9,10 +9,10 @@ AgentTrace 在 AgentDojo 基准测试框架之上，通过 AOP 拦截器（Monke
 ## 功能特性
 
 - **可审计运行时策略（4-Ring，轻量实现）**
-  - Ring 0：本地 `Horizon-Labs/prompt-injection-guard-small` 分块检测直接注入；支持 ADVISORY、QUARANTINE 和 STRICT
-  - Ring 1：使用同一模型分块检测工具输出；高风险块在进入 Agent 前隔离，完整原文保留在审计视图
-  - Ring 2：使用人工定义的 L0/L1/L2 工具等级；模型生成调用链，运行时可更新 L0/L1，L2 必须来自初始授权链、通过链路一致性检查并由用户确认
-  - Ring 3：在 egress 执行前只检查最终工具参数；按 APP 原生实体的手工敏感等级、多来源最高等级继承、来源风险和接收方授权状态进行判定
+  - Ring 0：本地 `Unplug-AI/unplug-tiny-v1` 双头模型检测直接注入并返回精确攻击 span；主模型未命中时使用语义句级后备检测，支持 ADVISORY、QUARANTINE 和 STRICT
+  - Ring 1：按 schema 字段类型扫描工具输出；普通字符串一律检测，Unplug 命中时隔离精确 span，后备检测命中时隔离语义块，并将来源实体标记为可疑
+  - Ring 2：使用人工定义的 L0/L1/L2 工具等级，对所有工具返回字段和非只读动作的具体资源选择器执行访问授权；L2 及可疑来源影响的 L1 写操作必须通过链路检查并由用户确认
+  - Ring 3：在 egress 执行前检查最终参数及被引用资源内容；按 APP 实体字段的敏感等级、多来源最高等级继承、完整来源元组、来源风险和接收方授权状态进行判定
 - **信息流标签与风险状态**
   - 每条数据记录 `confidentiality`（public/internal/confidential/secret）和 `integrity`（trusted/untrusted/tainted）
   - 机密性按最高级别传播；注入来源风险只标记被命中的直接实体及其来源，不扩散为整批工具结果或整个上下文
@@ -23,8 +23,8 @@ AgentTrace 在 AgentDojo 基准测试框架之上，通过 AOP 拦截器（Monke
 - **全机制开关**
   - Ring 0：小模型分块检测
   - Ring 1：小模型分块扫描 + 不可信控制流提醒
-  - Ring 2：任务范围授权
-  - Ring 3：APP 原生实体敏感等级、接收方三态授权与控制器占位符解析
+  - Ring 2：任务范围、资源选择器和 Agent 字段暴露授权
+  - Ring 3：APP 字段级敏感等级、接收方三态授权与控制器占位符解析
 - **四 APP 复合任务**
   - 四个 suite 分别作为 `workspace / banking / slack / travel` 独立 APP 域
   - `unified` 模式持有四个独立环境，并由 `RouterRuntime` 按工具路由到对应域
@@ -54,7 +54,7 @@ AgentTrace 在 AgentDojo 基准测试框架之上，通过 AOP 拦截器（Monke
 # 1. 创建环境并安装项目基础依赖（Python 3.10+，推荐 3.12）
 conda create -n agent python=3.12 -y
 conda activate agent
-pip install -e ".[transformers]"
+pip install -e ".[transformers,privacy]"
 
 # 2. 安装可视化平台依赖
 pip install flask flask-cors networkx
@@ -73,7 +73,7 @@ xdg-open frontend/index.html
 
 > 首次使用时，需在页面右上角“操作控制台”中配置 LLM（选择模型并填写 API Key，支持 OpenAI / Anthropic / DeepSeek / Gemini 等，详见 `src/agentdojo/agent_pipeline/llms/`），之后即可执行指令或攻击场景测试。
 
-> Ring 0/Ring 1 使用项目内 `models/prompt-injection-guard-small` 的多语言小模型；
+> Ring 0/Ring 1 使用项目内 `models/unplug-tiny-v1` 的双头小模型；
 > Ring 2/Ring 3 使用任务授权、声明式工具元数据、信息流标签和确定性路径检查。
 
 > 前端通过 `https://d3js.org` 加载 D3 v7。完全离线运行时需要把 D3 资源下载到 `frontend/` 并修改 `frontend/index.html` 的脚本地址。
@@ -82,21 +82,35 @@ xdg-open frontend/index.html
 
 | 变量 | 说明 |
 | :--- | :--- |
-| `AGENTDOJO_PI_MODEL_PATH=<dir>` | 覆盖本地提示注入检测模型目录；未设置时使用项目内 `models/prompt-injection-guard-small` |
+| `AGENTDOJO_PI_MODEL_PATH=<dir>` | 覆盖本地提示注入检测模型目录；未设置时使用项目内 `models/unplug-tiny-v1` |
+| `AGENTDOJO_GLINER_MODEL_PATH=<dir>` | 覆盖本地 GLiNER 目录；未设置时使用 `models/gliner_multi-v2.1`，模型不可用时读取 fail-closed |
 | `AGENTDOJO_USE_RELOADER=true` | 开启 Flask debug 自动重载（默认关闭，避免重复加载模型） |
 | `AGENTDOJO_ATTACK_SCENARIOS_PER_SUITE=<n>` | 每个攻击类型在每个 suite 中生成的预设场景数，默认 3 |
 | `LOCAL_LLM_PORT=<port>` | 本地 OpenAI 兼容模型服务端口，默认 `8000` |
 
 提示注入检测模型始终从本地目录加载，并显式启用 `local_files_only=True`；
 运行时不访问 Hugging Face，也不会在模型缺失时静默退回在线下载。
-分块分类阈值默认设为 `0.95`，用于降低普通业务指令的过度防御；最终写操作和外发仍由 Ring 2/3 决定。
-未登记的敏感类别按 `secret` 处理，未知来源按 `untrusted` 处理；任务计划不可用时，
-`read` 只产生提醒，`write/privilege/egress` 会直接阻断。
+GLiNER 使用相同的离线约束，并且是 Ring 2 的强制组件。默认使用
+`urchade/gliner_multi-v2.1`；项目不会在运行时自动联网下载，模型不可用时读取结果不会进入 Agent。
+首次部署时，可先下载主检测模型：
+
+```bash
+hf download Unplug-AI/unplug-tiny-v1 --local-dir models/unplug-tiny-v1
+hf download urchade/gliner_multi-v2.1 --local-dir models/gliner_multi-v2.1
+```
+
+Unplug 文档头阈值默认设为 `0.9`，BIOES span 阈值默认设为 `0.45`；最终写操作和外发仍由 Ring 2/3 决定。
+若项目内仍存在 `models/prompt-injection-guard-small`，它只作为 Unplug 无命中时的
+语义句级后备检测器，用于覆盖 Unplug 英文训练分布之外的中文等文本：按段落和句子分块，
+超长句才使用带重叠的窗口，命中时隔离整个语义块而不是声称获得精确 span。
+Unplug 的训练分布偏英文，中文和混合语言效果应纳入项目自己的攻击集持续评估。
+隔离后的可见文本会复扫一次；复扫仍有风险或检测器不可用时阻断，不会进行基于关键词的循环清洗。
+未登记的敏感类别按 `secret` 处理，未知来源按 `untrusted` 处理；任务计划或数据访问契约不可用时，所有工具动作均 fail-closed。
 
 策略配置文件：
 
 - `src/agentdojo/method/modeling/tool_security.json`：工具 profile、L0/L1/L2、effect、字段角色和风险阈值
-- `src/agentdojo/method/modeling/data_sensitivity.json`：四个 APP 的人工实体敏感等级和工具输出实体映射
+- `src/agentdojo/method/modeling/data_sensitivity.json`：四个 APP 的人工实体/字段敏感等级、类别和工具输出实体映射
 
 ## 项目结构
 

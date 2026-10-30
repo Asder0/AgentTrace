@@ -1,6 +1,6 @@
-"""Ring 0: chunked small-model direct-prompt injection detection.
+"""Ring 0: local small-model direct-prompt injection and span detection.
 
-The same lightweight classifier used for Ring 1 scans sentence-aware chunks.
+Unplug returns document risk and BIOES attack spans for precise redaction.
 No keyword or synonym security rule participates in the decision.
 """
 
@@ -72,17 +72,20 @@ def check_prompt_for_injection_with_details(
                 "passed": available and not suspected,
                 "safety_score": score if suspected else (1.0 - score if available else 0.0),
                 "detection_method": (
-                    "small_model_chunked" if available else "small_model_unavailable"
+                    "small_model_chunked"
+                    if available
+                    else "small_model_unavailable"
                 ),
+                "detection_granularity": "attack_span",
                 "evidence_spans": list(scan_result.get("evidence_spans", [])),
                 "injection_target": "instruction_hierarchy",
                 "reason": (
                     str(scan_result.get("error", ""))
                     if not available
                     else (
-                        "A prompt-injection classifier flagged one or more text chunks."
+                        "The injection detector flagged one or more text spans."
                         if suspected
-                        else "No prompt-injection chunk exceeded the configured threshold."
+                        else "No injection span exceeded the configured threshold."
                     )
                 ),
                 "judge_confidence": score if available else None,

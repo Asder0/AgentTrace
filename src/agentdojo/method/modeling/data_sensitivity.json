@@ -50,6 +50,194 @@
       "inbox": "confidential"
     }
   },
+  "fields": {
+    "workspace": {
+      "email": {
+        "$.id_": {"level": "internal"},
+        "$.sender": {"level": "internal", "categories": ["email"]},
+        "$.recipients[*]": {"level": "internal", "categories": ["email"]},
+        "$.cc[*]": {"level": "internal", "categories": ["email"]},
+        "$.bcc[*]": {"level": "internal", "categories": ["email"]},
+        "$.subject": {"level": "internal"},
+        "$.body": {"level": "confidential"},
+        "$.status": {"level": "internal"},
+        "$.read": {"level": "internal"},
+        "$.timestamp": {"level": "internal"},
+        "$.attachments[*]": {"level": "confidential"}
+      },
+      "email_contact": {
+        "$.email": {"level": "internal", "categories": ["email"]},
+        "$.name": {"level": "confidential", "categories": ["personal_name"]}
+      },
+      "cloud_drive_file": {
+        "$.id_": {"level": "internal"},
+        "$.filename": {"level": "internal"},
+        "$.content": {"level": "confidential"},
+        "$.owner": {"level": "internal", "categories": ["email"]},
+        "$.last_modified": {"level": "internal"},
+        "$.shared_with": {"level": "internal"},
+        "$.size": {"level": "internal"}
+      },
+      "calendar_event": {
+        "$.id_": {"level": "internal"},
+        "$.title": {"level": "internal"},
+        "$.description": {"level": "confidential"},
+        "$.start_time": {"level": "internal", "categories": ["calendar"]},
+        "$.end_time": {"level": "internal", "categories": ["calendar"]},
+        "$.location": {"level": "confidential", "categories": ["location"]},
+        "$.participants[*]": {"level": "internal", "categories": ["email"]},
+        "$.all_day": {"level": "internal"},
+        "$.status": {"level": "internal"}
+      },
+      "current_date": {
+        "$": {"level": "public"}
+      },
+      "user_account": {
+        "$.first_name": {"level": "confidential", "categories": ["personal_name"]},
+        "$.last_name": {"level": "confidential", "categories": ["personal_name"]},
+        "$.street": {"level": "confidential", "categories": ["address"]},
+        "$.city": {"level": "confidential", "categories": ["location"]},
+        "$.password": {"level": "secret", "categories": ["credential"]}
+      }
+    },
+    "banking": {
+      "account": {
+        "$.balance": {"level": "secret", "categories": ["financial_data"]},
+        "$.iban": {"level": "secret", "categories": ["iban", "financial_data"]},
+        "$.transactions[*]": {"level": "secret", "categories": ["financial_data"]},
+        "$.scheduled_transactions[*]": {"level": "secret", "categories": ["financial_data"]}
+      },
+      "transaction": {
+        "$.id": {"level": "secret", "categories": ["financial_data"]},
+        "$.sender": {"level": "secret", "categories": ["iban", "financial_data"]},
+        "$.recipient": {"level": "secret", "categories": ["iban", "financial_data"]},
+        "$.amount": {"level": "secret", "categories": ["financial_amount"]},
+        "$.subject": {"level": "confidential", "categories": ["financial_data"]},
+        "$.date": {"level": "confidential", "categories": ["financial_data"]},
+        "$.recurring": {"level": "confidential", "categories": ["financial_data"]}
+      },
+      "file": {
+        "$": {"level": "confidential"}
+      },
+      "user_account": {
+        "$.first_name": {"level": "confidential", "categories": ["personal_name"]},
+        "$.last_name": {"level": "confidential", "categories": ["personal_name"]},
+        "$.street": {"level": "confidential", "categories": ["address"]},
+        "$.city": {"level": "confidential", "categories": ["location"]},
+        "$.password": {"level": "secret", "categories": ["credential"]}
+      }
+    },
+    "slack": {
+      "message": {
+        "$.sender": {"level": "internal"},
+        "$.recipient": {"level": "internal"},
+        "$.body": {"level": "confidential"}
+      },
+      "channel": {
+        "$": {"level": "internal"}
+      },
+      "channel_member": {
+        "$": {"level": "internal"}
+      },
+      "slack_user": {
+        "$": {"level": "internal"}
+      },
+      "webpage": {
+        "$": {"level": "internal"}
+      }
+    },
+    "travel": {
+      "user": {
+        "$.first_name": {"level": "confidential", "categories": ["personal_name"]},
+        "$.last_name": {"level": "confidential", "categories": ["personal_name"]},
+        "$.ID_number": {"level": "secret", "categories": ["government_identifier"]},
+        "$.email": {"level": "confidential", "categories": ["email"]},
+        "$.phone_number": {"level": "confidential", "categories": ["phone"]},
+        "$.address": {"level": "confidential", "categories": ["address"]},
+        "$.passport_number": {"level": "secret", "categories": ["passport_number"]},
+        "$.bank_account_number": {"level": "secret", "categories": ["financial_data"]},
+        "$.credit_card_number": {"level": "secret", "categories": ["credit_card"]}
+      },
+      "reservation": {
+        "$": {"level": "confidential"},
+        "$.reservation_type": {"level": "confidential"},
+        "$.title": {"level": "confidential"},
+        "$.start_time": {"level": "confidential", "categories": ["calendar"]},
+        "$.end_time": {"level": "confidential", "categories": ["calendar"]},
+        "$.contact_information": {"level": "confidential", "categories": ["phone"]}
+      },
+      "email": {
+        "$.id_": {"level": "internal"},
+        "$.sender": {"level": "internal", "categories": ["email"]},
+        "$.recipients[*]": {"level": "internal", "categories": ["email"]},
+        "$.cc[*]": {"level": "internal", "categories": ["email"]},
+        "$.bcc[*]": {"level": "internal", "categories": ["email"]},
+        "$.subject": {"level": "internal"},
+        "$.body": {"level": "confidential"},
+        "$.status": {"level": "internal"},
+        "$.read": {"level": "internal"},
+        "$.timestamp": {"level": "internal"},
+        "$.attachments[*]": {"level": "confidential"}
+      },
+      "calendar_event": {
+        "$.id_": {"level": "internal"},
+        "$.title": {"level": "internal"},
+        "$.description": {"level": "confidential"},
+        "$.start_time": {"level": "internal", "categories": ["calendar"]},
+        "$.end_time": {"level": "internal", "categories": ["calendar"]},
+        "$.location": {"level": "confidential", "categories": ["location"]},
+        "$.participants[*]": {"level": "internal", "categories": ["email"]},
+        "$.all_day": {"level": "internal"},
+        "$.status": {"level": "internal"}
+      },
+      "hotel": {
+        "$": {"level": "internal"},
+        "$.name": {"level": "public"},
+        "$.city": {"level": "public"},
+        "$.rating": {"level": "public"},
+        "$.price_min": {"level": "public"},
+        "$.price_max": {"level": "public"},
+        "$.address": {"level": "internal", "content_detection": false},
+        "$.reviews[*]": {"level": "public"}
+      },
+      "restaurant": {
+        "$": {"level": "internal"},
+        "$.name": {"level": "public"},
+        "$.city": {"level": "public"},
+        "$.address": {"level": "internal", "content_detection": false},
+        "$.rating": {"level": "public"},
+        "$.price_per_person": {"level": "public"},
+        "$.operating_hours": {"level": "public"},
+        "$.reviews[*]": {"level": "public"},
+        "$.contact_information": {"level": "internal"},
+        "$.cuisine_type": {"level": "public"},
+        "$.dietary_restrictions": {"level": "internal"}
+      },
+      "car_rental_company": {
+        "$": {"level": "internal"},
+        "$.name": {"level": "public"},
+        "$.city": {"level": "public"},
+        "$.address": {"level": "internal", "content_detection": false},
+        "$.rating": {"level": "public"},
+        "$.price_per_day": {"level": "public"},
+        "$.reviews[*]": {"level": "public"},
+        "$.contact_information": {"level": "internal"},
+        "$.car_types_available[*]": {"level": "public"},
+        "$.fuel_options[*]": {"level": "public"}
+      },
+      "flight": {
+        "$": {"level": "internal"},
+        "$.airline": {"level": "public"},
+        "$.flight_number": {"level": "public"},
+        "$.departure_city": {"level": "public"},
+        "$.arrival_city": {"level": "public"},
+        "$.departure_time": {"level": "public"},
+        "$.arrival_time": {"level": "public"},
+        "$.price": {"level": "public"},
+        "$.contact_information": {"level": "internal"}
+      }
+    }
+  },
   "environment_only_entities": {
     "workspace": [
       "inbox",

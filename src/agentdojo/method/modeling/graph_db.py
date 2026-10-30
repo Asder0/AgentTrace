@@ -696,6 +696,11 @@ def update_activity_outcome(event: Dict[str, Any]) -> None:
         "inputs",
         "original_inputs",
         "ring3_check",
+        "ring2_check",
+        "requirement_audit",
+        "requirement_decision",
+        "data_access_check",
+        "injection_scan",
         "flow_contract",
         "argument_flow_labels",
         "argument_sources",
@@ -1013,6 +1018,11 @@ def mark_activity_blocked(event: Dict[str, Any]) -> None:
         "inputs",
         "original_inputs",
         "ring3_check",
+        "ring2_check",
+        "requirement_audit",
+        "requirement_decision",
+        "data_access_check",
+        "injection_scan",
         "flow_contract",
         "argument_flow_labels",
         "argument_sources",
@@ -1034,6 +1044,51 @@ def mark_activity_blocked(event: Dict[str, Any]) -> None:
     )
 
 
+def mark_activity_denied(event: Dict[str, Any]) -> None:
+    """Record a denied tool call without terminating the overall task."""
+    kg = KnowledgeGraph()
+    activity_id = _find_activity(kg, event)
+    if not activity_id:
+        return
+    activity = kg.G.nodes[activity_id]
+    activity["blocked"] = True
+    activity["denied"] = True
+    activity["status"] = "blocked"
+    activity["executed"] = False
+    activity["block_reason"] = event.get("block_reason", "")
+    for key in (
+        "l2_chain_check",
+        "l2_confirmation",
+        "tool_risk_level",
+        "inputs",
+        "original_inputs",
+        "ring3_check",
+        "ring2_check",
+        "data_access_check",
+        "injection_scan",
+        "flow_contract",
+        "argument_flow_labels",
+        "argument_sources",
+        "parameter_resolutions",
+        "parameter_resolution_errors",
+        "parameter_resolution_warnings",
+    ):
+        if key in event:
+            activity[key] = copy.deepcopy(event.get(key))
+    record_risk_assessments(event)
+    transition_state(
+        activity_id=activity_id,
+        state_name="ADVISED",
+        reason=activity["block_reason"],
+        risk_ids=[
+            risk.get("risk_id", "")
+            for risk in event.get("risk_assessments", [])
+        ],
+        suffix=f"denied_{activity_id.rsplit('_', 1)[-1]}",
+        scope="activity",
+    )
+
+
 def record_human_authorization(
     activity_id: str,
     confirmation: Dict[str, Any],
@@ -1048,12 +1103,34 @@ def record_human_authorization(
         return None
     node_id = f"HumanAuthorization_{request_id}"
     status = str(confirmation.get("status", "pending"))
+    confirmation_kind = str(
+        confirmation.get("confirmation_kind", "l2_action")
+        or "l2_action"
+    )
     G.add_node(
         node_id,
         type="HumanAuthorization",
-        label=f"Human authorization: {status}",
+        label=(
+            "Sensitive-data exposure authorization: "
+            if confirmation_kind == "sensitive_data_exposure"
+            else (
+                "任务要求决策："
+                if confirmation_kind == "requirement_resolution"
+                else "Human authorization: "
+            )
+        )
+        + (
+            {
+                "pending": "待处理",
+                "resolved": "已处理",
+                "cancelled": "已取消",
+            }.get(status, status)
+            if confirmation_kind == "requirement_resolution"
+            else status
+        ),
         request_id=request_id,
         status=status,
+        confirmation_kind=confirmation_kind,
         approved=confirmation.get("approved"),
         tool_name=str(confirmation.get("tool_name", "")),
         risk_level=str(confirmation.get("risk_level", "L2")),
@@ -1063,6 +1140,13 @@ def record_human_authorization(
         plan_hash=str(confirmation.get("plan_hash", "")),
         chain_check=copy.deepcopy(confirmation.get("chain_check", {})),
         flow_check=copy.deepcopy(confirmation.get("flow_check", {})),
+        decision_kind=str(
+            confirmation.get("decision_kind", "approve_reject")
+        ),
+        options=copy.deepcopy(confirmation.get("options", [])),
+        payload=copy.deepcopy(confirmation.get("payload", {})),
+        decision=copy.deepcopy(confirmation.get("decision")),
+        decision_hash=str(confirmation.get("decision_hash", "")),
         created_at=confirmation.get("created_at"),
         expires_at=confirmation.get("expires_at"),
         app=str(confirmation.get("app", "system") or "system"),
@@ -1084,7 +1168,17 @@ def record_human_authorization(
         transition_state(
             activity_id=activity_id,
             state_name="HELD",
-            reason="L2 action is awaiting explicit human authorization.",
+            reason=(
+                "Sensitive APP data is awaiting explicit exposure "
+                "authorization."
+                if confirmation_kind == "sensitive_data_exposure"
+                else (
+                    "The task has an unresolved business requirement "
+                    "that requires an explicit user decision."
+                    if confirmation_kind == "requirement_resolution"
+                    else "L2 action is awaiting explicit human authorization."
+                )
+            ),
             suffix=f"auth_{request_id}",
         )
     return node_id
@@ -1184,6 +1278,7 @@ __all__ = [
     "ensure_task_state",
     "finalize_task_outcome",
     "mark_activity_blocked",
+    "mark_activity_denied",
     "record_human_authorization",
     "record_activity",
     "record_llm_interaction",

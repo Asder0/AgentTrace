@@ -5,7 +5,12 @@ from typing import Literal
 from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
 from agentdojo.agent_pipeline.errors import AbortAgentError
 from agentdojo.functions_runtime import EmptyEnv, Env, FunctionsRuntime
-from agentdojo.method.analysis.injection_scanner import DEFAULT_THRESHOLD
+from agentdojo.method.analysis.injection_scanner import (
+    DEFAULT_THRESHOLD,
+    INDIRECT_INJECTION_PLACEHOLDER,
+    InjectionScanner,
+    redact_injection_chunks_with_metrics,
+)
 from agentdojo.model_assets import (
     DEFAULT_INJECTION_MODEL_ID,
     resolve_injection_model_path,
@@ -57,6 +62,9 @@ class PromptInjectionDetector(BasePipelineElement):
             else block
             for block in tool_output
         ]
+
+    def sanitize_text(self, text: str) -> str:
+        return INDIRECT_INJECTION_PLACEHOLDER
 
     def query(
         self,
@@ -114,14 +122,23 @@ class PromptInjectionDetector(BasePipelineElement):
                 )
 
             if is_injection:
-                message["content"] = self.transform(message["content"] or [])
+                message["content"] = [
+                    text_content_block_from_string(
+                        self.sanitize_text(
+                            get_text_content_as_str([block])
+                        )
+                    )
+                    if block["type"] == "text"
+                    else block
+                    for block in (message["content"] or [])
+                ]
             processed_messages.append(message)
 
         return query, runtime, env, messages, extra_args
 
 
 class TransformersBasedPIDetector(PromptInjectionDetector):
-    """Uses the local multilingual prompt-injection guard model.
+    """Uses the local Unplug span detector with semantic fallback.
 
     Args:
         model_name: The name of the model to use for prompt injection detection.
@@ -142,30 +159,29 @@ class TransformersBasedPIDetector(PromptInjectionDetector):
     ) -> None:
         super().__init__(mode=mode, raise_on_injection=raise_on_injection)
 
-        try:
-            import torch  # type: ignore
-            from transformers import pipeline  # type: ignore
-        except ImportError:
-            raise ImportError(
-                "TransformersBasedPIDetector requires the 'transformers' and 'torch' libraries to be installed. "
-                "Please install them using 'pip install agentdojo[transformers]'."
-            )
-
         self.model_name = model_name
         self.safe_label = safe_label
         self.threshold = threshold
-        self.model_path = resolve_injection_model_path(model_name)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.pipeline = pipeline(
-            "text-classification",
-            model=self.model_path,
-            device=device,
-            local_files_only=True,
-        )
+        self.model_path = str(resolve_injection_model_path(model_name))
+        self.scanner = InjectionScanner(threshold=threshold)
+        self._last_scan = None
 
     def detect(self, tool_output: str) -> tuple[bool, float]:
-        result: dict = self.pipeline(tool_output)[0]  # type: ignore
-        safety_score: float = result["score"] if result["label"] == self.safe_label else 1 - result["score"]
-        is_injection: bool = safety_score < self.threshold
+        result = self.scanner.scan(tool_output)
+        self._last_scan = result
+        is_injection = not result.available or result.suspected
+        score = result.score if is_injection else max(0.0, 1.0 - result.score)
+        return is_injection, score
 
-        return is_injection, safety_score
+    def sanitize_text(self, text: str) -> str:
+        scan = self._last_scan
+        if scan is None or not scan.available:
+            return INDIRECT_INJECTION_PLACEHOLDER
+        sanitized, self.last_quarantine_metrics = (
+            redact_injection_chunks_with_metrics(
+                text,
+                scan,
+                placeholder=INDIRECT_INJECTION_PLACEHOLDER,
+            )
+        )
+        return sanitized

@@ -318,8 +318,14 @@ const APP = {
             overlay.hidden = true;
             overlay.classList.remove('reviewing-graph');
             document.body.classList.remove('l2-review-active');
+            const decisionPanel = document.getElementById(
+                'l2RequirementDecision'
+            );
+            if (decisionPanel) decisionPanel.hidden = true;
             this._activeConfirmationId = null;
             this._activeConfirmationRequest = null;
+            this._requirementDecisionRendered = false;
+            this._requirementDecisionSelection = [];
             return;
         }
         const isNewRequest = this._activeConfirmationId !== request.request_id;
@@ -329,12 +335,54 @@ const APP = {
         overlay.classList.add('reviewing-graph');
         document.body.classList.add('l2-review-active');
         const chain = request.chain_check || {};
+        const sensitiveExposure = request.confirmation_kind === 'sensitive_data_exposure';
+        const exposure = chain.exposure_check || {};
         const riskLabels = window.AgentTraceRiskLabels || {};
         const setText = (id, value) => {
             const element = document.getElementById(id);
             if (element) element.textContent = value == null ? '-' : String(value);
         };
-        setText('l2ConfirmationTitle', `${request.tool_name} 需要确认`);
+        const requirementDecision = (
+            request.confirmation_kind === 'requirement_resolution'
+        );
+        const decisionPanel = document.getElementById(
+            'l2RequirementDecision'
+        );
+        if (decisionPanel) {
+            decisionPanel.hidden = !requirementDecision;
+        }
+        if (requirementDecision) {
+            if (isNewRequest || !this._requirementDecisionRendered) {
+                if (isNewRequest) {
+                    this._requirementDecisionSelection = [];
+                }
+                this._renderRequirementDecision(request, setText);
+                this._requirementDecisionRendered = true;
+            }
+            if (isNewRequest && typeof GRAPH !== 'undefined') {
+                GRAPH.loadData()
+                    .then(() => GRAPH.focusConfirmationEvidence(request))
+                    .catch(() => {});
+            }
+            return;
+        }
+        this._requirementDecisionRendered = false;
+        setText(
+            'l2ConfirmationKicker',
+            sensitiveExposure
+                ? (
+                    exposure.phase === 'post_execution_runtime_detection'
+                        ? '动态敏感内容展示授权'
+                        : '敏感数据读取授权'
+                )
+                : 'L2 高风险操作确认'
+        );
+        setText(
+            'l2ConfirmationTitle',
+            sensitiveExposure
+                ? `${request.tool_name} 将向 Agent 暴露任务必需数据`
+                : `${request.tool_name} 需要确认`
+        );
         setText('l2ConfirmationReason', chain.reason || '调用链检查通过，等待用户确认。');
         setText(
             'l2ConfirmationChain',
@@ -376,36 +424,53 @@ const APP = {
         };
         setText(
             'l2ConfirmationFlow',
-            [
-                `接收方：${(flow.destinations || []).join(', ') || '-'}`,
-                `接收方状态：${
-                    localizedDestinationLabels[flow.destination_state]
-                    || '未检查'
-                }`,
-                `敏感等级：${
-                    riskLabels.confidentialityLabel
-                        ? riskLabels.confidentialityLabel(flow.confidentiality)
-                        : flow.confidentiality || '-'
-                } / 上限 ${
-                    riskLabels.confidentialityLabel
-                        ? riskLabels.confidentialityLabel(flow.max_confidentiality)
-                        : flow.max_confidentiality || '-'
-                }`,
-                `来源完整性：${
-                    riskLabels.provenanceStateLabel
-                        ? riskLabels.provenanceStateLabel(flow.provenance_state)
-                        : flow.provenance_state || '未知'
-                }`,
-                `数据来源：${(flow.data_sources || []).join(', ') || '用户输入'}`,
-                `来源祖先：${(flow.provenance_ancestors || []).join(', ') || '-'}`,
-                `来源提醒：${
-                    (flow.provenance_warnings || [])
-                        .map(item => riskLabels.warningLabel
-                            ? riskLabels.warningLabel(item)
-                            : '来源校验存在提醒')
-                        .join('；') || '无'
-                }`,
-            ].join(' · ')
+            sensitiveExposure
+                ? [
+                    `待查看字段：${
+                        (exposure.inspection_fields || []).join(', ') || '-'
+                    }`,
+                    `占位符搬运字段：${
+                        (exposure.opaque_fields || []).join(', ') || '无'
+                    }`,
+                    `允许暴露上限：${
+                        riskLabels.confidentialityLabel
+                            ? riskLabels.confidentialityLabel(
+                                exposure.max_exposure_level
+                            )
+                            : exposure.max_exposure_level || '-'
+                    }`,
+                    '未列入待查看或搬运范围的字段会在进入 Agent 前隐藏',
+                ].join(' · ')
+                : [
+                    `接收方：${(flow.destinations || []).join(', ') || '-'}`,
+                    `接收方状态：${
+                        localizedDestinationLabels[flow.destination_state]
+                        || '未检查'
+                    }`,
+                    `敏感等级：${
+                        riskLabels.confidentialityLabel
+                            ? riskLabels.confidentialityLabel(flow.confidentiality)
+                            : flow.confidentiality || '-'
+                    } / 上限 ${
+                        riskLabels.confidentialityLabel
+                            ? riskLabels.confidentialityLabel(flow.max_confidentiality)
+                            : flow.max_confidentiality || '-'
+                    }`,
+                    `来源完整性：${
+                        riskLabels.provenanceStateLabel
+                            ? riskLabels.provenanceStateLabel(flow.provenance_state)
+                            : flow.provenance_state || '未知'
+                    }`,
+                    `数据来源：${(flow.data_sources || []).join(', ') || '用户输入'}`,
+                    `来源祖先：${(flow.provenance_ancestors || []).join(', ') || '-'}`,
+                    `来源提醒：${
+                        (flow.provenance_warnings || [])
+                            .map(item => riskLabels.warningLabel
+                                ? riskLabels.warningLabel(item)
+                                : '来源校验存在提醒')
+                            .join('；') || '无'
+                    }`,
+                ].join(' · ')
         );
         setText('l2ConfirmationTool', request.tool_name);
         setText(
@@ -425,6 +490,12 @@ const APP = {
             'l2ConfirmationArgs',
             JSON.stringify(request.args || {}, null, 2)
         );
+        const approveButton = document.getElementById('btnApproveL2');
+        if (approveButton) {
+            approveButton.textContent = sensitiveExposure
+                ? '授权读取'
+                : '确认执行';
+        }
         this._renderL2Evidence(
             flow.field_sources || [],
             flow.parameter_generation || {},
@@ -435,6 +506,126 @@ const APP = {
                 .then(() => GRAPH.focusConfirmationEvidence(request))
                 .catch(() => {});
         }
+    },
+
+    _renderRequirementDecision(request, setText) {
+        const payload = request.payload || {};
+        const unmet = Array.isArray(payload.unmet_requirements)
+            ? payload.unmet_requirements
+            : [];
+        const options = Array.isArray(request.options)
+            ? request.options
+            : [];
+        const escape = value => String(value == null ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+        setText('l2ConfirmationKicker', '任务要求需要人工决策');
+        setText('l2ConfirmationTitle', '当前要求无法继续自动验证');
+        setText(
+            'l2ConfirmationReason',
+            payload.summary || '请确认放宽或修改业务要求后继续执行。'
+        );
+        setText(
+            'l2ConfirmationChain',
+            unmet.map(item => (
+                `${item.id || '-'}：${item.description || '-'}；`
+                + `状态=${item.status || '-'}；${item.reason || ''}`
+            )).join('  · ')
+        );
+        setText(
+            'l2ConfirmationFlow',
+            '该决策会创建新的计划版本；放宽或修改后仍需重新执行要求审计、Ring 3 和最终 L2 确认。'
+        );
+        const evidence = document.getElementById(
+            'l2ConfirmationEvidence'
+        );
+        if (evidence) {
+            evidence.innerHTML = unmet.map((item, index) => `
+                <div class="confirmation-evidence-item">
+                    <div class="confirmation-evidence-source">
+                        要求 ${index + 1} · ${escape(item.id || '-')}
+                    </div>
+                    <div class="confirmation-evidence-meta">
+                        ${escape(item.status || '-')}
+                    </div>
+                    <div>${escape(item.description || '-')}</div>
+                    <div class="confirmation-evidence-quote">
+                        ${escape(item.reason || '暂无说明')}
+                    </div>
+                </div>
+            `).join('') || '<div class="confirmation-evidence-item">没有待决策要求。</div>';
+        }
+        setText('l2ConfirmationTool', request.tool_name || '-');
+        setText(
+            'l2ConfirmationApp',
+            window.AgentTraceAppCatalog.appLabel(request.app || 'unknown')
+        );
+        setText(
+            'l2ConfirmationPlan',
+            [
+                `${request.plan_id || '-'} / r${request.plan_revision || '?'}`,
+                request.plan_hash
+                    ? `hash ${String(request.plan_hash).replace(/^sha256:/, '').slice(0, 16)}`
+                    : '',
+            ].filter(Boolean).join('  · ')
+        );
+        setText(
+            'l2ConfirmationArgs',
+            JSON.stringify(request.args || {}, null, 2)
+        );
+        const error = document.getElementById(
+            'l2RequirementDecisionError'
+        );
+        if (error) {
+            error.hidden = true;
+            error.textContent = '';
+        }
+        const optionContainer = document.getElementById(
+            'l2RequirementDecisionOptions'
+        );
+        const waivableIds = new Set(
+            options
+                .filter(option => option.kind === 'waive_requirement')
+                .flatMap(option => option.requirement_ids || [])
+                .map(value => String(value))
+        );
+        if (optionContainer) {
+            const selectedIds = new Set(
+                this._requirementDecisionSelection || []
+            );
+            optionContainer.innerHTML = unmet
+                .filter(item => waivableIds.has(String(item.id || '')))
+                .map(item => `
+                    <label class="confirmation-requirement-option">
+                        <input type="checkbox" value="${escape(item.id || '')}"
+                            ${selectedIds.has(String(item.id || '')) ? 'checked' : ''}>
+                        <span>
+                            ${escape(item.description || item.id || '-')}
+                            <span class="confirmation-requirement-option-detail">
+                                ${escape(item.reason || item.status || '')}
+                            </span>
+                        </span>
+                    </label>
+                `).join('');
+            optionContainer
+                .querySelectorAll('input[type="checkbox"]')
+                .forEach(input => {
+                    input.addEventListener('change', () => {
+                        this._requirementDecisionSelection = Array.from(
+                            optionContainer.querySelectorAll(
+                                'input[type="checkbox"]:checked'
+                            )
+                        ).map(item => String(item.value || ''));
+                    });
+                });
+        }
+        const approve = document.getElementById('btnApproveL2');
+        const reject = document.getElementById('btnRejectL2');
+        if (approve) approve.textContent = '放宽所选要求';
+        if (reject) reject.textContent = '不放宽并取消';
     },
 
     _renderL2Evidence(
@@ -462,6 +653,13 @@ const APP = {
         };
         const sources = Array.isArray(fieldSources) ? fieldSources : [];
         const generationByParameter = parameterGeneration || {};
+        const sensitiveExposure = (
+            this._activeConfirmationRequest?.confirmation_kind
+            === 'sensitive_data_exposure'
+        );
+        const evidenceTitle = sensitiveExposure
+            ? '读取参数与数据暴露范围'
+            : '外发参数与溯源证据';
         const parameters = [];
         const addParameter = (name) => {
             const parameter = String(name || '').trim();
@@ -475,7 +673,7 @@ const APP = {
 
         if (parameters.length === 0) {
             container.innerHTML = `
-                <div class="confirmation-evidence-title">外发参数与溯源证据</div>
+                <div class="confirmation-evidence-title">${evidenceTitle}</div>
                 <div class="confirmation-evidence-item">
                     当前调用没有可展示的参数或字段级来源，请结合左侧执行链判断。
                 </div>`;
@@ -500,6 +698,9 @@ const APP = {
             if (generation.validation_mode === 'natural_language_manual') {
                 return '自然语言内容，仅人工核对来源与风险';
             }
+            if (generation.validation_mode === 'natural_language_source') {
+                return '直接来源已核验，语义内容由 Agent 解释并供人工核对';
+            }
             if (typeof generation.semantic_supported !== 'boolean') {
                 return '未记录';
             }
@@ -510,7 +711,7 @@ const APP = {
 
         container.innerHTML = `
             <div class="confirmation-evidence-title">
-                外发参数、生成说明与来源证据（${parameters.length} 个参数）
+                ${evidenceTitle}（${parameters.length} 个参数）
             </div>
             ${parameters.map((parameter, parameterIndex) => {
                 const generation = generationByParameter[parameter] || {};
@@ -612,16 +813,70 @@ const APP = {
 
     async _resolveL2Confirmation(approved) {
         if (!this._activeConfirmationId || this._confirmationResolving) return;
+        const request = this._activeConfirmationRequest || {};
+        const requirementDecision = (
+            request.confirmation_kind === 'requirement_resolution'
+        );
+        let structuredDecision = null;
+        if (requirementDecision) {
+            if (!approved) {
+                structuredDecision = {
+                    decision: 'cancel_task',
+                };
+            } else {
+                const selectedRequirementIds = Array.from(
+                    document.querySelectorAll(
+                        '#l2RequirementDecisionOptions input:checked'
+                    )
+                ).map(input => String(input.value || '')).filter(Boolean);
+                const selectedOption = selectedRequirementIds.length
+                    ? {
+                        kind: 'waive_requirement',
+                        requirement_ids: selectedRequirementIds,
+                    }
+                    : null;
+                const error = document.getElementById(
+                    'l2RequirementDecisionError'
+                );
+                if (!selectedOption) {
+                    if (error) {
+                        error.hidden = false;
+                        error.textContent = '请至少选择一项要放宽的要求。';
+                    }
+                    return;
+                }
+                structuredDecision = {
+                    decision: selectedOption.kind,
+                    requirement_ids: selectedOption.requirement_ids || [],
+                };
+                this._requirementDecisionSelection = (
+                    selectedOption.requirement_ids || []
+                );
+            }
+        }
         this._confirmationResolving = true;
         const buttons = this._confirmationOverlay.querySelectorAll('button');
         buttons.forEach((button) => { button.disabled = true; });
         try {
-            await API.resolveConfirmation(this._activeConfirmationId, approved);
+            if (requirementDecision) {
+                await API.resolveRequirementDecision(
+                    this._activeConfirmationId,
+                    structuredDecision
+                );
+            } else {
+                await API.resolveConfirmation(
+                    this._activeConfirmationId,
+                    approved
+                );
+            }
             this._confirmationOverlay.hidden = true;
             this._confirmationOverlay.classList.remove('reviewing-graph');
             document.body.classList.remove('l2-review-active');
             this._activeConfirmationId = null;
             this._activeConfirmationRequest = null;
+            if (typeof GRAPH !== 'undefined') {
+                setTimeout(() => GRAPH.loadData().catch(() => {}), 300);
+            }
         } catch (err) {
             console.error('[confirmation] resolve failed', err);
         } finally {

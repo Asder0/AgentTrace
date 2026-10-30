@@ -163,6 +163,51 @@ const AUDIT_SUMMARY = {
             || (!labels.hasChinese || labels.hasChinese(plan.task_goal)
                 ? plan.task_goal
                 : '');
+        const planActions = (plan.steps || [])
+            .flatMap(step => step.actions || [])
+            .filter(Boolean);
+        const dataAccessActions = planActions
+            .filter(action => action.data_access);
+        const visibleFields = [...new Set(
+            dataAccessActions.flatMap(
+                action => action.data_access.visible_fields || []
+            )
+        )];
+        const resourceScopes = [...new Set(planActions.flatMap(action => {
+            const dataAccess = action.data_access || {};
+            const resourceAccess = action.resource_access || dataAccess;
+            return [
+                ...(action.data_access
+                    ? [`max: ${dataAccess.max_exposure_level || 'internal'}`]
+                    : []),
+                ...Object.entries(resourceAccess.resource_parameters || {})
+                    .map(([name, rule]) => {
+                        if (rule.mode === 'literal') {
+                            return `${name}: ${(rule.allowed_values || []).join(', ')}`;
+                        }
+                        return `${name}: derived`;
+                    })
+            ];
+        }))];
+        const quarantineMetrics = tools
+            .map(tool => tool.quarantine_metrics)
+            .filter(metric => metric && metric.fields_measured);
+        const quarantineSummary = quarantineMetrics.length
+            ? [
+                `覆盖率 ${Math.round(
+                    Math.min(...quarantineMetrics.map(
+                        metric => Number(metric.replacement_coverage || 0)
+                    )) * 100
+                )}%`,
+                `隔离跨度 ${quarantineMetrics.reduce(
+                    (sum, metric) => sum + Number(metric.redacted_spans_total || 0),
+                    0
+                )}`,
+                quarantineMetrics.some(metric => metric.sanitized_residual_suspected)
+                    ? '复扫仍有风险'
+                    : '复扫通过',
+            ]
+            : [];
 
         const chips = (items, className = '') => items.length
             ? items.map(item => `<span class="audit-chip ${className}">${this._escape(item)}</span>`).join('')
@@ -198,6 +243,21 @@ const AUDIT_SUMMARY = {
                 <span class="audit-block-label">实际调用</span>
                 <div class="audit-chips">${chips(actualTools, 'actual')}</div>
             </div>
+            <div class="audit-section audit-two-col">
+                <div>
+                    <span class="audit-block-label">Agent 可见字段</span>
+                    <div class="audit-chips">${chips(visibleFields, 'sensitive')}</div>
+                </div>
+                <div>
+                    <span class="audit-block-label">资源访问范围</span>
+                    <div class="audit-chips">${chips(resourceScopes, 'effect')}</div>
+                </div>
+            </div>
+            ${quarantineSummary.length ? `
+            <div class="audit-section">
+                <span class="audit-block-label">注入隔离指标</span>
+                <div class="audit-chips">${chips(quarantineSummary, 'effect')}</div>
+            </div>` : ''}
             <div class="audit-section audit-two-col">
                 <div>
                     <span class="audit-block-label">数据类别</span>
