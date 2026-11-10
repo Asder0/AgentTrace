@@ -18,29 +18,24 @@ to avoid circular import issues that occur when importing via task_suite.py
 (which triggers v1_1_1 → v1 workspace circular dependency).
 """
 
+import datetime
 import os
+from collections.abc import Mapping
+from typing import Any
+
 import yaml
-from typing import Any, Dict, Mapping, Tuple
 
-from agentdojo.functions_runtime import FunctionsRuntime, TaskEnvironment, make_function
-from agentdojo.method.tasks.cross_app import get_cross_app_scenarios
-
-# ============================================================
-# Import agentdojo's original tool functions and types directly
-# ============================================================
-
-# Workspace: Email tools
-from agentdojo.default_suites.v1.tools.email_client import (
-    Inbox,
-    delete_email,
-    get_draft_emails,
-    get_received_emails,
-    get_sent_emails,
-    get_unread_emails,
-    search_contacts_by_email,
-    search_contacts_by_name,
-    search_emails,
-    send_email,
+# Banking tools
+from agentdojo.default_suites.v1.tools.banking_client import (
+    BankAccount,
+    Transaction,
+    get_balance,
+    get_iban,
+    get_most_recent_transactions,
+    get_scheduled_transactions,
+    schedule_transaction,
+    send_money,
+    update_scheduled_transaction,
 )
 
 # Workspace: Calendar tools
@@ -68,29 +63,41 @@ from agentdojo.default_suites.v1.tools.cloud_drive_client import (
     share_file,
 )
 
-# Banking tools
-from agentdojo.default_suites.v1.tools.banking_client import (
-    BankAccount,
-    get_balance,
-    get_iban,
-    get_most_recent_transactions,
-    get_scheduled_transactions,
-    schedule_transaction,
-    send_money,
-    update_scheduled_transaction,
+# ============================================================
+# Import agentdojo's original tool functions and types directly
+# ============================================================
+# Workspace: Email tools
+from agentdojo.default_suites.v1.tools.email_client import (
+    Inbox,
+    delete_email,
+    get_draft_emails,
+    get_received_emails,
+    get_sent_emails,
+    get_unread_emails,
+    search_contacts_by_email,
+    search_contacts_by_name,
+    search_emails,
+    send_email,
 )
 
 # Banking: File reader
 from agentdojo.default_suites.v1.tools.file_reader import Filesystem, read_file
-from agentdojo.default_suites.v1.tools.types import Email, EmailStatus
+from agentdojo.default_suites.v1.tools.slack import Message
+from agentdojo.default_suites.v1.tools.types import (
+    CloudDriveFile,
+    Email,
+    EmailStatus,
+)
 
 # Banking: User account
 from agentdojo.default_suites.v1.tools.user_account import UserAccount, get_user_info, update_password, update_user_info
-
+from agentdojo.functions_runtime import FunctionsRuntime, TaskEnvironment, make_function
+from agentdojo.method.tasks.cross_app import get_cross_app_scenarios
 
 # ============================================================
 # Workspace Environment (replicates the original without importing task_suite)
 # ============================================================
+
 
 class WorkspaceEnvironment(TaskEnvironment):
     inbox: Inbox
@@ -133,6 +140,7 @@ WORKSPACE_TOOLS = [
 # Banking Environment (replicates the original without importing task_suite)
 # ============================================================
 
+
 class BankingEnvironment(TaskEnvironment):
     bank_account: BankAccount
     filesystem: Filesystem
@@ -158,23 +166,25 @@ BANKING_TOOLS = [
 # Create default environments from original YAML data files
 # ============================================================
 
+
 def _get_suite_data_dir(suite_name: str) -> str:
     """Get the path to the suite data directory."""
     package_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return os.path.join(package_dir, 'data', 'suites', suite_name)
+    return os.path.join(package_dir, "data", "suites", suite_name)
 
 
 # AgentDojo 的四个 suite（同时是可视化中的 APP 域）
 SUITE_NAMES = ("workspace", "banking", "slack", "travel")
 
-_SUITE_CACHE: Dict[str, Any] = {}
-_SUITE_RUNTIME_CACHE: Dict[str, FunctionsRuntime] = {}
+_SUITE_CACHE: dict[str, Any] = {}
+_SUITE_RUNTIME_CACHE: dict[str, FunctionsRuntime] = {}
 
 
 def _get_task_suite(suite_name: str) -> Any:
     """按可视化使用的基准版本（v1.2.2）获取 TaskSuite。"""
     if suite_name not in _SUITE_CACHE:
         from agentdojo.task_suite.load_suites import get_suite
+
         _SUITE_CACHE[suite_name] = get_suite("v1.2.2", suite_name)
     return _SUITE_CACHE[suite_name]
 
@@ -196,10 +206,10 @@ def _get_suite_env(suite_name: str) -> Any:
 def get_injection_vector_keys(suite_name: str) -> list[str]:
     """读取 suite 的 injection_vectors.yaml，返回全部注入占位符名称。"""
     suite_dir = _get_suite_data_dir(suite_name)
-    vector_path = os.path.join(suite_dir, 'injection_vectors.yaml')
+    vector_path = os.path.join(suite_dir, "injection_vectors.yaml")
     if not os.path.exists(vector_path):
         return []
-    with open(vector_path, 'r', encoding='utf-8') as f:
+    with open(vector_path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     return [str(key) for key in data.keys()]
 
@@ -235,24 +245,25 @@ _banking_runtime = FunctionsRuntime([make_function(t) for t in BANKING_TOOLS])
 
 # ============================================================
 # RouterRuntime: 真正的跨 APP 路由 Runtime
-# 
+#
 # 设计原理：
 # - 不合并工具到同一个 Runtime，而是维护一个工具名 → (APP名, Function) 的注册表
 # - LLM 看到的是所有 APP 的工具列表（通过 self.functions 暴露）
 # - 实际执行时，根据工具名路由到对应的 APP Runtime，使用对应的 APP Environment
 # - 每个 APP 保持独立的 Runtime 和环境，状态互不干扰
-# 
+#
 # 这比简单的"合并所有工具"更接近真实微服务架构：
 #   真实世界 = 每个 APP 有独立 API 网关 + 独立数据库
 #   本实现 = 每个 APP 有独立 FunctionsRuntime + 独立 Environment
 # ============================================================
 
+
 class RouterRuntime(FunctionsRuntime):
     """路由 Runtime：将工具调用分发到正确的 APP Runtime。
-    
+
     继承 FunctionsRuntime 以兼容 AgentPipeline 的类型检查，
     但重写 run_function 实现路由逻辑。
-    
+
     Attributes:
         _tool_registry: 对外工具名 → (app_name, base_tool_name, Function)
         _app_runtimes: APP 名 → FunctionsRuntime 的映射表
@@ -262,42 +273,32 @@ class RouterRuntime(FunctionsRuntime):
     第一个 APP。此时统一运行时会暴露 ``workspace__send_email``、
     ``travel__send_email`` 等稳定别名；唯一工具保持原名。
     """
-    
-    def __init__(self, app_runtimes: Dict[str, FunctionsRuntime]):
+
+    def __init__(self, app_runtimes: dict[str, FunctionsRuntime]):
         # 不调用 super().__init__()，我们自己管理 functions
         self._app_runtimes = app_runtimes
-        self._tool_registry: Dict[str, Tuple[str, str, Any]] = {}
-        self._raw_registry: Dict[str, list[Tuple[str, Any]]] = {}
-        self._alias_to_base: Dict[str, str] = {}
-        self.functions: Dict[str, Any] = {}
+        self._tool_registry: dict[str, tuple[str, str, Any]] = {}
+        self._raw_registry: dict[str, list[tuple[str, Any]]] = {}
+        self._alias_to_base: dict[str, str] = {}
+        self.functions: dict[str, Any] = {}
 
         # 先统计每个原始工具名被哪些 APP 暴露。
         for app_name, runtime in app_runtimes.items():
             for func_name, func in runtime.functions.items():
-                self._raw_registry.setdefault(func_name, []).append(
-                    (app_name, func)
-                )
+                self._raw_registry.setdefault(func_name, []).append((app_name, func))
 
         # 唯一工具保持原名；重复工具必须使用 suite__tool 显式命名空间。
         for base_name, owners in self._raw_registry.items():
             for app_name, func in owners:
-                exposed_name = (
-                    base_name
-                    if len(owners) == 1
-                    else f"{app_name}__{base_name}"
-                )
+                exposed_name = base_name if len(owners) == 1 else f"{app_name}__{base_name}"
                 if exposed_name in self._tool_registry:
-                    raise ValueError(
-                        f"Duplicate unified tool alias: {exposed_name}"
-                    )
+                    raise ValueError(f"Duplicate unified tool alias: {exposed_name}")
                 exposed_func = func
                 if exposed_name != base_name:
                     exposed_func = func.model_copy(
                         update={
                             "name": exposed_name,
-                            "description": (
-                                f"[{app_name} APP] {func.description}"
-                            ),
+                            "description": (f"[{app_name} APP] {func.description}"),
                         }
                     )
                 self._tool_registry[exposed_name] = (
@@ -308,14 +309,11 @@ class RouterRuntime(FunctionsRuntime):
                 self.functions[exposed_name] = exposed_func
                 self._alias_to_base[exposed_name] = base_name
 
-    def tool_app_map(self) -> Dict[str, str]:
+    def tool_app_map(self) -> dict[str, str]:
         """返回 工具名 → APP 名 的映射，供可视化层标注 APP 域。"""
-        return {
-            func_name: app_name
-            for func_name, (app_name, _base, _func) in self._tool_registry.items()
-        }
+        return {func_name: app_name for func_name, (app_name, _base, _func) in self._tool_registry.items()}
 
-    def tool_aliases(self) -> Dict[str, list[str]]:
+    def tool_aliases(self) -> dict[str, list[str]]:
         """Return base tool names that require suite-qualified aliases."""
         return {
             base_name: [
@@ -333,39 +331,36 @@ class RouterRuntime(FunctionsRuntime):
         function: str,
         kwargs: Mapping[str, Any],
         raise_on_error: bool = False,
-    ) -> Tuple[Any, str | None]:
+    ) -> tuple[Any, str | None]:
         """路由执行：根据工具名找到对应的 APP Runtime 和 Environment。
-        
-        流程：
-        1. 在 _tool_registry 中查找工具名 → (app_name, func)
-    2. 从统一环境 env 中提取对应 APP 的子环境（workspace/banking/slack/travel）
-        3. 调用对应 APP 的 Runtime 执行
+
+            流程：
+            1. 在 _tool_registry 中查找工具名 → (app_name, func)
+        2. 从统一环境 env 中提取对应 APP 的子环境（workspace/banking/slack/travel）
+            3. 调用对应 APP 的 Runtime 执行
         """
         if function not in self._tool_registry:
             if raise_on_error:
                 from agentdojo.functions_runtime import ToolNotFoundError
+
                 if function in self._raw_registry:
                     aliases = self.tool_aliases().get(function, [])
                     raise ToolNotFoundError(
-                        f"The tool `{function}` exists in multiple APP domains. "
-                        f"Use one of: {', '.join(aliases)}"
+                        f"The tool `{function}` exists in multiple APP domains. Use one of: {', '.join(aliases)}"
                     )
                 raise ToolNotFoundError(f"The requested function `{function}` is not available.")
             if function in self._raw_registry:
                 aliases = self.tool_aliases().get(function, [])
-                return "", (
-                    f"ToolNotFoundError: The tool `{function}` is ambiguous. "
-                    f"Use one of: {', '.join(aliases)}"
-                )
+                return "", (f"ToolNotFoundError: The tool `{function}` is ambiguous. Use one of: {', '.join(aliases)}")
             return "", f"ToolNotFoundError: The requested function `{function}` is not available."
-        
+
         app_name, base_name, _exposed_func = self._tool_registry[function]
-        
+
         # 从统一环境中提取对应 APP 的子环境
         app_env = None
         if env is not None and hasattr(env, app_name):
             app_env = getattr(env, app_name)
-        
+
         # 路由到对应的 APP Runtime 执行
         app_runtime = self._app_runtimes[app_name]
         from agentdojo.method.capture.interceptor import _EXPOSED_TOOL_NAME
@@ -380,7 +375,7 @@ class RouterRuntime(FunctionsRuntime):
             )
         finally:
             _EXPOSED_TOOL_NAME.reset(token)
-    
+
     def __repr__(self) -> str:
         apps = list(self._app_runtimes.keys())
         tool_count = len(self._tool_registry)
@@ -389,19 +384,21 @@ class RouterRuntime(FunctionsRuntime):
 
 # ============================================================
 # Unified Environment: 持有四个 suite 的独立环境
-# 
+#
 # 设计原理：
 # - 不合并两个环境的状态，而是分别持有
 # - RouterRuntime 根据工具名路由时，从对应属性提取子环境
 # - 每个 APP 的状态完全隔离
 # ============================================================
 
+
 class UnifiedEnvironment(TaskEnvironment):
     """统一环境：持有 workspace / banking / slack / travel 四个独立环境。
-    
+
     每个 APP 的环境保持独立，RouterRuntime 在路由工具调用时
     从对应的属性提取子环境传递给 APP 的 Runtime。
     """
+
     workspace: Any = None
     banking: Any = None
     slack: Any = None
@@ -426,8 +423,8 @@ def _create_unified_env() -> UnifiedEnvironment:
 # Global environment instances cache
 # ============================================================
 
-_env_instances: Dict[str, Any] = {}
-_runtime_instances: Dict[str, FunctionsRuntime] = {
+_env_instances: dict[str, Any] = {}
+_runtime_instances: dict[str, FunctionsRuntime] = {
     "workspace": _workspace_runtime,
     "banking": _banking_runtime,
 }
@@ -480,23 +477,20 @@ def _get_router_runtime() -> FunctionsRuntime:
     """获取覆盖四个 suite 的 RouterRuntime（惰性创建，避免导入期循环依赖）。"""
     global _router_runtime
     if _router_runtime is None:
-        _router_runtime = RouterRuntime({
-            suite_name: _get_app_runtime(suite_name)
-            for suite_name in SUITE_NAMES
-        })
+        _router_runtime = RouterRuntime({suite_name: _get_app_runtime(suite_name) for suite_name in SUITE_NAMES})
     return _router_runtime
 
 
-def get_runtime_and_env(app_name: str) -> Tuple[FunctionsRuntime, Any]:
+def get_runtime_and_env(app_name: str) -> tuple[FunctionsRuntime, Any]:
     """
     Get or create a FunctionsRuntime and environment for the given APP.
-    
+
     Args:
         app_name: "workspace" / "banking" / "slack" / "travel" / "unified"
-        
+
     Returns:
         (runtime, env) tuple
-        
+
     For "unified" mode:
         - runtime = RouterRuntime（路由到正确的 APP Runtime）
         - env = UnifiedEnvironment（持有四个 suite 的独立环境）
@@ -505,7 +499,7 @@ def get_runtime_and_env(app_name: str) -> Tuple[FunctionsRuntime, Any]:
         if "unified" not in _env_instances:
             _env_instances["unified"] = _create_unified_env()
         return _get_router_runtime(), _env_instances["unified"]
-    
+
     if app_name not in SUITE_NAMES:
         raise ValueError(f"Unknown APP: {app_name}")
 
@@ -514,7 +508,7 @@ def get_runtime_and_env(app_name: str) -> Tuple[FunctionsRuntime, Any]:
 
 def reset_all_environments():
     """重置所有环境实例，强制下次 get_runtime_and_env 时重新创建。
-    
+
     用于在任务执行前重置状态，确保不同任务的执行环境互不干扰。
     """
     global _env_instances
@@ -610,6 +604,7 @@ def get_original_user_tasks() -> dict:
 # 用于生成攻击场景（user_task + injection_task + attack_type）
 # ============================================================
 
+
 def _get_original_injection_tasks() -> dict:
     """从原版 TaskSuite 加载四个 suite 的所有 injection_tasks。"""
     tasks = {}
@@ -682,38 +677,32 @@ AVAILABLE_ATTACK_TYPES = [
 
 def get_attack_scenarios() -> list:
     """生成所有可用的攻击场景列表。
-    
+
     每个攻击场景是一个 (user_task, injection_task, attack_type) 的组合。
     只生成同 suite 内的组合（workspace 任务配 workspace 注入，banking 同理）。
-    
+
     Returns:
         list of dict: 攻击场景列表
     """
     user_tasks = get_original_user_tasks()
     injection_tasks = get_original_injection_tasks()
-    
+
     scenarios = []
-    
+
     # 为每个攻击类型生成场景
     for attack_info in AVAILABLE_ATTACK_TYPES:
         attack_id = attack_info["id"]
         attack_name = attack_info["name"]
-        
+
         # 按 suite 分组
         for suite_name in SUITE_NAMES:
             # 获取该 suite 的 user_tasks 和 injection_tasks
-            suite_user_tasks = {
-                tid: t for tid, t in user_tasks.items()
-                if t.get("suite") == suite_name
-            }
-            suite_injection_tasks = {
-                tid: t for tid, t in injection_tasks.items()
-                if t.get("suite") == suite_name
-            }
-            
+            suite_user_tasks = {tid: t for tid, t in user_tasks.items() if t.get("suite") == suite_name}
+            suite_injection_tasks = {tid: t for tid, t in injection_tasks.items() if t.get("suite") == suite_name}
+
             if not suite_user_tasks or not suite_injection_tasks:
                 continue
-            
+
             # 为每个 (user_task, injection_task) 组合生成场景
             # 每个攻击类型每个 suite 的预设数量可通过环境变量配置。
             count = 0
@@ -732,11 +721,7 @@ def get_attack_scenarios() -> list:
             # Select deterministic combinations spread across the full catalog.
             ut_ids = list(suite_user_tasks.keys())
             inj_ids = list(suite_injection_tasks.keys())
-            combinations = [
-                (user_id, injection_id)
-                for user_id in ut_ids
-                for injection_id in inj_ids
-            ]
+            combinations = [(user_id, injection_id) for user_id in ut_ids for injection_id in inj_ids]
             if len(combinations) > max_combos:
                 stride = max(1, len(combinations) // max_combos)
                 combinations = combinations[::stride][:max_combos]
@@ -747,28 +732,30 @@ def get_attack_scenarios() -> list:
                         continue
                     if count >= max_combos:
                         break
-                    
+
                     ut_info = suite_user_tasks[ut_id]
                     inj_info = suite_injection_tasks[inj_id]
-                    
+
                     scenario_id = f"attack_{attack_id}_{suite_name}_{ut_id}_{inj_id}"
-                    
-                    scenarios.append({
-                        "id": scenario_id,
-                        "attack_type": attack_id,
-                        "attack_name": attack_name,
-                        "suite": suite_name,
-                        "user_task_id": ut_id,
-                        "injection_task_id": inj_id,
-                        "user_task_label": ut_info.get("task_id", ut_id),
-                        "injection_task_label": inj_info.get("task_id", inj_id),
-                        "user_task_prompt": ut_info["prompt"],
-                        "injection_goal": inj_info["goal"],
-                        "name": f"{attack_name}: {ut_info.get('task_id', ut_id)} + {inj_info.get('task_id', inj_id)}",
-                        "description": f"用户任务: {ut_info['description'][:40]}... | 注入目标: {inj_info['description'][:40]}...",
-                    })
+
+                    scenarios.append(
+                        {
+                            "id": scenario_id,
+                            "attack_type": attack_id,
+                            "attack_name": attack_name,
+                            "suite": suite_name,
+                            "user_task_id": ut_id,
+                            "injection_task_id": inj_id,
+                            "user_task_label": ut_info.get("task_id", ut_id),
+                            "injection_task_label": inj_info.get("task_id", inj_id),
+                            "user_task_prompt": ut_info["prompt"],
+                            "injection_goal": inj_info["goal"],
+                            "name": f"{attack_name}: {ut_info.get('task_id', ut_id)} + {inj_info.get('task_id', inj_id)}",
+                            "description": f"用户任务: {ut_info['description'][:40]}... | 注入目标: {inj_info['description'][:40]}...",
+                        }
+                    )
                     count += 1
-    
+
     return scenarios
 
 
@@ -785,46 +772,157 @@ MOCK_SCENARIOS.update(CROSS_APP_SCENARIOS)
 def apply_scenario_fixtures(env: Any, scenario: Mapping[str, Any]) -> None:
     """Apply declarative scenario data to the selected mock environment."""
     fixtures = scenario.get("fixtures") or {}
-    workspace_fixture = (
-        fixtures.get("workspace", {})
-        if isinstance(fixtures, Mapping)
-        else {}
-    )
-    if not isinstance(workspace_fixture, Mapping):
+    if not isinstance(fixtures, Mapping):
         return
-    workspace = (
-        env.workspace
-        if env is not None and hasattr(env, "workspace")
-        else env
-    )
-    inbox = getattr(workspace, "inbox", None)
-    if inbox is None:
-        return
-    for index, raw in enumerate(
-        workspace_fixture.get("append_unread_emails", [])
-    ):
-        if not isinstance(raw, Mapping):
-            continue
-        fixture_id = str(
-            raw.get("fixture_id") or f"fixture_email_{index + 1}"
-        ).strip()
-        email_id = str(raw.get("id_") or "").strip()
-        if not email_id.isdecimal():
-            raise ValueError(
-                f"Email fixture {fixture_id!r} requires a numeric id_ "
-                "for its runtime entity ID."
+    workspace_fixture = fixtures.get("workspace", {})
+    if isinstance(workspace_fixture, Mapping):
+        workspace = env.workspace if env is not None and hasattr(env, "workspace") else env
+        inbox = getattr(workspace, "inbox", None)
+        cloud_drive = getattr(workspace, "cloud_drive", None)
+        if inbox is not None:
+            for index, raw in enumerate(workspace_fixture.get("append_unread_emails", [])):
+                if not isinstance(raw, Mapping):
+                    continue
+                fixture_id = str(raw.get("fixture_id") or f"fixture_email_{index + 1}").strip()
+                email_id = str(raw.get("id_") or "").strip()
+                if not email_id.isdecimal():
+                    raise ValueError(f"Email fixture {fixture_id!r} requires a numeric id_ for its runtime entity ID.")
+                if email_id in inbox.emails:
+                    continue
+                inbox.emails[email_id] = Email(
+                    id_=email_id,
+                    sender=str(raw["sender"]),
+                    recipients=list(raw.get("recipients", [])),
+                    cc=list(raw.get("cc", [])),
+                    bcc=list(raw.get("bcc", [])),
+                    subject=str(raw.get("subject", "")),
+                    body=str(raw.get("body", "")),
+                    status=EmailStatus.received,
+                    read=False,
+                    attachments=list(raw.get("attachments", [])),
+                )
+        if cloud_drive is not None:
+            for index, raw in enumerate(workspace_fixture.get("append_files", [])):
+                if not isinstance(raw, Mapping):
+                    continue
+                fixture_id = str(raw.get("fixture_id") or f"fixture_file_{index + 1}").strip()
+                file_id = str(raw.get("id_") or "").strip()
+                if not file_id.isdecimal():
+                    raise ValueError(f"File fixture {fixture_id!r} requires a numeric id_ for its runtime entity ID.")
+                if file_id in cloud_drive.files:
+                    continue
+                last_modified = raw.get(
+                    "last_modified",
+                    "2024-05-15T12:00:00",
+                )
+                cloud_drive.files[file_id] = CloudDriveFile(
+                    id_=file_id,
+                    filename=str(raw["filename"]),
+                    content=str(raw.get("content", "")),
+                    owner=str(
+                        raw.get(
+                            "owner",
+                            cloud_drive.account_email,
+                        )
+                    ),
+                    last_modified=(datetime.datetime.fromisoformat(str(last_modified))),
+                    shared_with=dict(raw.get("shared_with", {})),
+                )
+
+    slack_fixture = fixtures.get("slack", {})
+    slack_environment = getattr(env, "slack", None) if env is not None else None
+    slack = getattr(slack_environment, "slack", None) if slack_environment is not None else None
+    if isinstance(slack_fixture, Mapping) and slack is not None:
+        if slack_fixture.get("current_user"):
+            slack.current_user = str(slack_fixture["current_user"])
+        for raw_user in slack_fixture.get("ensure_users", []):
+            user = str(raw_user)
+            if user not in slack.users:
+                slack.users.append(user)
+                slack.user_inbox[user] = []
+                slack.user_channels[user] = []
+        for raw_channel in slack_fixture.get("ensure_channels", []):
+            channel = str(raw_channel)
+            if channel not in slack.channels:
+                slack.channels.append(channel)
+                slack.channel_inbox[channel] = []
+        memberships = slack_fixture.get("user_channel_memberships", {})
+        if isinstance(memberships, Mapping):
+            for raw_user, raw_channels in memberships.items():
+                user = str(raw_user)
+                if user not in slack.users:
+                    slack.users.append(user)
+                    slack.user_inbox[user] = []
+                    slack.user_channels[user] = []
+                for raw_channel in raw_channels:
+                    channel = str(raw_channel)
+                    if channel not in slack.channels:
+                        slack.channels.append(channel)
+                        slack.channel_inbox[channel] = []
+                    if channel not in slack.user_channels[user]:
+                        slack.user_channels[user].append(channel)
+        for index, raw in enumerate(slack_fixture.get("append_direct_messages", [])):
+            if not isinstance(raw, Mapping):
+                continue
+            recipient = str(raw["recipient"])
+            message = Message(
+                sender=str(raw.get("sender", "bot")),
+                recipient=recipient,
+                body=str(raw.get("body", "")),
             )
-        if email_id in inbox.emails:
-            continue
-        inbox.emails[email_id] = Email(
-            id_=email_id,
-            sender=str(raw["sender"]),
-            recipients=list(raw.get("recipients", [])),
-            cc=list(raw.get("cc", [])),
-            bcc=list(raw.get("bcc", [])),
-            subject=str(raw.get("subject", "")),
-            body=str(raw.get("body", "")),
-            status=EmailStatus.received,
-            read=False,
-            attachments=list(raw.get("attachments", [])),
-        )
+            if recipient not in slack.users:
+                slack.users.append(recipient)
+                slack.user_inbox[recipient] = []
+                slack.user_channels.setdefault(recipient, [])
+            message_data = message.model_dump()
+            if not any(
+                existing.model_dump() == message_data for existing in slack.user_inbox.setdefault(recipient, [])
+            ):
+                slack.user_inbox[recipient].append(message)
+        for index, raw in enumerate(slack_fixture.get("append_channel_messages", [])):
+            if not isinstance(raw, Mapping):
+                continue
+            channel = str(raw["recipient"])
+            message = Message(
+                sender=str(raw.get("sender", "bot")),
+                recipient=channel,
+                body=str(raw.get("body", "")),
+            )
+            if channel not in slack.channels:
+                slack.channels.append(channel)
+                slack.channel_inbox[channel] = []
+            message_data = message.model_dump()
+            if not any(
+                existing.model_dump() == message_data for existing in slack.channel_inbox.setdefault(channel, [])
+            ):
+                slack.channel_inbox[channel].append(message)
+
+    banking_fixture = fixtures.get("banking", {})
+    banking = getattr(env, "banking", None) if env is not None else None
+    if isinstance(banking_fixture, Mapping) and banking is not None:
+        account = banking.bank_account
+        existing_ids = {transaction.id for transaction in (account.transactions + account.scheduled_transactions)}
+        for index, raw in enumerate(banking_fixture.get("append_transactions", [])):
+            if not isinstance(raw, Mapping):
+                continue
+            fixture_id = str(raw.get("fixture_id") or f"fixture_transaction_{index + 1}").strip()
+            try:
+                transaction_id = int(raw.get("id") or 0)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Transaction fixture {fixture_id!r} requires an integer id.") from error
+            if transaction_id <= 0:
+                raise ValueError(f"Transaction fixture {fixture_id!r} requires a positive id.")
+            if transaction_id in existing_ids:
+                continue
+            account.transactions.append(
+                Transaction(
+                    id=transaction_id,
+                    sender=str(raw["sender"]),
+                    recipient=str(raw["recipient"]),
+                    amount=float(raw["amount"]),
+                    subject=str(raw.get("subject", "")),
+                    date=str(raw["date"]),
+                    recurring=bool(raw.get("recurring", False)),
+                )
+            )
+            existing_ids.add(transaction_id)

@@ -268,6 +268,8 @@
     "workspace": {
       "inbox": "email",
       "calendar": "calendar_event",
+      "day_events": "calendar_event",
+      "events": "calendar_event",
       "cloud_drive": "cloud_drive_file",
       "file": "cloud_drive_file",
       "filesystem": "cloud_drive_file"
@@ -283,6 +285,8 @@
     },
     "travel": {
       "calendar": "calendar_event",
+      "day_events": "calendar_event",
+      "events": "calendar_event",
       "hotels": "hotel",
       "flights": "flight",
       "restaurants": "restaurant",

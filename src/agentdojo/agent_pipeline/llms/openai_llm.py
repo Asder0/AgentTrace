@@ -1,4 +1,5 @@
 import json
+import os
 from collections.abc import Sequence
 from typing import overload
 
@@ -18,7 +19,12 @@ from openai.types.chat import (
     ChatCompletionUserMessageParam,
 )
 from openai.types.shared_params import FunctionDefinition
-from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_random_exponential
+from tenacity import (
+    Retrying,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
 from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
 from agentdojo.functions_runtime import EmptyEnv, Env, Function, FunctionCall, FunctionsRuntime
@@ -140,12 +146,6 @@ def _function_to_openai(f: Function) -> ChatCompletionToolParam:
     return ChatCompletionToolParam(type="function", function=function_definition)
 
 
-@retry(
-    wait=wait_random_exponential(multiplier=1, max=40),
-    stop=stop_after_attempt(3),
-    reraise=True,
-    retry=retry_if_not_exception_type((openai.BadRequestError, openai.UnprocessableEntityError)),
-)
 def chat_completion_request(
     client: openai.OpenAI,
     model: str,
@@ -154,14 +154,37 @@ def chat_completion_request(
     reasoning_effort: ChatCompletionReasoningEffort | None,
     temperature: float | None = 0.0,
 ):
-    return client.chat.completions.create(
-        model=model,
-        messages=messages,
-        tools=tools or NOT_GIVEN,
-        tool_choice="auto" if tools else NOT_GIVEN,
-        temperature=temperature if temperature is not None else NOT_GIVEN,
-        reasoning_effort=reasoning_effort or NOT_GIVEN,
+    max_attempts = max(
+        1,
+        int(os.getenv("LLM_MAX_RETRIES", "1")) + 1,
     )
+    for attempt in Retrying(
+        wait=wait_random_exponential(multiplier=1, max=40),
+        stop=stop_after_attempt(max_attempts),
+        reraise=True,
+        retry=retry_if_not_exception_type(
+            (
+                openai.BadRequestError,
+                openai.UnprocessableEntityError,
+            )
+        ),
+    ):
+        with attempt:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools or NOT_GIVEN,
+                tool_choice="auto" if tools else NOT_GIVEN,
+                temperature=(
+                    temperature
+                    if temperature is not None
+                    else NOT_GIVEN
+                ),
+                reasoning_effort=(
+                    reasoning_effort or NOT_GIVEN
+                ),
+            )
+    raise RuntimeError("LLM request retry loop exited unexpectedly")
 
 
 class OpenAILLM(BasePipelineElement):

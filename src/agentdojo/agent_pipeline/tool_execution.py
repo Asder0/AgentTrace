@@ -6,7 +6,13 @@ from pydantic import BaseModel
 
 from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
 from agentdojo.agent_pipeline.llms.google_llm import EMPTY_FUNCTION_NAME
-from agentdojo.functions_runtime import EmptyEnv, Env, FunctionReturnType, FunctionsRuntime
+from agentdojo.functions_runtime import (
+    FUNCTION_CALL_ID,
+    EmptyEnv,
+    Env,
+    FunctionReturnType,
+    FunctionsRuntime,
+)
 from agentdojo.logging import Logger
 from agentdojo.types import ChatMessage, ChatToolResultMessage, text_content_block_from_string
 
@@ -108,7 +114,11 @@ class ToolsExecutor(BasePipelineElement):
                 if isinstance(arg_v, str) and is_string_list(arg_v):
                     tool_call.args[arg_k] = literal_eval(arg_v)
 
-            tool_call_result, error = runtime.run_function(env, tool_call.function, tool_call.args)
+            call_id_token = FUNCTION_CALL_ID.set(tool_call.id)
+            try:
+                tool_call_result, error = runtime.run_function(env, tool_call.function, tool_call.args)
+            finally:
+                FUNCTION_CALL_ID.reset(call_id_token)
             tool_call_id = tool_call.id
             formatted_tool_call_result = self.output_formatter(tool_call_result)
             tool_call_results.append(

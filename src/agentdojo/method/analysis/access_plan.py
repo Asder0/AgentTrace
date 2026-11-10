@@ -5,8 +5,9 @@ from __future__ import annotations
 import datetime
 import re
 import types
+from collections.abc import Mapping
 from enum import Enum
-from typing import Any, Mapping, Union, get_args, get_origin
+from typing import Any, Union, get_args, get_origin
 
 from pydantic import BaseModel
 
@@ -19,9 +20,7 @@ ALLOWED_DECISIONS = {
     "HIDE_ALL",
 }
 
-LOW_CONFIDENCE_THRESHOLD = float(
-    security_thresholds().get("field_plan_min_confidence", 0.55)
-)
+LOW_CONFIDENCE_THRESHOLD = float(security_thresholds().get("field_plan_min_confidence", 0.55))
 
 
 def semantic_type_for_annotation(annotation: Any) -> str:
@@ -82,7 +81,7 @@ def schema_for_type(annotation: Any) -> dict[str, Any]:
                         default
                         if isinstance(
                             default,
-                            (str, int, float, bool, type(None)),
+                            str | int | float | bool | type(None),
                         )
                         else str(default)
                     )
@@ -218,9 +217,7 @@ def validate_access_plan(
     subgoal_id = str(plan.get("subgoal_id", "") or "")
     confidence = plan.get("confidence")
     try:
-        confidence_value = (
-            float(confidence) if confidence is not None else None
-        )
+        confidence_value = float(confidence) if confidence is not None else None
     except (TypeError, ValueError):
         confidence_value = None
         warnings.append("invalid_confidence")
@@ -242,10 +239,7 @@ def validate_access_plan(
             decision = "OPAQUE_ONLY"
             opaque = list(visible) or ["$"]
             visible = []
-        elif (
-            confidence_value is not None
-            and confidence_value < LOW_CONFIDENCE_THRESHOLD
-        ):
+        elif confidence_value is not None and confidence_value < LOW_CONFIDENCE_THRESHOLD:
             warnings.append("low_confidence_opaque_only")
             decision = "OPAQUE_ONLY"
             opaque = list(visible) or ["$"]
@@ -283,9 +277,7 @@ def _actual_to_plan_path(path: str) -> str:
 
 
 def _is_descendant(path: str, parent: str) -> bool:
-    return path == parent or path.startswith(f"{parent}.") or path.startswith(
-        f"{parent}["
-    )
+    return path == parent or path.startswith(f"{parent}.") or path.startswith(f"{parent}[")
 
 
 def actual_path_for_projection(path: str) -> str:
@@ -312,24 +304,14 @@ def classify_projection_path(
     if not isinstance(plan, Mapping):
         return "visible"
     projection_path = actual_path_for_projection(path)
-    hidden = {
-        str(item) for item in plan.get("hidden_fields", []) if item
-    }
-    opaque = {
-        str(item) for item in plan.get("opaque_fields", []) if item
-    }
-    visible = {
-        str(item) for item in plan.get("visible_fields", []) if item
-    }
+    hidden = {str(item) for item in plan.get("hidden_fields", []) if item}
+    opaque = {str(item) for item in plan.get("opaque_fields", []) if item}
+    visible = {str(item) for item in plan.get("visible_fields", []) if item}
     decision = str(plan.get("decision", "PROJECT")).upper()
 
-    if projection_path == "$" or any(
-        _is_descendant(projection_path, ref) for ref in hidden
-    ):
+    if projection_path == "$" or any(_is_descendant(projection_path, ref) for ref in hidden):
         return "withheld"
-    if any(
-        _is_descendant(projection_path, ref) for ref in opaque
-    ):
+    if any(_is_descendant(projection_path, ref) for ref in opaque):
         return "opaque"
     if decision == "HIDE_ALL":
         return "withheld"
@@ -337,11 +319,7 @@ def classify_projection_path(
         return "visible"
     if decision == "OPAQUE_ONLY":
         return "withheld"
-    if any(
-        _is_descendant(projection_path, ref)
-        or _is_descendant(ref, projection_path)
-        for ref in visible
-    ):
+    if any(_is_descendant(projection_path, ref) or _is_descendant(ref, projection_path) for ref in visible):
         return "visible"
     return "withheld"
 
@@ -384,10 +362,7 @@ def project_with_plan(
 
     def matches_hidden(actual_path: str, plan_path: str) -> bool:
         return any(
-            actual_path == ref
-            or _is_descendant(actual_path, ref)
-            or _is_descendant(plan_path, ref)
-            for ref in hidden
+            actual_path == ref or _is_descendant(actual_path, ref) or _is_descendant(plan_path, ref) for ref in hidden
         )
 
     def walk(item: Any, path: str, *, in_object: bool = False) -> Any:
@@ -409,14 +384,10 @@ def project_with_plan(
                     child_plan_path,
                 )
                 explicitly_visible = any(
-                    _is_descendant(child_plan_path, ref)
-                    or _is_descendant(ref, child_plan_path)
-                    for ref in visible
+                    _is_descendant(child_plan_path, ref) or _is_descendant(ref, child_plan_path) for ref in visible
                 )
                 should_visit_child = explicitly_visible or any(
-                    ref.startswith(f"{child_plan_path}.")
-                    or ref.startswith(f"{child_plan_path}[")
-                    for ref in visible
+                    ref.startswith(f"{child_plan_path}.") or ref.startswith(f"{child_plan_path}[") for ref in visible
                 )
                 if decision == "HIDE_ALL":
                     projected[key] = "[HIDDEN]"
@@ -425,10 +396,7 @@ def project_with_plan(
                     projected[key] = f"[HIDDEN:{key}]"
                     hidden_paths.append(child_path)
                 elif decision == "OPAQUE_ONLY":
-                    if include_opaque_values and any(
-                        _is_descendant(child_plan_path, ref)
-                        for ref in opaque
-                    ):
+                    if include_opaque_values and any(_is_descendant(child_plan_path, ref) for ref in opaque):
                         projected[key] = walk(child, child_path)
                     else:
                         projected[key] = f"[HIDDEN:{key}]"
@@ -438,11 +406,7 @@ def project_with_plan(
                 elif should_visit_child:
                     projected[key] = walk(child, child_path)
                 elif child_plan_path in opaque:
-                    projected[key] = (
-                        walk(child, child_path)
-                        if include_opaque_values
-                        else {"$ref": child_path}
-                    )
+                    projected[key] = walk(child, child_path) if include_opaque_values else {"$ref": child_path}
                     opaque_paths.append(child_path)
                 else:
                     projected[key] = f"[HIDDEN:{key}]"
@@ -450,17 +414,9 @@ def project_with_plan(
             return projected
 
         if isinstance(item, list):
-            return [
-                walk(child, f"{path}[{index}]")
-                for index, child in enumerate(item)
-            ]
-        scalar_visible = (
-            "$" in visible
-            or any(
-                _is_descendant(plan_path, ref)
-                or _is_descendant(ref, plan_path)
-                for ref in visible
-            )
+            return [walk(child, f"{path}[{index}]") for index, child in enumerate(item)]
+        scalar_visible = "$" in visible or any(
+            _is_descendant(plan_path, ref) or _is_descendant(ref, plan_path) for ref in visible
         )
         if not scalar_visible:
             hidden_paths.append(path)

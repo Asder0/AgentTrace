@@ -13,11 +13,13 @@ from pathlib import Path
 DEFAULT_INJECTION_MODEL_ID = "Unplug-AI/unplug-tiny-v1"
 DEFAULT_INJECTION_MODEL_DIRNAME = "unplug-tiny-v1"
 INJECTION_MODEL_PATH_ENV = "AGENTDOJO_PI_MODEL_PATH"
+DIRECT_INJECTION_MODEL_ID = "deberta-v3-base-prompt-injection-v2"
+DIRECT_INJECTION_MODEL_DIRNAME = "deberta-v3-base-prompt-injection-v2"
+DIRECT_INJECTION_MODEL_PATH_ENV = "AGENTDOJO_DIRECT_PI_MODEL_PATH"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_INJECTION_MODEL_DIR = (
-    PROJECT_ROOT / "models" / DEFAULT_INJECTION_MODEL_DIRNAME
-)
+DEFAULT_INJECTION_MODEL_DIR = PROJECT_ROOT / "models" / DEFAULT_INJECTION_MODEL_DIRNAME
+DIRECT_INJECTION_MODEL_DIR = PROJECT_ROOT / "models" / DIRECT_INJECTION_MODEL_DIRNAME
 
 
 def missing_injection_model_files(model_dir: Path) -> list[str]:
@@ -27,9 +29,7 @@ def missing_injection_model_files(model_dir: Path) -> list[str]:
         return [str(model_dir)]
     if not (model_dir / "config.json").is_file():
         missing.append("config.json")
-    if not any(model_dir.glob("*.safetensors")) and not any(
-        model_dir.glob("pytorch_model*.bin")
-    ):
+    if not any(model_dir.glob("*.safetensors")) and not any(model_dir.glob("pytorch_model*.bin")):
         missing.append("model weights (*.safetensors or pytorch_model*.bin)")
     if not (
         (model_dir / "tokenizer.json").is_file()
@@ -58,9 +58,7 @@ def resolve_injection_model_path(model_path: str | Path | None = None) -> Path:
     requested = configured or (str(model_path).strip() if model_path else "")
     if requested:
         candidate = (
-            DEFAULT_INJECTION_MODEL_DIR
-            if requested == DEFAULT_INJECTION_MODEL_ID
-            else Path(requested).expanduser()
+            DEFAULT_INJECTION_MODEL_DIR if requested == DEFAULT_INJECTION_MODEL_ID else Path(requested).expanduser()
         )
     else:
         candidate = DEFAULT_INJECTION_MODEL_DIR
@@ -73,5 +71,29 @@ def resolve_injection_model_path(model_path: str | Path | None = None) -> Path:
             f"Missing or incomplete model directory: {resolved}. "
             f"Missing: {', '.join(missing)}. "
             f"Place the model assets there or set {INJECTION_MODEL_PATH_ENV}."
+        )
+    return resolved
+
+
+def resolve_direct_injection_model_path(
+    model_path: str | Path | None = None,
+) -> Path:
+    """Resolve the direct-prompt classifier from local files only."""
+    configured = os.getenv(DIRECT_INJECTION_MODEL_PATH_ENV, "").strip()
+    requested = configured or (str(model_path).strip() if model_path else "")
+    if requested:
+        candidate = (
+            DIRECT_INJECTION_MODEL_DIR if requested == DIRECT_INJECTION_MODEL_ID else Path(requested).expanduser()
+        )
+    else:
+        candidate = DIRECT_INJECTION_MODEL_DIR
+    resolved = candidate.resolve()
+    missing = missing_injection_model_files(resolved)
+    if missing:
+        raise FileNotFoundError(
+            "Direct prompt-injection detector must be loaded from local "
+            f"files. Missing or incomplete model directory: {resolved}. "
+            f"Missing: {', '.join(missing)}. Place the model assets there "
+            f"or set {DIRECT_INJECTION_MODEL_PATH_ENV}."
         )
     return resolved

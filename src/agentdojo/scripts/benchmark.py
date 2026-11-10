@@ -112,14 +112,6 @@ def show_results(suite_name: str, results: SuiteResults, show_security_results: 
     type=str,  # 将 click.Choice 替换为 str，允许直接输入任意小写模型名称
     help="The language model to benchmark. Defaults to `deepseek-flash`.",
 )
-
-# @click.option(
-#     "--model",
-#     default="gpt-4o-2024-05-13",
-#     type=click.Choice([value for value in ModelsEnum]),
-#     help="The language model to benchmark. Defaults to `gpt-4o-2024-05-13`.",
-# )
-
 @click.option(
     "--model-id",
     type=str,

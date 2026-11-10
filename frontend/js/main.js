@@ -1135,7 +1135,11 @@ const APP = {
             riskCards.length,
             events.length
         );
-        STATUS_PANEL.setGraphStats(nodeCount, edgeCount);
+        const displayedStats = GRAPH.getDisplayedStats();
+        STATUS_PANEL.setGraphStats(
+            displayedStats.nodes,
+            displayedStats.relations,
+        );
         Store.set('lastNodeCount', nodeCount);
         Store.set('lastEdgeCount', edgeCount);
 
@@ -1207,28 +1211,290 @@ const APP = {
             const labels = window.AgentTraceRiskLabels;
             return labels ? labels.normalizeCard(card) : card;
         };
+        const events = Array.isArray(trace.events) ? trace.events : [];
+        const graphNodes = Array.isArray(trace.graph?.nodes)
+            ? trace.graph.nodes
+            : [];
+        const authorizationNodes = graphNodes.filter(
+            node => node?.type === 'HumanAuthorization'
+        );
+        const eventByRiskId = new Map();
+        const registerRisk = (event, risk) => {
+            const riskId = String(
+                risk?.risk_id || risk?.event_id || ''
+            );
+            if (riskId && !eventByRiskId.has(riskId)) {
+                eventByRiskId.set(riskId, { event, risk });
+            }
+        };
+        events.forEach((event) => {
+            ['risk_assessments', 'risks', 'policy_events'].forEach(
+                (key) => {
+                    const values = Array.isArray(event[key])
+                        ? event[key]
+                        : [];
+                    values.forEach(
+                        risk => registerRisk(event, risk)
+                    );
+                }
+            );
+        });
+        const enrichReplayCard = (rawCard) => {
+            const card = { ...rawCard };
+            const riskId = String(
+                card.risk_id || card.event_id || ''
+            );
+            const linked = eventByRiskId.get(riskId);
+            if (linked) {
+                const event = linked.event;
+                const linkedRisk = linked.risk || {};
+                card.agent = card.agent
+                    || linkedRisk.agent_id
+                    || event.agent_id
+                    || trace.agent_id
+                    || 'unknown';
+                card.activity_id = (
+                    card.activity_id
+                    || linkedRisk.activity_id
+                    || event.activity_id
+                    || ''
+                );
+                const sensitivePhase = (
+                    card.policy_id
+                    === 'ring2.sensitive_data_exposure_confirmation'
+                );
+                const authorizationKind = sensitivePhase
+                    ? 'sensitive_data_exposure'
+                    : 'l2_action';
+                const matchingAuthorizations = authorizationNodes.filter(
+                    node => (
+                        String(node.tool_name || '') === String(
+                            card.action || event.tool_intent || ''
+                        )
+                        && String(
+                            node.confirmation_kind || ''
+                        ) === authorizationKind
+                    )
+                );
+                const authorization = sensitivePhase
+                    ? (
+                        card.phase
+                        === 'post_execution_runtime_detection'
+                        || card.fsm_before === 'OUTPUT_OBSERVED'
+                            ? matchingAuthorizations[
+                                matchingAuthorizations.length - 1
+                            ]
+                            : matchingAuthorizations[0]
+                    )
+                    : matchingAuthorizations[0];
+                const confirmation = (
+                    event.l2_confirmation
+                    && typeof event.l2_confirmation === 'object'
+                ) ? event.l2_confirmation : {};
+                const status = String(
+                    authorization?.status
+                    || confirmation.status
+                    || ''
+                );
+                if (status) {
+                    const approved = (
+                        status === 'approved'
+                        || authorization?.approved === true
+                        || confirmation.approved === true
+                    );
+                    const rejected = (
+                        status === 'rejected'
+                        || authorization?.approved === false
+                        || confirmation.approved === false
+                    );
+                    card.confirmation_state = status;
+                    card.approval_source = (
+                        authorization?.approval_source
+                        || confirmation.approval_source
+                        || confirmation.decision?.source
+                        || ''
+                    );
+                    card.request_id = (
+                        authorization?.request_id
+                        || confirmation.request_id
+                        || ''
+                    );
+                    card.user_decision_label = approved
+                        ? (
+                            card.approval_source === 'automatic_default'
+                                ? '已自动同意'
+                                : '已批准'
+                        )
+                        : rejected
+                            ? '已拒绝'
+                            : '等待确认';
+                    card.defense_action = approved
+                        ? (
+                            card.approval_source === 'automatic_default'
+                                ? '已按默认策略确认并继续'
+                                : '已授权并继续'
+                        )
+                        : rejected
+                            ? '已拒绝并阻断'
+                            : '等待确认';
+                }
+                card.graph_focus = card.graph_focus || {
+                    risk_node_id: riskId,
+                    activity_node_id: card.activity_id,
+                    authorization_node_id: card.request_id
+                        ? `HumanAuthorization_${card.request_id}`
+                        : '',
+                    evidence_entity_ids: card.evidence_entity_ids || [],
+                    source_ids: card.source_ids || [],
+                    sink_ids: card.sink_ids || [],
+                    action: card.action || event.tool_intent || '',
+                    app: card.app || event.target_app || '',
+                };
+                if (
+                    card.policy_id
+                    === 'ring2.sensitive_data_exposure_confirmation'
+                ) {
+                    const runtimePhase = (
+                        card.phase
+                        === 'post_execution_runtime_detection'
+                        || card.fsm_before === 'OUTPUT_OBSERVED'
+                    );
+                    const action = card.action || '当前操作';
+                    const exposure = runtimePhase
+                        ? (
+                            confirmation.chain_check
+                            && confirmation.chain_check.exposure_check
+                        )
+                        : (
+                            event.ring2_check
+                            && event.ring2_check.exposure_check
+                        );
+                    const exposureData = (
+                        exposure && typeof exposure === 'object'
+                    ) ? exposure : {};
+                    const fields = Array.isArray(
+                        exposureData.inspection_fields
+                    )
+                        ? exposureData.inspection_fields
+                        : (
+                            Array.isArray(linkedRisk.exposure_fields)
+                                ? linkedRisk.exposure_fields
+                                : []
+                        );
+                    const fieldPolicies = (
+                        exposureData.field_policies
+                        && typeof exposureData.field_policies === 'object'
+                    ) ? exposureData.field_policies : {};
+                    const hiddenFields = Array.isArray(
+                        fieldPolicies.hidden
+                    ) ? fieldPolicies.hidden : [];
+                    const categories = [...new Set(
+                        fields.flatMap((field) => {
+                            const policy = fieldPolicies[field];
+                            return Array.isArray(policy?.categories)
+                                ? policy.categories
+                                : [];
+                        })
+                    )];
+                    const previousLevel = (
+                        exposureData.previous_max_exposure_level
+                        || 'confidential'
+                    );
+                    const currentLevel = (
+                        exposureData.max_exposure_level
+                        || 'secret'
+                    );
+                    const fieldText = fields.join('、') || '未声明字段';
+                    const hiddenText = hiddenFields.join('、');
+                    const categoryText = categories.length
+                        ? categories.join('、')
+                        : '敏感内容';
+                    const actionText = action === 'read_inbox'
+                        ? `“read_inbox”读取 ${
+                            event.inputs?.user
+                                ? `${event.inputs.user} 的 `
+                                : ''
+                        }Slack 私信`
+                        : `“${action}”`;
+                    card.user_view = {
+                        ...(card.user_view || {}),
+                        content: runtimePhase
+                            ? `${actionText}；实际检测字段：${fieldText}；最高等级：${currentLevel}。`
+                            : `${actionText}；计划暴露字段：${fieldText}；计划上限：${currentLevel}。`,
+                        reason: runtimePhase
+                            ? `读取后检测：${fieldText} 含 ${categoryText}，等级由 ${previousLevel} 升至 ${currentLevel}，超过原计划上限。`
+                            : `读取前检查：待暴露字段为 ${fieldText}，计划上限 ${currentLevel}${
+                                hiddenText ? `；${hiddenText} 对 Agent 隐藏` : ''
+                            }。`,
+                    };
+                }
+                if (
+                    card.policy_id === 'ring2.l2_confirmation'
+                    && !card.user_view?.reason
+                ) {
+                    const inputs = (
+                        event.inputs
+                        && typeof event.inputs === 'object'
+                    ) ? event.inputs : {};
+                    const action = card.action || event.tool_intent || 'unknown';
+                    let content = '';
+                    if (action === 'send_money') {
+                        content = [
+                            `send_money 转账金额 ${inputs.amount ?? '-'}`,
+                            `收款方 ${inputs.recipient ?? '-'}`,
+                            inputs.subject ? `主题 ${inputs.subject}` : '',
+                            inputs.date ? `日期 ${inputs.date}` : '',
+                        ].filter(Boolean).join('，') + '。';
+                    } else if (action === 'send_direct_message') {
+                        content = (
+                            `send_direct_message 向 ${inputs.recipient ?? '-'} `
+                            + `发送私信“${inputs.body ?? inputs.message ?? ''}”。`
+                        );
+                    } else {
+                        content = `${action} 属于计划内 L2 操作。`;
+                    }
+                    card.user_view = {
+                        ...(card.user_view || {}),
+                        content,
+                        reason: action === 'send_money'
+                            ? '该转账会写入银行交易记录，属于 L2 写操作。'
+                            : action === 'send_direct_message'
+                                ? '该操作会向外部接收方发送内容，属于 L2 外发。'
+                                : '该操作会改变外部状态，属于 L2 操作。',
+                    };
+                }
+            }
+            return normalizeRisk(card);
+        };
         const savedRisks = Array.isArray(trace.risk_cards)
-            ? trace.risk_cards.map(normalizeRisk)
+            ? trace.risk_cards.map(enrichReplayCard)
             : [];
         const savedPolicies = Array.isArray(trace.policy_events)
             ? trace.policy_events.map(event => ({
                 ...event,
+                risk_id: event.risk_id || event.event_id,
                 event_kind: 'policy',
                 title: event.title || `Ring ${event.ring || '?'}: 策略事件`,
+                action: event.action
+                    || event.tool_intent
+                    || 'unknown',
+                app: event.app || event.target_app || 'system',
                 defense_detail: event.detail || event.reason || '策略事件',
-            })).map(normalizeRisk)
+            })).map(enrichReplayCard)
             : [];
         if (savedRisks.length > 0 || savedPolicies.length > 0) {
-            return [...savedRisks, ...savedPolicies];
+            return RISK_PANEL.dedupeCards([
+                ...savedRisks,
+                ...savedPolicies,
+            ]);
         }
 
-        const events = Array.isArray(trace.events) ? trace.events : [];
         const riskEvents = events.filter(
             e => e && ['risk', 'policy'].includes(e.type)
         );
         if (riskEvents.length === 0) return [];
 
-        return riskEvents.flatMap((event) => {
+        return RISK_PANEL.dedupeCards(riskEvents.flatMap((event) => {
             const detail = event.block_reason || event.content || '检测到风险事件';
             const suite = this._resolveTraceSuite(trace);
             const risks = Array.isArray(event.risks) && event.risks.length
@@ -1254,7 +1520,7 @@ const APP = {
                 action: event.tool_intent || 'unknown',
                 app: this._canonicalAppName(event.target_app, suite) || 'unknown',
             }));
-        });
+        }));
     },
 
     /**

@@ -10,18 +10,21 @@ messages back to `system` role before sending to DeepSeek API.
 
 from collections.abc import Sequence
 
-import openai
 from openai.types.chat import (
     ChatCompletionAssistantMessageParam,
     ChatCompletionContentPartTextParam,
-    ChatCompletionDeveloperMessageParam,
     ChatCompletionMessageParam,
     ChatCompletionSystemMessageParam,
     ChatCompletionToolMessageParam,
     ChatCompletionUserMessageParam,
 )
 
-from agentdojo.agent_pipeline.llms.openai_llm import OpenAILLM, _function_to_openai, _message_to_openai, _openai_to_assistant_message, chat_completion_request
+from agentdojo.agent_pipeline.llms.openai_llm import (
+    OpenAILLM,
+    _function_to_openai,
+    _openai_to_assistant_message,
+    chat_completion_request,
+)
 from agentdojo.functions_runtime import EmptyEnv, Env, FunctionsRuntime
 from agentdojo.types import ChatMessage
 
@@ -43,7 +46,6 @@ def _message_to_deepseek(message: ChatMessage, model_name: str) -> ChatCompletio
                 role="user", content=_content_blocks_to_openai_content_blocks(message)
             )
         case "assistant":
-            from openai.types.chat import ChatCompletionMessageToolCallParam
             if message["tool_calls"] is not None and len(message["tool_calls"]) > 0:
                 from agentdojo.agent_pipeline.llms.openai_llm import _tool_call_to_openai
                 tool_calls = [_tool_call_to_openai(tool_call) for tool_call in message["tool_calls"]]

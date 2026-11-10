@@ -97,6 +97,11 @@
       "risk_level": "L1",
       "confidentiality": "internal"
     },
+    "resource_mutation": {
+      "effect": "write",
+      "risk_level": "L2",
+      "confidentiality": "internal"
+    },
     "privilege": {
       "effect": "privilege",
       "risk_level": "L2",
@@ -119,6 +124,7 @@
       "control_fields": ["event_id", "participants"],
       "resource_fields": ["event_id"],
       "destination_fields": ["participants"],
+      "semantic_types": {"event_id": "calendar_event_id"},
       "implicit_egress": [
         {
           "resource_path": "calendar.events",
@@ -141,19 +147,22 @@
       "profile": "egress_internal",
       "control_fields": ["channel", "user"],
       "resource_fields": ["channel"],
-      "destination_fields": ["channel", "user"]
+      "destination_fields": ["channel", "user"],
+      "semantic_types": {"channel": "slack_channel"}
     },
     "append_to_file": {
       "profile": "write_internal",
       "control_fields": ["file_id"],
       "resource_fields": ["file_id"],
-      "content_fields": ["content"]
+      "content_fields": ["content"],
+      "semantic_types": {"file_id": "workspace_file_id"}
     },
     "cancel_calendar_event": {
       "profile": "egress_internal",
       "control_fields": ["event_id"],
       "resource_fields": ["event_id"],
       "destination_fields": ["event_id"],
+      "semantic_types": {"event_id": "calendar_event_id"},
       "implicit_egress": [
         {
           "resource_path": "calendar.events",
@@ -174,7 +183,9 @@
     "check_restaurant_opening_hours": {
       "profile": "read_public",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["restaurant_names"],
+      "semantic_types": {"restaurant_names": "restaurant_name"}
     },
     "create_calendar_event": {
       "profile": "egress_internal",
@@ -190,31 +201,40 @@
       "profile": "write_internal",
       "control_fields": ["filename"],
       "resource_fields": ["filename"],
-      "content_fields": ["content"]
+      "content_fields": ["content"],
+      "semantic_types": {"filename": "filename"}
     },
     "delete_email": {
       "profile": "write_internal",
       "risk_level": "L2",
       "control_fields": ["email_id"],
-      "resource_fields": ["email_id"]
+      "resource_fields": ["email_id"],
+      "semantic_types": {"email_id": "email_id"}
     },
     "delete_file": {
       "profile": "write_internal",
       "risk_level": "L2",
       "control_fields": ["file_id"],
-      "resource_fields": ["file_id"]
+      "resource_fields": ["file_id"],
+      "semantic_types": {"file_id": "workspace_file_id"}
     },
     "get_all_car_rental_companies_in_city": {
       "profile": "read_internal",
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["city"],
+      "semantic_types": {"city": "city"}
     },
     "get_all_hotels_in_city": {
       "profile": "read_internal",
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["city"],
+      "semantic_types": {"city": "city"}
     },
     "get_all_restaurants_in_city": {
       "profile": "read_internal",
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["city"],
+      "semantic_types": {"city": "city"}
     },
     "get_balance": {
       "profile": "read_secret",
@@ -242,17 +262,21 @@
     },
     "get_channels": {
       "profile": "read_internal",
-      "output_semantic_types": {"$[*]": "identifier"}
+      "output_semantic_types": {"$[*]": "slack_channel"}
     },
     "get_contact_information_for_restaurants": {
       "profile": "read_internal",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["restaurant_names"],
+      "semantic_types": {"restaurant_names": "restaurant_name"}
     },
     "get_cuisine_type_for_restaurants": {
       "profile": "read_public",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["restaurant_names"],
+      "semantic_types": {"restaurant_names": "restaurant_name"}
     },
     "get_current_day": {"profile": "read_public"},
     "get_day_calendar_events": {
@@ -263,7 +287,9 @@
     "get_dietary_restrictions_for_all_restaurants": {
       "profile": "read_public",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["restaurant_names"],
+      "semantic_types": {"restaurant_names": "restaurant_name"}
     },
     "get_draft_emails": {
       "profile": "read_internal",
@@ -272,18 +298,23 @@
     "get_file_by_id": {
       "profile": "read_confidential",
       "resource_fields": ["file_id"],
-      "categories": ["file"]
+      "categories": ["file"],
+      "semantic_types": {"file_id": "workspace_file_id"}
     },
     "get_flight_information": {"profile": "read_internal"},
     "get_hotels_address": {
       "profile": "read_internal",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["hotel_name"],
+      "semantic_types": {"hotel_name": "hotel_name"}
     },
     "get_hotels_prices": {
       "profile": "read_internal",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["hotel_names"],
+      "semantic_types": {"hotel_names": "hotel_name"}
     },
     "get_iban": {
       "profile": "read_secret",
@@ -296,7 +327,9 @@
     "get_price_for_restaurants": {
       "profile": "read_public",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["restaurant_names"],
+      "semantic_types": {"restaurant_names": "restaurant_name"}
     },
     "get_rating_reviews_for_car_rental": {
       "profile": "read_public",
@@ -306,12 +339,16 @@
     "get_rating_reviews_for_hotels": {
       "profile": "read_public",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["hotel_names"],
+      "semantic_types": {"hotel_names": "hotel_name"}
     },
     "get_rating_reviews_for_restaurants": {
       "profile": "read_public",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["restaurant_names"],
+      "semantic_types": {"restaurant_names": "restaurant_name"}
     },
     "get_received_emails": {
       "profile": "read_internal",
@@ -320,7 +357,9 @@
     "get_restaurants_address": {
       "profile": "read_internal",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["restaurant_names"],
+      "semantic_types": {"restaurant_names": "restaurant_name"}
     },
     "get_scheduled_transactions": {
       "profile": "read_secret",
@@ -343,17 +382,20 @@
       "profile": "read_confidential",
       "resource_fields": ["channel"],
       "categories": ["personal_name"],
-      "output_semantic_types": {"$[*]": "identifier"}
+      "semantic_types": {"channel": "slack_channel"},
+      "output_semantic_types": {"$[*]": "slack_user"}
     },
     "get_webpage": {
       "profile": "read_internal",
-      "resource_fields": ["url"]
+      "resource_fields": ["url"],
+      "semantic_types": {"url": "url"}
     },
     "invite_user_to_slack": {
       "profile": "egress_internal",
       "control_fields": ["user", "user_email"],
       "resource_fields": ["user_email"],
-      "destination_fields": ["user", "user_email"]
+      "destination_fields": ["user", "user_email"],
+      "semantic_types": {"user_email": "email"}
     },
     "list_files": {
       "profile": "read_confidential",
@@ -367,21 +409,26 @@
     },
     "read_channel_messages": {
       "profile": "read_internal",
-      "resource_fields": ["channel"]
+      "resource_fields": ["channel"],
+      "semantic_types": {"channel": "slack_channel"}
     },
     "read_file": {
       "profile": "read_confidential",
       "resource_fields": ["file_path"],
-      "categories": ["file"]
+      "categories": ["file"],
+      "semantic_types": {"file_path": "file_path"}
     },
     "read_inbox": {
       "profile": "read_internal",
-      "resource_fields": ["user"]
+      "resource_fields": ["user"],
+      "parameter_roles": {"user": "identity"},
+      "semantic_types": {"user": "slack_user"}
     },
     "remove_user_from_slack": {
       "profile": "privilege",
       "control_fields": ["user"],
-      "resource_fields": ["user"]
+      "resource_fields": ["user"],
+      "semantic_types": {"user": "slack_user"}
     },
     "reschedule_calendar_event": {
       "profile": "egress_internal",
@@ -405,33 +452,42 @@
         }
       ],
       "semantic_types": {
+        "event_id": "calendar_event_id",
         "new_start_time": "datetime",
         "new_end_time": "datetime"
       }
     },
     "reserve_car_rental": {
-      "profile": "egress_internal",
+      "profile": "resource_mutation",
       "control_fields": ["company", "start_time", "end_time"],
+      "resource_fields": ["company"],
       "destination_fields": ["company"],
       "semantic_types": {
+        "company": "company_name",
         "start_time": "datetime",
         "end_time": "datetime"
       }
     },
     "reserve_hotel": {
-      "profile": "egress_internal",
+      "profile": "resource_mutation",
       "control_fields": ["hotel", "start_day", "end_day"],
+      "resource_fields": ["hotel", "start_day", "end_day"],
       "destination_fields": ["hotel"],
       "semantic_types": {
+        "hotel": "hotel_name",
         "start_day": "date",
         "end_day": "date"
       }
     },
     "reserve_restaurant": {
-      "profile": "egress_internal",
+      "profile": "resource_mutation",
       "control_fields": ["restaurant", "start_time"],
+      "resource_fields": ["restaurant", "start_time"],
       "destination_fields": ["restaurant"],
-      "semantic_types": {"start_time": "datetime"}
+      "semantic_types": {
+        "restaurant": "restaurant_name",
+        "start_time": "datetime"
+      }
     },
     "schedule_transaction": {
       "profile": "egress_secret",
@@ -468,23 +524,29 @@
     },
     "search_files": {
       "profile": "read_confidential",
-      "categories": ["file"]
+      "categories": ["file"],
+      "resource_fields": ["query"],
+      "semantic_types": {"query": "file_search_query"}
     },
     "search_files_by_filename": {
       "profile": "read_confidential",
-      "categories": ["file"]
+      "categories": ["file"],
+      "resource_fields": ["filename"],
+      "semantic_types": {"filename": "filename"}
     },
     "send_channel_message": {
       "profile": "egress_internal",
       "control_fields": ["channel"],
       "destination_fields": ["channel"],
-      "content_fields": ["body"]
+      "content_fields": ["body"],
+      "semantic_types": {"channel": "slack_channel"}
     },
     "send_direct_message": {
       "profile": "egress_internal",
       "control_fields": ["recipient"],
       "destination_fields": ["recipient"],
-      "content_fields": ["body"]
+      "content_fields": ["body"],
+      "semantic_types": {"recipient": "slack_user"}
     },
     "send_email": {
       "profile": "egress_internal",
@@ -545,6 +607,10 @@
       "control_fields": ["file_id", "email", "permission"],
       "resource_fields": ["file_id"],
       "destination_fields": ["email"],
+      "semantic_types": {
+        "file_id": "workspace_file_id",
+        "email": "email"
+      },
       "implicit_egress": [
         {
           "resource_path": "cloud_drive.files",
@@ -560,8 +626,7 @@
             "last_modified"
           ]
         }
-      ],
-      "semantic_types": {"email": "email"}
+      ]
     },
     "update_password": {
       "profile": "privilege",
@@ -590,6 +655,7 @@
         }
       ],
       "semantic_types": {
+        "id": "transaction_id",
         "amount": "number",
         "date": "date"
       },

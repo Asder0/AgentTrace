@@ -48,6 +48,29 @@ NON_LANGUAGE_CATEGORIES = {
 }
 
 
+def _should_scan(text: Any) -> bool:
+    """Return whether a string leaf can carry natural-language instructions."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    value = text.strip()
+    if not re.search(r"[A-Za-z\u4e00-\u9fff]", value):
+        return False
+    if re.search(
+        r"ignore[_ -]+(?:all[_ -]+)?previous|"
+        r"忽略(?:之前|以上|所有)",
+        value,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"https?://|www\.", value, re.IGNORECASE):
+        return True
+    machine_identifier = re.fullmatch(
+        r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)+",
+        value,
+    )
+    return machine_identifier is None
+
+
 def _normalise_scan_path(path: str) -> str:
     return re.sub(r"\[\d+\]", "[*]", str(path or "$"))
 
@@ -59,17 +82,12 @@ def _machine_field_paths(
     result: set[str] = set()
     schema_type = str(schema.get("type", ""))
     semantic_type = str(schema.get("semantic_type", ""))
-    if (
-        schema_type in MACHINE_FIELD_TYPES
-        or semantic_type in MACHINE_FIELD_TYPES
-    ):
+    if schema_type in MACHINE_FIELD_TYPES or semantic_type in MACHINE_FIELD_TYPES:
         result.add(_normalise_scan_path(prefix))
     if schema_type == "array":
         items = schema.get("items")
         if isinstance(items, Mapping):
-            result.update(
-                _machine_field_paths(items, f"{prefix}[*]")
-            )
+            result.update(_machine_field_paths(items, f"{prefix}[*]"))
     elif schema_type == "object":
         fields = schema.get("fields")
         if isinstance(fields, Mapping):
@@ -93,6 +111,12 @@ class ToolOutputScan:
     source_flagged: bool = False
     max_score: float = 0.0
     detector: str = ""
+    primary_detector: str = ""
+    fallback_detector: str = ""
+    fallback_available: bool = False
+    fallback_executed: bool = False
+    coverage_scope: str = "primary_only"
+    coverage_complete: bool = True
     available: bool = True
     incomplete: bool = False
     field_statuses: dict[str, str] = field(default_factory=dict)
@@ -102,6 +126,7 @@ class ToolOutputScan:
     unscanned_fields: list[str] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
     chunk_evidence: list[dict[str, Any]] = field(default_factory=list)
+    field_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
     quarantine_metrics: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
@@ -111,9 +136,7 @@ class ToolOutputScan:
 
     def information_flow(self) -> dict[str, Any]:
         return make_injection(
-            source_flagged=bool(
-                self.risky_entities or self.quarantined_fields
-            ),
+            source_flagged=bool(self.risky_entities or self.quarantined_fields),
             max_score=self.max_score,
             detector=self.detector,
             field_statuses=self.field_statuses,
@@ -124,6 +147,12 @@ class ToolOutputScan:
             unscanned_fields=self.unscanned_fields,
             risky_entities=self.risky_entities,
             incomplete=self.incomplete,
+            primary_detector=self.primary_detector,
+            fallback_detector=self.fallback_detector,
+            fallback_available=self.fallback_available,
+            fallback_executed=self.fallback_executed,
+            coverage_scope=self.coverage_scope,
+            coverage_complete=self.coverage_complete,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -131,6 +160,12 @@ class ToolOutputScan:
             "source_flagged": self.source_flagged,
             "max_score": round(self.max_score, 6),
             "detector": self.detector,
+            "primary_detector": self.primary_detector,
+            "fallback_detector": self.fallback_detector,
+            "fallback_available": self.fallback_available,
+            "fallback_executed": self.fallback_executed,
+            "coverage_scope": self.coverage_scope,
+            "coverage_complete": self.coverage_complete,
             "available": self.available,
             "incomplete": self.incomplete,
             "field_statuses": dict(self.field_statuses),
@@ -140,6 +175,7 @@ class ToolOutputScan:
             "unscanned_fields": list(self.unscanned_fields),
             "evidence_refs": list(self.evidence_refs),
             "chunk_evidence": list(self.chunk_evidence),
+            "field_metrics": {str(path): dict(metrics) for path, metrics in self.field_metrics.items()},
             "quarantine_metrics": dict(self.quarantine_metrics),
             "errors": list(self.errors),
         }
@@ -249,33 +285,28 @@ def scan_tool_output(
     entity: str = "",
 ) -> ToolOutputScan:
     """Scan only natural-language leaves and replace suspicious chunks."""
-    result = ToolOutputScan(sanitized_value=copy.deepcopy(value))
+    result = ToolOutputScan(
+        sanitized_value=copy.deepcopy(value),
+        primary_detector=str(getattr(scanner, "detector_name", "")),
+        fallback_detector=str(getattr(scanner, "fallback_detector_name", "")),
+        fallback_available=bool(getattr(scanner, "fallback_available", False)),
+        coverage_scope=str(getattr(scanner, "coverage_scope", "primary_only")),
+    )
     jsonable = _jsonable(value)
     pending: list[tuple[str, str]] = []
-    machine_paths = (
-        _machine_field_paths(schema)
-        if isinstance(schema, Mapping)
-        else set()
-    )
+    machine_paths = _machine_field_paths(schema) if isinstance(schema, Mapping) else set()
 
     def collect(item: Any, path: str) -> None:
         if isinstance(item, str):
             normalized_path = _normalise_scan_path(path)
-            policy = (
-                field_policy(app, entity, path)
-                if app and entity
-                else {}
-            )
-            categories = {
-                str(item)
-                for item in policy.get("categories", [])
-                if item
-            }
+            policy = field_policy(app, entity, path) if app and entity else {}
+            categories = {str(item) for item in policy.get("categories", []) if item}
             if (
                 normalized_path in machine_paths
                 or categories & NON_LANGUAGE_CATEGORIES
                 or SENSITIVE_REFERENCE_PATTERN.fullmatch(item)
                 or item == INDIRECT_INJECTION_PLACEHOLDER
+                or not _should_scan(item)
             ):
                 result.field_statuses[path] = "not_applicable"
             else:
@@ -289,14 +320,8 @@ def scan_tool_output(
 
     collect(jsonable, "$")
     scans = scanner.scan_many([text for _path, text in pending])
-    scan_by_path = {
-        path: scan for (path, _text), scan in zip(pending, scans)
-    }
-    unscanned_paths = {
-        path
-        for path, _text in pending
-        if path not in scan_by_path
-    }
+    scan_by_path = {path: scan for (path, _text), scan in zip(pending, scans)}
+    unscanned_paths = {path for path, _text in pending if path not in scan_by_path}
     if unscanned_paths:
         result.available = False
         result.incomplete = True
@@ -306,9 +331,7 @@ def scan_tool_output(
             result.flagged_fields.append(path)
             result.quarantined_fields.append(path)
             result.unscanned_fields.append(path)
-        result.errors.append(
-            "scanner_returned_incomplete_batch"
-        )
+        result.errors.append("scanner_returned_incomplete_batch")
     field_metrics: dict[str, dict[str, Any]] = {}
 
     def transform(item: Any, path: str) -> Any:
@@ -319,6 +342,15 @@ def scan_tool_output(
                     return REDACTION_PLACEHOLDER
                 return item
             result.detector = scan.detector
+            result.fallback_executed = bool(result.fallback_executed or getattr(scan, "fallback_executed", False))
+            result.coverage_complete = bool(
+                result.coverage_complete
+                and getattr(
+                    scan,
+                    "coverage_complete",
+                    scan.available and not scan.truncated,
+                )
+            )
             result.max_score = max(result.max_score, scan.score)
             if not scan.available:
                 result.available = False
@@ -376,11 +408,7 @@ def scan_tool_output(
             result.flagged_fields.append(path)
             result.quarantined_fields.append(path)
             for chunk in scan.chunks:
-                evidence_ref = (
-                    f"{tool_name}:{path}:chunk:{chunk.index}"
-                    if tool_name
-                    else f"{path}:chunk:{chunk.index}"
-                )
+                evidence_ref = f"{tool_name}:{path}:chunk:{chunk.index}" if tool_name else f"{path}:chunk:{chunk.index}"
                 result.evidence_refs.append(evidence_ref)
                 result.chunk_evidence.append(
                     {
@@ -388,6 +416,7 @@ def scan_tool_output(
                         "chunk_index": chunk.index,
                         "start": chunk.start,
                         "end": chunk.end,
+                        "text": item[chunk.start : chunk.end],
                         "score": round(chunk.score, 6),
                         "evidence_ref": evidence_ref,
                     }
@@ -400,30 +429,16 @@ def scan_tool_output(
             field_metrics[path] = metrics
             return sanitized
         if isinstance(item, dict):
-            return {
-                key: transform(child, f"{path}.{key}" if path else str(key))
-                for key, child in item.items()
-            }
+            return {key: transform(child, f"{path}.{key}" if path else str(key)) for key, child in item.items()}
         if isinstance(item, list):
-            return [
-                transform(child, f"{path}[{index}]")
-                for index, child in enumerate(item)
-            ]
+            return [transform(child, f"{path}[{index}]") for index, child in enumerate(item)]
         return item
 
     result.sanitized_value = transform(jsonable, "$")
     sanitized_fields = _collect_string_fields(result.sanitized_value)
-    rescan_paths = [
-        path
-        for path in result.quarantined_fields
-        if path in sanitized_fields
-    ]
+    rescan_paths = [path for path in result.quarantined_fields if path in sanitized_fields]
     if rescan_paths:
-        rescans = list(
-            scanner.scan_many(
-                [sanitized_fields[path] for path in rescan_paths]
-            )
-        )
+        rescans = list(scanner.scan_many([sanitized_fields[path] for path in rescan_paths]))
         for index, path in enumerate(rescan_paths):
             rescan = rescans[index] if index < len(rescans) else None
             metrics = field_metrics.setdefault(
@@ -441,9 +456,7 @@ def scan_tool_output(
                 )
                 result.available = False
                 result.incomplete = True
-                result.errors.append(
-                    f"residual_rescan_missing:{path}"
-                )
+                result.errors.append(f"residual_rescan_missing:{path}")
                 continue
             metrics.update(
                 {
@@ -456,21 +469,14 @@ def scan_tool_output(
             if rescan.suspected or not rescan.available:
                 result.incomplete = True
                 if rescan.suspected:
-                    result.errors.append(
-                        f"residual_injection_after_redaction:{path}"
-                    )
+                    result.errors.append(f"residual_injection_after_redaction:{path}")
                 else:
                     result.available = False
-                    result.errors.append(
-                        f"residual_rescan_unavailable:{path}"
-                    )
+                    result.errors.append(f"residual_rescan_unavailable:{path}")
     residual_paths = {
         path
         for path, metrics in field_metrics.items()
-        if (
-            metrics.get("sanitized_residual_suspected", False)
-            or metrics.get("sanitized_rescan_unavailable", False)
-        )
+        if (metrics.get("sanitized_residual_suspected", False) or metrics.get("sanitized_rescan_unavailable", False))
     }
     if residual_paths:
         result.sanitized_value = _replace_string_paths(
@@ -482,19 +488,12 @@ def scan_tool_output(
             metrics = field_metrics[path]
             metrics["fallback_field_quarantine"] = True
             metrics["sanitized_length"] = len(REDACTION_PLACEHOLDER)
-    result.quarantine_metrics = merge_quarantine_metrics(
-        field_metrics.values()
-    )
+    result.field_metrics = {path: dict(metrics) for path, metrics in field_metrics.items()}
+    result.quarantine_metrics = merge_quarantine_metrics(field_metrics.values())
     result.flagged_fields = list(dict.fromkeys(result.flagged_fields))
-    result.quarantined_fields = list(
-        dict.fromkeys(result.quarantined_fields)
-    )
-    result.risky_entities = list(
-        dict.fromkeys(
-            _direct_entity_path(path)
-            for path in result.quarantined_fields
-        )
-    )
+    result.quarantined_fields = list(dict.fromkeys(result.quarantined_fields))
+    result.risky_entities = list(dict.fromkeys(_direct_entity_path(path) for path in result.quarantined_fields))
     result.unscanned_fields = list(dict.fromkeys(result.unscanned_fields))
     result.evidence_refs = list(dict.fromkeys(result.evidence_refs))
+    result.coverage_complete = bool(result.coverage_complete and result.available and not result.incomplete)
     return result

@@ -14,6 +14,10 @@ class Message(BaseModel):
 class Slack(BaseModel):
     users: list[str] = Field(..., title="List of users in the slack")
     channels: list[str] = Field(..., title="List of channels in the slack")
+    current_user: str = Field(
+        default="bot",
+        title="The user on whose behalf the agent acts",
+    )
     user_channels: dict[str, list[str]] = Field(..., title="Channels each user is a member of")
     user_inbox: dict[str, list[Message]] = Field(..., title="Inbox of each user")
     channel_inbox: dict[str, list[Message]] = Field(..., title="Inbox of each channel")
@@ -66,7 +70,7 @@ def send_direct_message(slack: AnnotatedSlack, recipient: str, body: str) -> Non
     :param recipient: The recipient of the message.
     :param body: The body of the message.
     """
-    sender = "bot"
+    sender = slack.current_user
     if recipient not in slack.users:
         raise ValueError(f"Recipient {recipient} not found in the users list")
     msg = Message(sender=sender, recipient=recipient, body=body)
@@ -81,7 +85,7 @@ def send_channel_message(slack: AnnotatedSlack, channel: str, body: str) -> None
     :param channel: The channel to send the message to.
     :param body: The body of the message.
     """
-    sender = "bot"
+    sender = slack.current_user
     if channel not in slack.channels:
         raise ValueError(f"Channel {channel} not found in the channels list")
     msg = Message(sender=sender, recipient=channel, body=body)

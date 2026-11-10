@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from importlib.resources import files
-from typing import Any, Iterable
+from typing import Any
 
 from ..app_domains import APP_DOMAINS
 from .labels import make_confidentiality, minimum_level_for_categories
@@ -31,15 +32,43 @@ class ToolEffectPolicy:
     dynamic_entity_map: bool = False
     content_detection: bool = True
     implicit_egress: tuple[dict[str, Any], ...] = ()
-    authoritative_parameters: dict[str, dict[str, Any]] = field(
-        default_factory=dict
-    )
+    authoritative_parameters: dict[str, dict[str, Any]] = field(default_factory=dict)
     confidentiality: str = "internal"
     categories: set[str] = field(default_factory=set)
 
     @property
     def egress(self) -> bool:
         return self.effect == "egress"
+
+    @property
+    def parameter_names(self) -> set[str]:
+        """Return every parameter with declared security semantics."""
+
+        names = {
+            *self.control_fields,
+            *self.resource_fields,
+            *self.destination_fields,
+            *self.content_fields,
+            *self.parameter_roles,
+            *self.semantic_types,
+            *self.authoritative_parameters,
+        }
+        for declaration in self.implicit_egress:
+            selector = str(
+                declaration.get("id_parameter", "") or ""
+            )
+            if selector:
+                names.add(selector)
+            names.update(
+                str(item)
+                for item in declaration.get(
+                    "recipient_parameters",
+                    [],
+                )
+                or []
+                if str(item).strip()
+            )
+        return names
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,18 +81,11 @@ class ToolEffectPolicy:
             "content_fields": sorted(self.content_fields),
             "parameter_roles": dict(self.parameter_roles),
             "semantic_types": dict(self.semantic_types),
-            "output_semantic_types": dict(
-                self.output_semantic_types
-            ),
+            "output_semantic_types": dict(self.output_semantic_types),
             "dynamic_entity_map": self.dynamic_entity_map,
             "content_detection": self.content_detection,
-            "implicit_egress": [
-                dict(item) for item in self.implicit_egress
-            ],
-            "authoritative_parameters": {
-                key: dict(value)
-                for key, value in self.authoritative_parameters.items()
-            },
+            "implicit_egress": [dict(item) for item in self.implicit_egress],
+            "authoritative_parameters": {key: dict(value) for key, value in self.authoritative_parameters.items()},
             "confidentiality": self.confidentiality,
             "categories": sorted(self.categories),
             "egress": self.egress,
@@ -74,10 +96,9 @@ def _load_specs() -> dict[str, Any]:
     global _SPEC_CACHE
     if _SPEC_CACHE is None:
         _SPEC_CACHE = json.loads(
-            files("agentdojo.method.modeling")
-            .joinpath("tool_security.json")
-            .read_text(encoding="utf-8")
+            files("agentdojo.method.modeling").joinpath("tool_security.json").read_text(encoding="utf-8")
         )
+    assert _SPEC_CACHE is not None
     return _SPEC_CACHE
 
 
@@ -117,6 +138,36 @@ def base_tool_name(tool_name: str) -> str:
     return split_qualified_tool_name(tool_name)[1]
 
 
+def tool_identity(tool_name: str, suite_hint: Any = "") -> str:
+    """Resolve one canonical APP-qualified tool identity.
+
+    An explicit ``suite__tool`` qualification always wins. An unqualified
+    tool name uses ``suite_hint`` when available. Keeping this rule in one
+    place prevents adjacent metrics from disagreeing about cross-APP aliases.
+    """
+
+    qualified_suite, base_name = split_qualified_tool_name(
+        str(tool_name or "")
+    )
+    suite = str(qualified_suite or suite_hint or "").strip().lower()
+    return f"{suite}__{base_name}" if suite and base_name else base_name
+
+
+def tool_identity_matches(
+    left: str,
+    right: str,
+    *,
+    left_suite: Any = "",
+    right_suite: Any = "",
+) -> bool:
+    """Compare tool names without collapsing cross-APP qualifications."""
+
+    return tool_identity(left, left_suite) == tool_identity(
+        right,
+        right_suite,
+    )
+
+
 def tool_effect(tool_name: str) -> ToolEffectPolicy:
     """Resolve explicitly declared tool metadata; unknown tools fail closed."""
     name = base_tool_name(tool_name)
@@ -139,18 +190,10 @@ def tool_effect(tool_name: str) -> ToolEffectPolicy:
         return {str(value) for value in values if value}
 
     effect = str(profile.get("effect") or raw.get("effect") or "unknown")
-    risk_level = str(
-        raw.get("risk_level")
-        or profile.get("risk_level")
-        or "L2"
-    ).upper()
+    risk_level = str(raw.get("risk_level") or profile.get("risk_level") or "L2").upper()
     if risk_level not in {"L0", "L1", "L2"}:
         risk_level = "L2"
-    confidentiality = str(
-        raw.get("confidentiality")
-        or profile.get("confidentiality")
-        or "internal"
-    )
+    confidentiality = str(raw.get("confidentiality") or profile.get("confidentiality") or "internal")
     return ToolEffectPolicy(
         name=name,
         effect=effect,
@@ -161,37 +204,25 @@ def tool_effect(tool_name: str) -> ToolEffectPolicy:
         content_fields=merged_list("content_fields"),
         parameter_roles={
             str(parameter): str(role)
-            for parameter, role in (
-                raw.get("parameter_roles", {}) or {}
-            ).items()
+            for parameter, role in (raw.get("parameter_roles", {}) or {}).items()
             if str(role).strip()
         },
         semantic_types={
             str(parameter): str(value_type)
-            for parameter, value_type in (
-                raw.get("semantic_types", {}) or {}
-            ).items()
+            for parameter, value_type in (raw.get("semantic_types", {}) or {}).items()
             if str(value_type).strip()
         },
         output_semantic_types={
             str(path): str(value_type)
-            for path, value_type in (
-                raw.get("output_semantic_types", {}) or {}
-            ).items()
+            for path, value_type in (raw.get("output_semantic_types", {}) or {}).items()
             if str(value_type).strip()
         },
         dynamic_entity_map=bool(raw.get("dynamic_entity_map", False)),
         content_detection=bool(raw.get("content_detection", True)),
-        implicit_egress=tuple(
-            dict(item)
-            for item in (raw.get("implicit_egress", []) or [])
-            if isinstance(item, dict)
-        ),
+        implicit_egress=tuple(dict(item) for item in (raw.get("implicit_egress", []) or []) if isinstance(item, dict)),
         authoritative_parameters={
             str(parameter): dict(spec)
-            for parameter, spec in (
-                raw.get("authoritative_parameters", {}) or {}
-            ).items()
+            for parameter, spec in (raw.get("authoritative_parameters", {}) or {}).items()
             if isinstance(spec, dict)
         },
         confidentiality=confidentiality,

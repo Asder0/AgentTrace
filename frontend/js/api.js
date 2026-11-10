@@ -10,7 +10,7 @@
  * - 后端不可用时返回错误，不降级到模拟数据
  * 
  * 增强功能：
- * - 自定义指令执行（通过 /api/execute/custom）
+ * - 跨 APP 预设任务与攻击任务执行
  * - 预设场景执行（通过 /api/execute）
  * - LLM 配置管理（通过 /api/config/llm）
  * - 增量数据更新支持
@@ -134,28 +134,6 @@ const API = {
             return await response.json();
         } catch (err) {
             console.error('执行操作失败:', err.message);
-            throw err;
-        }
-    },
-
-    /**
-     * 执行自定义指令（通过 AgentPipeline 调用真实 LLM 自主决策）
-     * 用户输入自然语言指令，LLM 根据可用工具 API 自主决策工具调用
-     * @param {Object} params - 自定义指令参数
-     * @param {string} params.prompt - 自然语言指令（只发送原始指令，让 LLM 自主决策）
-     * @returns {Promise<Object>} 更新后的图谱数据
-     */
-    async executeCustom(params) {
-        try {
-            const response = await fetch(`${this.BASE_URL}/execute/custom`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(params)
-            });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('执行自定义指令失败:', err.message);
             throw err;
         }
     },
@@ -339,62 +317,15 @@ const API = {
     // 攻击场景 API
     // ============================================================
 
-    /**
-     * 获取可用的攻击类型列表
-     * @returns {Promise<Array>} [{ id, name, description }]
-     */
-    async getAttackTypes() {
+    async getCrossAppAttackTargets() {
         try {
-            const response = await fetch(`${this.BASE_URL}/attack-types`);
+            const response = await fetch(
+                `${this.BASE_URL}/attack/cross-app-targets`
+            );
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             return await response.json();
         } catch (err) {
-            console.error('获取攻击类型列表失败:', err.message);
-            throw err;
-        }
-    },
-
-    /**
-     * 获取所有可用的 user_tasks（用于攻击场景选择器）
-     * @returns {Promise<Array>} [{ id, suite, prompt, description, cross_app, cross_module }]
-     */
-    async getAttackUserTasks() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/attack/user-tasks`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取攻击 user_tasks 失败:', err.message);
-            throw err;
-        }
-    },
-
-    /**
-     * 获取所有可用的 injection_tasks（用于攻击场景选择器）
-     * @returns {Promise<Array>} [{ id, suite, goal, description }]
-     */
-    async getAttackInjectionTasks() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/attack/injection-tasks`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取攻击 injection_tasks 失败:', err.message);
-            throw err;
-        }
-    },
-
-    /**
-     * 获取所有可用的攻击场景列表
-     * @returns {Promise<Array>} [{ id, attack_type, attack_name, suite, user_task_id, injection_task_id, name, description }]
-     */
-    async getAttackScenarios() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/attack-scenarios`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取攻击场景列表失败:', err.message);
+            console.error('获取跨 APP 攻击目标失败:', err.message);
             throw err;
         }
     },
@@ -402,10 +333,10 @@ const API = {
     /**
      * 执行攻击场景
      * @param {Object} params - 攻击场景参数
-     * @param {string} params.user_task_id - 用户任务 ID
-     * @param {string} params.injection_task_id - 注入任务 ID
+     * @param {string} params.cross_app_task_id - 跨 APP 基础任务 ID
+     * @param {string} params.injection_point_id - 注入位置 ID
+     * @param {string} params.injection_goal_id - 恶意目标 ID
      * @param {string} params.attack_type - 攻击类型
-     * @param {string} params.suite - 套件名称
      * @returns {Promise<Object>} 执行结果（含图谱数据、风险卡片等）
      */
     async executeAttack(params) {

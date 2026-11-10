@@ -16,7 +16,7 @@ import copy
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import networkx as nx
 
@@ -35,8 +35,17 @@ from .policy import split_qualified_tool_name, tool_effect
 class KnowledgeGraph:
     """Singleton in-memory PROV/FSM graph."""
 
-    _instance: Optional["KnowledgeGraph"] = None
+    _instance: KnowledgeGraph | None = None
     _lock = threading.Lock()
+    G: nx.MultiDiGraph
+    agent_node: str
+    last_invocation_id: str | None
+    last_invocation_label: dict[str, Any] | None
+    current_state_id: str | None
+    task_id: str | None
+    suite: str | None
+    prompt_entity_id: str | None
+    activity_input_ids: dict[str, list[str]]
 
     def __new__(cls, *args, **kwargs):
         with cls._lock:
@@ -73,7 +82,7 @@ def _make_label(node_type: str, content: str, max_len: int = 120) -> str:
     if not content:
         return node_type
     text = str(content)
-    return text if len(text) <= max_len else f"{text[:max_len - 1]}…"
+    return text if len(text) <= max_len else f"{text[: max_len - 1]}…"
 
 
 def _make_tool_label(tool_intent: str, tool_description: str = "") -> str:
@@ -82,7 +91,6 @@ def _make_tool_label(tool_intent: str, tool_description: str = "") -> str:
 
 def _infer_app_from_function_name(function_name: str) -> str:
     return domain_for_tool(function_name) or "unknown"
-
 
 
 def _add_edge(
@@ -111,8 +119,8 @@ def _state_id(task_id: str, name: str, suffix: str = "") -> str:
 
 def reset_graph(
     *,
-    task_id: Optional[str] = None,
-    suite: Optional[str] = None,
+    task_id: str | None = None,
+    suite: str | None = None,
 ) -> KnowledgeGraph:
     """Reset all singleton graph state at a task boundary."""
     kg = KnowledgeGraph()
@@ -182,9 +190,9 @@ def _find_or_create_prompt_node(
 
 def ensure_task_state(
     *,
-    prompt: Optional[str] = None,
-    task_id: Optional[str] = None,
-    suite: Optional[str] = None,
+    prompt: str | None = None,
+    task_id: str | None = None,
+    suite: str | None = None,
 ) -> str:
     """Ensure the current task, prompt entity, and initial FSM state exist."""
     kg = KnowledgeGraph()
@@ -217,12 +225,12 @@ def ensure_task_state(
 
 def transition_state(
     *,
-    activity_id: Optional[str],
+    activity_id: str | None,
     state_name: str,
     reason: str = "",
-    risk_ids: Optional[List[str]] = None,
-    suffix: Optional[str] = None,
-    scope: Optional[str] = None,
+    risk_ids: list[str] | None = None,
+    suffix: str | None = None,
+    scope: str | None = None,
 ) -> str:
     """Create an FSM state and link it from the current state/activity."""
     kg = KnowledgeGraph()
@@ -273,20 +281,20 @@ def finalize_task_outcome(
     outcome: str,
     reason: str = "",
     summary: str = "",
-    task_id: Optional[str] = None,
-    suite: Optional[str] = None,
-    plan: Optional[Dict[str, Any]] = None,
-    executed_tools: Optional[List[str]] = None,
-    successful_tools: Optional[List[str]] = None,
-    failed_tools: Optional[List[str]] = None,
-    blocked_tools: Optional[List[str]] = None,
+    task_id: str | None = None,
+    suite: str | None = None,
+    plan: dict[str, Any] | None = None,
+    executed_tools: list[str] | None = None,
+    successful_tools: list[str] | None = None,
+    failed_tools: list[str] | None = None,
+    blocked_tools: list[str] | None = None,
     tool_call_count: int = 0,
     successful_tool_call_count: int = 0,
     failed_tool_call_count: int = 0,
     blocked_tool_call_count: int = 0,
-    completion_audit: Optional[Dict[str, Any]] = None,
-    finished_at: Optional[float] = None,
-) -> Dict[str, Any]:
+    completion_audit: dict[str, Any] | None = None,
+    finished_at: float | None = None,
+) -> dict[str, Any]:
     """Record one terminal task state after the Agent pipeline returns."""
     kg = KnowledgeGraph()
     ensure_task_state(task_id=task_id, suite=suite)
@@ -295,11 +303,7 @@ def finalize_task_outcome(
         state_name = "FAILED"
 
     current = kg.G.nodes.get(kg.current_state_id, {})
-    if (
-        current.get("terminal")
-        and current.get("scope") == "task"
-        and current.get("state") == state_name
-    ):
+    if current.get("terminal") and current.get("scope") == "task" and current.get("state") == state_name:
         state_id = str(kg.current_state_id)
     else:
         state_id = transition_state(
@@ -360,23 +364,19 @@ def finalize_task_outcome(
         "failed_tools": list(task_state["failed_tools"]),
         "blocked_tools": list(task_state["blocked_tools"]),
         "tool_call_count": task_state["tool_call_count"],
-        "successful_tool_call_count": task_state[
-            "successful_tool_call_count"
-        ],
+        "successful_tool_call_count": task_state["successful_tool_call_count"],
         "failed_tool_call_count": task_state["failed_tool_call_count"],
         "blocked_tool_call_count": task_state["blocked_tool_call_count"],
-        "completion_audit": copy.deepcopy(
-            task_state["completion_audit"]
-        ),
+        "completion_audit": copy.deepcopy(task_state["completion_audit"]),
     }
 
 
 def record_task_start(
     prompt: str,
     *,
-    task_id: Optional[str] = None,
-    suite: Optional[str] = None,
-) -> Dict[str, str]:
+    task_id: str | None = None,
+    suite: str | None = None,
+) -> dict[str, str]:
     """Reset the graph and register the trusted user authorization anchor."""
     resolved_task_id = task_id or f"task_{uuid.uuid4().hex[:8]}"
     kg = reset_graph(task_id=resolved_task_id, suite=suite)
@@ -394,7 +394,7 @@ def record_task_start(
     }
 
 
-def record_llm_interaction(event: Dict[str, Any]) -> None:
+def record_llm_interaction(event: dict[str, Any]) -> None:
     """Record an LLM activity and full-context information-flow label."""
     kg = KnowledgeGraph()
     G = kg.G
@@ -410,12 +410,8 @@ def record_llm_interaction(event: Dict[str, Any]) -> None:
     event["invocation_id"] = invocation_id
     prompt_id = _find_or_create_prompt_node(G, prompt_text, event["timestamp"])
     if prompt_id in G:
-        G.nodes[prompt_id]["raw_prompt"] = event.get(
-            "raw_prompt", prompt_text
-        )
-        G.nodes[prompt_id]["prompt_modified"] = bool(
-            event.get("prompt_modified", False)
-        )
+        G.nodes[prompt_id]["raw_prompt"] = event.get("raw_prompt", prompt_text)
+        G.nodes[prompt_id]["prompt_modified"] = bool(event.get("prompt_modified", False))
     prompt_label = G.nodes[prompt_id].get("flow_label") or make_flow_label()
     context_labels = [
         prompt_label,
@@ -441,9 +437,7 @@ def record_llm_interaction(event: Dict[str, Any]) -> None:
         task_id=event.get("task_id", kg.task_id),
         context_messages=copy.deepcopy(event.get("context_messages", [])),
         plan_updates=copy.deepcopy(event.get("plan_updates", [])),
-        plan_update_warnings=list(
-            event.get("plan_update_warnings", [])
-        ),
+        plan_update_warnings=list(event.get("plan_update_warnings", [])),
         flow_label=flow_label,
     )
     _add_edge(G, prompt_id, invocation_id, "informed")
@@ -452,20 +446,14 @@ def record_llm_interaction(event: Dict[str, Any]) -> None:
         if not isinstance(label, dict):
             continue
         confidentiality = label.get("confidentiality")
-        source_ids = (
-            confidentiality.get("source_ids", [])
-            if isinstance(confidentiality, dict)
-            else []
-        )
+        source_ids = confidentiality.get("source_ids", []) if isinstance(confidentiality, dict) else []
         for source_id in source_ids:
             source_activity_id = str(source_id).split(":", 1)[0]
             if source_activity_id not in G:
                 continue
             for candidate_id, candidate in G.nodes(data=True):
-                if (
-                    candidate.get("type") != "DomainData"
-                    or candidate.get("task_id")
-                    != event.get("task_id", kg.task_id)
+                if candidate.get("type") != "DomainData" or candidate.get("task_id") != event.get(
+                    "task_id", kg.task_id
                 ):
                     continue
                 if any(
@@ -496,19 +484,15 @@ def record_llm_interaction(event: Dict[str, Any]) -> None:
     )
 
 
-def _resolve_invocation_id(kg: KnowledgeGraph, event: Dict[str, Any]) -> Optional[str]:
+def _resolve_invocation_id(kg: KnowledgeGraph, event: dict[str, Any]) -> str | None:
     value = event.get("wasInformedBy")
     if value:
-        invocation_id = (
-            str(value)
-            if str(value).startswith("AIModelInvocation_")
-            else f"AIModelInvocation_{value}"
-        )
+        invocation_id = str(value) if str(value).startswith("AIModelInvocation_") else f"AIModelInvocation_{value}"
         return invocation_id if invocation_id in kg.G else None
     return kg.last_invocation_id
 
 
-def record_activity(event: Dict[str, Any]) -> None:
+def record_activity(event: dict[str, Any]) -> None:
     """Record a proposed tool activity and its input entities."""
     kg = KnowledgeGraph()
     G = kg.G
@@ -523,13 +507,9 @@ def record_activity(event: Dict[str, Any]) -> None:
     activity_id = f"Activity_{tool_intent}_{uuid.uuid4().hex[:8]}"
     event["activity_id"] = activity_id
     invocation_id = _resolve_invocation_id(kg, event)
-    parent_labels: List[dict[str, Any]] = []
+    parent_labels: list[dict[str, Any]] = []
     if invocation_id:
-        parent_labels.append(
-            G.nodes[invocation_id].get("flow_label")
-            or kg.last_invocation_label
-            or make_flow_label()
-        )
+        parent_labels.append(G.nodes[invocation_id].get("flow_label") or kg.last_invocation_label or make_flow_label())
     if kg.prompt_entity_id in G:
         parent_labels.append(G.nodes[kg.prompt_entity_id].get("flow_label") or {})
 
@@ -542,6 +522,7 @@ def record_activity(event: Dict[str, Any]) -> None:
     G.add_node(
         activity_id,
         type="AgentTool",
+        tool_call_id=event.get("tool_call_id"),
         label=_make_tool_label(tool_intent, event.get("tool_description", "")),
         app=event.get("app_domain") or event.get("target_app", "unknown"),
         module=event.get("target_app", "unknown"),
@@ -563,23 +544,15 @@ def record_activity(event: Dict[str, Any]) -> None:
         task_data_plan=copy.deepcopy(event.get("task_data_plan")),
         flow_contract=copy.deepcopy(event.get("flow_contract")),
         subgoal_id=(
-            event.get("access_plan", {}).get("subgoal_id")
-            if isinstance(event.get("access_plan"), dict)
-            else None
+            event.get("plan_step_id")
+            or (event.get("access_plan", {}).get("subgoal_id") if isinstance(event.get("access_plan"), dict) else None)
         ),
+        plan_step_id=event.get("plan_step_id"),
         argument_sources=copy.deepcopy(event.get("argument_sources", [])),
-        argument_flow_labels=copy.deepcopy(
-            event.get("argument_flow_labels", {})
-        ),
-        parameter_resolutions=copy.deepcopy(
-            event.get("parameter_resolutions", [])
-        ),
-        parameter_resolution_errors=list(
-            event.get("parameter_resolution_errors", [])
-        ),
-        parameter_resolution_warnings=list(
-            event.get("parameter_resolution_warnings", [])
-        ),
+        argument_flow_labels=copy.deepcopy(event.get("argument_flow_labels", {})),
+        parameter_resolutions=copy.deepcopy(event.get("parameter_resolutions", [])),
+        parameter_resolution_errors=list(event.get("parameter_resolution_errors", [])),
+        parameter_resolution_warnings=list(event.get("parameter_resolution_warnings", [])),
         control_fields=sorted(effect_policy.control_fields),
         content_fields=sorted(effect_policy.content_fields),
         egress=effect_policy.egress,
@@ -603,7 +576,7 @@ def record_activity(event: Dict[str, Any]) -> None:
         _add_edge(G, activity_id, sink_id, "egress_to")
 
     inputs = event.get("inputs") or {}
-    input_ids: List[str] = []
+    input_ids: list[str] = []
     if inputs:
         input_entity_id = f"Entity_Input_{uuid.uuid4().hex[:8]}"
         input_ids.append(input_entity_id)
@@ -646,7 +619,7 @@ def record_activity(event: Dict[str, Any]) -> None:
     )
 
 
-def _find_activity(kg: KnowledgeGraph, event: Dict[str, Any]) -> Optional[str]:
+def _find_activity(kg: KnowledgeGraph, event: dict[str, Any]) -> str | None:
     activity_id = event.get("activity_id")
     if activity_id and activity_id in kg.G:
         return str(activity_id)
@@ -655,22 +628,21 @@ def _find_activity(kg: KnowledgeGraph, event: Dict[str, Any]) -> Optional[str]:
         candidates = [
             node_id
             for node_id, attrs in kg.G.nodes(data=True)
-            if attrs.get("type") == "AgentTool"
-            and attrs.get("wasInformedBy") == informed_by
+            if attrs.get("type") == "AgentTool" and attrs.get("wasInformedBy") == informed_by
         ]
         if candidates:
             return candidates[-1]
     return None
 
 
-def _raw_output_text(event: Dict[str, Any]) -> Optional[str]:
+def _raw_output_text(event: dict[str, Any]) -> str | None:
     value = event.get("outputs")
     if value in (None, ""):
         return None
     return value if isinstance(value, str) else str(value)
 
 
-def update_activity_outcome(event: Dict[str, Any]) -> None:
+def update_activity_outcome(event: dict[str, Any]) -> None:
     """Attach an activity outcome, derived entities, risks, and FSM state."""
     kg = KnowledgeGraph()
     G = kg.G
@@ -714,9 +686,7 @@ def update_activity_outcome(event: Dict[str, Any]) -> None:
             activity[key] = copy.deepcopy(event.get(key))
 
     input_ids = kg.activity_input_ids.get(activity_id, [])
-    input_labels = [
-        G.nodes[node_id].get("flow_label") for node_id in input_ids if node_id in G
-    ]
+    input_labels = [G.nodes[node_id].get("flow_label") for node_id in input_ids if node_id in G]
     activity_label = activity.get("flow_label") or make_flow_label()
     output_label = event.get("output_flow_label") or derive_flow_label(
         [activity_label, *input_labels],
@@ -725,8 +695,8 @@ def update_activity_outcome(event: Dict[str, Any]) -> None:
         source_id=activity_id,
     )
 
-    output_ids: List[str] = []
-    source_evidence_ids: List[str] = []
+    output_ids: list[str] = []
+    source_evidence_ids: list[str] = []
     raw_output = _raw_output_text(event)
     if raw_output is not None:
         output_entity_id = f"Entity_Output_{uuid.uuid4().hex[:8]}"
@@ -745,11 +715,7 @@ def update_activity_outcome(event: Dict[str, Any]) -> None:
             task_id=event.get("task_id", kg.task_id),
             operation="output",
             field_path="tool.output",
-            admitted=not bool(
-                event.get("redaction_applied")
-                or event.get("quarantined")
-                or status == "blocked"
-            ),
+            admitted=not bool(event.get("redaction_applied") or event.get("quarantined") or status == "blocked"),
             flow_label=output_label,
         )
         _add_edge(G, activity_id, output_entity_id, "produces")
@@ -765,10 +731,7 @@ def update_activity_outcome(event: Dict[str, Any]) -> None:
                 )
 
         sanitized_text = event.get("sanitized_output")
-        if (
-            isinstance(sanitized_text, str)
-            and sanitized_text != raw_output
-        ):
+        if isinstance(sanitized_text, str) and sanitized_text != raw_output:
             sanitized_id = f"Entity_Sanitized_{uuid.uuid4().hex[:8]}"
             output_ids.append(sanitized_id)
             source_evidence_ids.append(sanitized_id)
@@ -821,11 +784,7 @@ def update_activity_outcome(event: Dict[str, Any]) -> None:
                     content=content,
                     source_id=delta_id,
                 )
-            delta_app = str(
-                event.get("app_domain")
-                or event.get("target_app")
-                or "unknown"
-            )
+            delta_app = str(event.get("app_domain") or event.get("target_app") or "unknown")
             delta_entity = str(entity_type or "unknown")
             delta_label = aggregate_flow_labels(
                 [
@@ -895,9 +854,7 @@ def update_activity_outcome(event: Dict[str, Any]) -> None:
             risk["evidence_total"] = {
                 "entities": len(risk["evidence_entity_ids"]),
                 "sources": len(_unique(risk.get("source_ids", []))),
-                "taint_roots": len(
-                    _unique(risk.get("taint_roots", []))
-                ),
+                "taint_roots": len(_unique(risk.get("taint_roots", []))),
             }
     record_risk_assessments(event, risks)
     state_name = "ADMITTED"
@@ -919,23 +876,26 @@ def update_activity_outcome(event: Dict[str, Any]) -> None:
 
 
 def record_risk_assessments(
-    event: Dict[str, Any],
-    risks: Optional[List[Dict[str, Any]]] = None,
-) -> List[str]:
+    event: dict[str, Any],
+    risks: list[dict[str, Any]] | None = None,
+) -> list[str]:
     """Attach risk events to graph nodes and FSM states."""
     kg = KnowledgeGraph()
     G = kg.G
-    risks = risks if risks is not None else event.get("risk_assessments", [])
+    raw_risks = risks if risks is not None else event.get("risk_assessments", [])
+    risks = raw_risks if isinstance(raw_risks, list) else []
     activity_id = event.get("activity_id")
-    risk_ids: List[str] = []
+    risk_ids: list[str] = []
     for risk in risks:
         risk_id = str(risk.get("risk_id") or f"Risk_{uuid.uuid4().hex[:10]}")
         risk["risk_id"] = risk_id
         risk_ids.append(risk_id)
         event_kind = str(risk.get("event_kind", "security"))
-        node_type = (
-            "PolicyEvent" if event_kind == "policy" else "RiskEvent"
-        )
+        node_type = "PolicyEvent" if event_kind == "policy" else "RiskEvent"
+        activity_app = str(G.nodes[activity_id].get("app", "")) if activity_id and activity_id in G else ""
+        event_app = str(event.get("app_domain") or event.get("target_app") or activity_app or "system")
+        confirmation = event.get("l2_confirmation")
+        confirmation = confirmation if isinstance(confirmation, dict) else {}
         G.add_node(
             risk_id,
             type=node_type,
@@ -946,7 +906,16 @@ def record_risk_assessments(
             reason=str(risk.get("reason", "")),
             policy_id=str(risk.get("policy_id", "")),
             label=f"Ring {risk.get('ring', 0)}: {risk.get('decision', 'RISK')}",
-            app="system",
+            app=event_app,
+            agent_id=str(
+                event.get("agent_id") or G.nodes[activity_id].get("agent_id", "")
+                if activity_id and activity_id in G
+                else event.get("agent_id", "")
+            ),
+            activity_id=str(activity_id or ""),
+            request_id=str(confirmation.get("request_id", "") or ""),
+            confirmation_status=str(confirmation.get("status", "") or ""),
+            approval_source=str(confirmation.get("approval_source", "") or ""),
             suite=kg.suite,
             task_id=kg.task_id,
             flow_label=make_flow_label(
@@ -967,6 +936,11 @@ def record_risk_assessments(
                     "policy_id",
                     "risk_id",
                     "event_kind",
+                    "activity_id",
+                    "agent_id",
+                    "request_id",
+                    "confirmation_status",
+                    "approval_source",
                 }
             },
         )
@@ -994,13 +968,11 @@ def record_risk_assessments(
     if risk_ids and activity_id in G:
         for id_field in ("risk_ids", "policy_ids"):
             if id_field in G.nodes[activity_id]:
-                G.nodes[activity_id][id_field] = _unique(
-                    G.nodes[activity_id][id_field]
-                )
+                G.nodes[activity_id][id_field] = _unique(G.nodes[activity_id][id_field])
     return risk_ids
 
 
-def mark_activity_blocked(event: Dict[str, Any]) -> None:
+def mark_activity_blocked(event: dict[str, Any]) -> None:
     """Mark an activity canceled before execution without inventing output."""
     kg = KnowledgeGraph()
     activity_id = _find_activity(kg, event)
@@ -1037,14 +1009,12 @@ def mark_activity_blocked(event: Dict[str, Any]) -> None:
         activity_id=activity_id,
         state_name="BLOCKED",
         reason=activity["block_reason"],
-        risk_ids=[
-            risk.get("risk_id", "") for risk in event.get("risk_assessments", [])
-        ],
+        risk_ids=[risk.get("risk_id", "") for risk in event.get("risk_assessments", [])],
         suffix=activity_id.rsplit("_", 1)[-1],
     )
 
 
-def mark_activity_denied(event: Dict[str, Any]) -> None:
+def mark_activity_denied(event: dict[str, Any]) -> None:
     """Record a denied tool call without terminating the overall task."""
     kg = KnowledgeGraph()
     activity_id = _find_activity(kg, event)
@@ -1080,10 +1050,7 @@ def mark_activity_denied(event: Dict[str, Any]) -> None:
         activity_id=activity_id,
         state_name="ADVISED",
         reason=activity["block_reason"],
-        risk_ids=[
-            risk.get("risk_id", "")
-            for risk in event.get("risk_assessments", [])
-        ],
+        risk_ids=[risk.get("risk_id", "") for risk in event.get("risk_assessments", [])],
         suffix=f"denied_{activity_id.rsplit('_', 1)[-1]}",
         scope="activity",
     )
@@ -1091,7 +1058,7 @@ def mark_activity_denied(event: Dict[str, Any]) -> None:
 
 def record_human_authorization(
     activity_id: str,
-    confirmation: Dict[str, Any],
+    confirmation: dict[str, Any],
 ) -> str | None:
     """Create or update a persistent human-authorization node."""
     kg = KnowledgeGraph()
@@ -1103,21 +1070,14 @@ def record_human_authorization(
         return None
     node_id = f"HumanAuthorization_{request_id}"
     status = str(confirmation.get("status", "pending"))
-    confirmation_kind = str(
-        confirmation.get("confirmation_kind", "l2_action")
-        or "l2_action"
-    )
+    confirmation_kind = str(confirmation.get("confirmation_kind", "l2_action") or "l2_action")
     G.add_node(
         node_id,
         type="HumanAuthorization",
         label=(
             "Sensitive-data exposure authorization: "
             if confirmation_kind == "sensitive_data_exposure"
-            else (
-                "任务要求决策："
-                if confirmation_kind == "requirement_resolution"
-                else "Human authorization: "
-            )
+            else ("任务要求决策：" if confirmation_kind == "requirement_resolution" else "Human authorization: ")
         )
         + (
             {
@@ -1140,9 +1100,7 @@ def record_human_authorization(
         plan_hash=str(confirmation.get("plan_hash", "")),
         chain_check=copy.deepcopy(confirmation.get("chain_check", {})),
         flow_check=copy.deepcopy(confirmation.get("flow_check", {})),
-        decision_kind=str(
-            confirmation.get("decision_kind", "approve_reject")
-        ),
+        decision_kind=str(confirmation.get("decision_kind", "approve_reject")),
         options=copy.deepcopy(confirmation.get("options", [])),
         payload=copy.deepcopy(confirmation.get("payload", {})),
         decision=copy.deepcopy(confirmation.get("decision")),
@@ -1169,12 +1127,10 @@ def record_human_authorization(
             activity_id=activity_id,
             state_name="HELD",
             reason=(
-                "Sensitive APP data is awaiting explicit exposure "
-                "authorization."
+                "Sensitive APP data is awaiting explicit exposure authorization."
                 if confirmation_kind == "sensitive_data_exposure"
                 else (
-                    "The task has an unresolved business requirement "
-                    "that requires an explicit user decision."
+                    "The task has an unresolved business requirement that requires an explicit user decision."
                     if confirmation_kind == "requirement_resolution"
                     else "L2 action is awaiting explicit human authorization."
                 )
@@ -1184,7 +1140,7 @@ def record_human_authorization(
     return node_id
 
 
-def get_graph_data() -> Dict[str, Any]:
+def get_graph_data() -> dict[str, Any]:
     """Serialize the graph for the D3 visualization layer."""
     kg = KnowledgeGraph()
     try:
@@ -1203,7 +1159,8 @@ def get_graph_data() -> Dict[str, Any]:
         if "app" not in node:
             node["app"] = (
                 "system"
-                if node.get("type") in {
+                if node.get("type")
+                in {
                     "AIAgent",
                     "Prompt",
                     "AIModelInvocation",
@@ -1216,17 +1173,17 @@ def get_graph_data() -> Dict[str, Any]:
     return data
 
 
-def get_graph_summary() -> Dict[str, Any]:
+def get_graph_summary() -> dict[str, Any]:
     """Return small graph counters used by status and audit views."""
     kg = KnowledgeGraph()
     G = kg.G
-    node_types: Dict[str, int] = {}
-    edge_types: Dict[str, int] = {}
-    confidentiality: Dict[str, int] = {}
-    integrity: Dict[str, int] = {}
-    risk_decisions: Dict[str, int] = {}
-    policy_decisions: Dict[str, int] = {}
-    event_kinds: Dict[str, int] = {}
+    node_types: dict[str, int] = {}
+    edge_types: dict[str, int] = {}
+    confidentiality: dict[str, int] = {}
+    integrity: dict[str, int] = {}
+    risk_decisions: dict[str, int] = {}
+    policy_decisions: dict[str, int] = {}
+    event_kinds: dict[str, int] = {}
     for _, attrs in G.nodes(data=True):
         node_type = str(attrs.get("type", "unknown"))
         node_types[node_type] = node_types.get(node_type, 0) + 1
@@ -1244,18 +1201,12 @@ def get_graph_summary() -> Dict[str, Any]:
             event_kinds[event_kind] = event_kinds.get(event_kind, 0) + 1
         elif node_type == "PolicyEvent":
             decision = str(attrs.get("decision", "unknown"))
-            policy_decisions[decision] = (
-                policy_decisions.get(decision, 0) + 1
-            )
+            policy_decisions[decision] = policy_decisions.get(decision, 0) + 1
             event_kinds["policy"] = event_kinds.get("policy", 0) + 1
     for _, _, attrs in G.edges(data=True):
         relation = str(attrs.get("relation", "unknown"))
         edge_types[relation] = edge_types.get(relation, 0) + 1
-    current_state = (
-        G.nodes.get(kg.current_state_id, {}) or {}
-        if kg.current_state_id
-        else {}
-    )
+    current_state = G.nodes.get(kg.current_state_id, {}) or {} if kg.current_state_id else {}
     return {
         "task_id": kg.task_id,
         "state": current_state.get("state"),
@@ -1277,16 +1228,16 @@ __all__ = [
     "KnowledgeGraph",
     "ensure_task_state",
     "finalize_task_outcome",
+    "get_graph_data",
+    "get_graph_summary",
     "mark_activity_blocked",
     "mark_activity_denied",
-    "record_human_authorization",
     "record_activity",
+    "record_human_authorization",
     "record_llm_interaction",
     "record_risk_assessments",
     "record_task_start",
     "reset_graph",
     "transition_state",
     "update_activity_outcome",
-    "get_graph_data",
-    "get_graph_summary",
 ]

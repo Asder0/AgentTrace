@@ -16,8 +16,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentdojo import model_assets
 from agentdojo.model_assets import (
     DEFAULT_INJECTION_MODEL_ID,
+    DIRECT_INJECTION_MODEL_ID,
+    resolve_direct_injection_model_path,
 )
 
 from ..modeling.policy import security_thresholds
@@ -31,16 +34,10 @@ from .unplug_model import (
 )
 
 DEFAULT_MODEL_NAME = DEFAULT_INJECTION_MODEL_ID
-_SCAN_POLICY = dict(
-    security_thresholds().get("prompt_injection_scan", {})
-)
+_SCAN_POLICY = dict(security_thresholds().get("prompt_injection_scan", {}))
 DEFAULT_THRESHOLD = float(_SCAN_POLICY.get("threshold", 0.95))
-DEFAULT_SPAN_THRESHOLD = float(
-    _SCAN_POLICY.get("span_threshold", 0.45)
-)
-DEFAULT_DOC_THRESHOLD = float(
-    _SCAN_POLICY.get("doc_threshold", 0.9)
-)
+DEFAULT_SPAN_THRESHOLD = float(_SCAN_POLICY.get("span_threshold", 0.45))
+DEFAULT_DOC_THRESHOLD = float(_SCAN_POLICY.get("doc_threshold", 0.9))
 MASK_URLS = bool(_SCAN_POLICY.get("mask_urls", True))
 MASK_EMAILS = bool(_SCAN_POLICY.get("mask_emails", True))
 DEFAULT_CHUNK_TOKENS = 2048
@@ -48,13 +45,34 @@ DEFAULT_OVERLAP_TOKENS = 256
 DEFAULT_MAX_CHUNKS = 64
 DEFAULT_CHUNK_CHARS = 2048
 DEFAULT_OVERLAP_CHARS = 256
+DEFAULT_CONTEXT_WINDOW_CHARS = 512
+
+_DIRECT_INJECTION_MARKER_RE = re.compile(
+    r"(?:"
+    r"ignore\s+(?:all\s+)?(?:the\s+)?(?:previous|prior|above)\s+"
+    r"(?:instructions|rules)|"
+    r"disregard\s+(?:all\s+)?(?:previous|prior|above)\s+"
+    r"(?:instructions|rules)|"
+    r"forget\s+(?:all\s+)?(?:previous|prior|above)\s+"
+    r"(?:instructions|rules)|"
+    r"(?:reveal|print|show|repeat)\s+(?:the\s+)?"
+    r"(?:system|developer)\s+(?:prompt|message|instructions)|"
+    r"(?:system|developer)\s+(?:prompt|message)|"
+    r"jailbreak|developer\s+mode|"
+    r"bypass\s+(?:the\s+)?(?:safety|security)\s+(?:policy|rules)|"
+    r"act\s+as\s+(?:a\s+)?system|you\s+are\s+now\s+(?:a\s+)?system|"
+    r"忽略(?:之前|以上|所有|前面)?的?指令|"
+    r"无视(?:之前|以上|所有|前面)?的?指令|"
+    r"显示(?:系统|开发者)(?:提示词|消息)|"
+    r"绕过(?:安全|防护)(?:策略|规则)"
+    r")",
+    re.IGNORECASE,
+)
+DEFAULT_CONTEXT_OVERLAP_CHARS = 128
 DEFAULT_NATIVE_CHUNK_CHARS = 2048
 DEFAULT_NATIVE_OVERLAP_CHARS = 256
-LEGACY_FALLBACK_MODEL_DIR = (
-    Path(__file__).resolve().parents[4]
-    / "models"
-    / "prompt-injection-guard-small"
-)
+DIRECT_INJECTION_THRESHOLD = 0.5
+LEGACY_FALLBACK_MODEL_DIR = Path(__file__).resolve().parents[4] / "models" / "prompt-injection-guard-small"
 DIRECT_INJECTION_PLACEHOLDER = "[[DATA_REMOVED]]"
 INDIRECT_INJECTION_PLACEHOLDER = "[[DATA_REMOVED]]"
 _URL_IN_TEXT_RE = re.compile(r"(?:https?://|www\.)[^\s<>]+", re.IGNORECASE)
@@ -62,9 +80,7 @@ _EMAIL_IN_TEXT_RE = re.compile(
     r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
     re.IGNORECASE,
 )
-_CONTROLLER_REFERENCE_RE = re.compile(
-    r"\[\[(?:SENSITIVE_REF:.+?|DATA_REMOVED)\]\]"
-)
+_CONTROLLER_REFERENCE_RE = re.compile(r"\[\[(?:SENSITIVE_REF:.+?|DATA_REMOVED)\]\]")
 SECURITY_PLACEHOLDER_NOTICE = (
     "AgentTrace security notice: the marker "
     f"'{DIRECT_INJECTION_PLACEHOLDER}' is controller-generated "
@@ -140,6 +156,12 @@ class InjectionScanResult:
     chunks: list[InjectionChunk] = field(default_factory=list)
     chunk_count: int = 0
     detector: str = DEFAULT_MODEL_NAME
+    primary_detector: str = DEFAULT_MODEL_NAME
+    fallback_detector: str = ""
+    fallback_available: bool = False
+    fallback_executed: bool = False
+    coverage_scope: str = "primary_only"
+    coverage_complete: bool = True
     available: bool = True
     error: str = ""
     truncated: bool = False
@@ -157,6 +179,12 @@ class InjectionScanResult:
             "chunks": [chunk.to_dict() for chunk in self.chunks],
             "chunk_count": self.chunk_count,
             "detector": self.detector,
+            "primary_detector": self.primary_detector,
+            "fallback_detector": self.fallback_detector,
+            "fallback_available": self.fallback_available,
+            "fallback_executed": self.fallback_executed,
+            "coverage_scope": self.coverage_scope,
+            "coverage_complete": self.coverage_complete,
             "available": self.available,
             "error": self.error,
             "truncated": self.truncated,
@@ -174,9 +202,7 @@ class TransformersInjectionClassifier:
     ) -> None:
         self.model_name = model_name
         self.safe_label = safe_label
-        self.explicit_model_path = (
-            Path(model_path) if model_path is not None else None
-        )
+        self.explicit_model_path = Path(model_path) if model_path is not None else None
         self._pipeline: Any = None
         self.model_path: str | None = None
         self._lock = threading.Lock()
@@ -192,12 +218,11 @@ class TransformersInjectionClassifier:
                 from transformers import pipeline
             except ImportError as exc:
                 raise RuntimeError(
-                    "Prompt-injection scanning requires "
-                    "`pip install 'agentdojo[transformers]'`."
+                    "Prompt-injection scanning requires `pip install 'agentdojo[transformers]'`."
                 ) from exc
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.model_path = str(
-                self.explicit_model_path or LEGACY_FALLBACK_MODEL_DIR
+                self.explicit_model_path or model_assets.DEFAULT_INJECTION_MODEL_DIR or LEGACY_FALLBACK_MODEL_DIR
             )
             self._pipeline = _build_local_text_classification_pipeline(
                 pipeline,
@@ -247,6 +272,8 @@ class InjectionScanner:
         chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
         overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
         max_chunks: int = DEFAULT_MAX_CHUNKS,
+        full_text_gate: bool = False,
+        trusted_instruction_mode: bool = False,
     ) -> None:
         self.classifier = classifier or UnplugTinyClassifier(
             span_threshold=DEFAULT_SPAN_THRESHOLD,
@@ -254,36 +281,52 @@ class InjectionScanner:
         )
         self.fallback_classifier = fallback_classifier
         if self.fallback_classifier is None and classifier is None:
-            if (
-                (LEGACY_FALLBACK_MODEL_DIR / "config.json").is_file()
-                and (
-                    LEGACY_FALLBACK_MODEL_DIR / "model.safetensors"
-                ).is_file()
-            ):
+            fallback_model_dir = model_assets.DEFAULT_INJECTION_MODEL_DIR
+            if (fallback_model_dir / "config.json").is_file() and (fallback_model_dir / "model.safetensors").is_file():
                 self.fallback_classifier = TransformersInjectionClassifier(
-                    model_name="Horizon-Labs/"
-                    "prompt-injection-guard-small",
+                    model_name="Horizon-Labs/prompt-injection-guard-small",
                 )
         self.threshold = float(threshold)
         self.chunk_tokens = max(32, int(chunk_tokens))
         self.overlap_tokens = max(0, min(int(overlap_tokens), self.chunk_tokens - 1))
         self.max_chunks = max(1, int(max_chunks))
+        self.full_text_gate = bool(full_text_gate)
+        self.trusted_instruction_mode = bool(trusted_instruction_mode)
         self._cache: dict[str, InjectionScanResult] = {}
         self._lock = threading.Lock()
 
     @property
     def detector_name(self) -> str:
         return str(
-            getattr(self.classifier, "model_name", None)
-            or getattr(self.classifier, "__name__", "injection_classifier")
+            getattr(self.classifier, "model_name", None) or getattr(self.classifier, "__name__", "injection_classifier")
         )
 
     @property
     def fallback_detector_name(self) -> str:
-        return str(
-            getattr(self.fallback_classifier, "model_name", "")
-            or ""
-        )
+        return str(getattr(self.fallback_classifier, "model_name", "") or "")
+
+    @property
+    def fallback_available(self) -> bool:
+        return self.fallback_classifier is not None
+
+    @property
+    def coverage_scope(self) -> str:
+        return "primary_plus_fallback" if self.fallback_available else "primary_only"
+
+    def _decorate_result(
+        self,
+        result: InjectionScanResult,
+        *,
+        fallback_executed: bool = False,
+    ) -> InjectionScanResult:
+        """Attach the detector path and coverage actually used for this scan."""
+        result.primary_detector = self.detector_name
+        result.fallback_detector = self.fallback_detector_name
+        result.fallback_available = self.fallback_available
+        result.fallback_executed = bool(fallback_executed or result.fallback_executed)
+        result.coverage_scope = self.coverage_scope
+        result.coverage_complete = bool(result.available and not result.truncated)
+        return result
 
     def warmup(self) -> None:
         warmup = getattr(self.classifier, "warmup", None)
@@ -299,11 +342,7 @@ class InjectionScanner:
         results: list[InjectionScanResult | None] = [None] * len(values)
         keys = [
             hashlib.sha256(
-                (
-                    f"{self.detector_name}\0"
-                    f"{self.fallback_detector_name}\0"
-                    f"{self.threshold}\0{value}"
-                ).encode(
+                (f"{self.detector_name}\0{self.fallback_detector_name}\0{self.threshold}\0{value}").encode(
                     "utf-8",
                     errors="replace",
                 )
@@ -326,9 +365,11 @@ class InjectionScanner:
             if results[index] is not None:
                 continue
             if not value.strip():
-                results[index] = InjectionScanResult(
-                    detector=self.detector_name,
-                    threshold=self.threshold,
+                results[index] = self._decorate_result(
+                    InjectionScanResult(
+                        detector=self.detector_name,
+                        threshold=self.threshold,
+                    )
                 )
                 continue
             pending_by_value.setdefault(value, []).append(index)
@@ -344,35 +385,128 @@ class InjectionScanner:
                     if result is not None:
                         self._cache[key] = result
             return [
-                result or InjectionScanResult(
-                    threshold=self.threshold,
-                    detector=self.detector_name,
-                    available=False,
-                    error="scanner did not produce a result",
+                result
+                or self._decorate_result(
+                    InjectionScanResult(
+                        threshold=self.threshold,
+                        detector=self.detector_name,
+                        available=False,
+                        error="scanner did not produce a result",
+                    )
                 )
                 for result in results
             ]
 
         prepared: list[tuple[str, list[tuple[int, int]], bool]] = []
-        chunk_texts: list[str] = []
         for value in pending_by_value:
             spans = self._chunk_spans(value)
             truncated = len(spans) > self.max_chunks
             if truncated:
                 spans = spans[: self.max_chunks]
             prepared.append((value, spans, truncated))
-            chunk_texts.extend(
-                _mask_nonlinguistic_tokens(value[start:end])
-                for start, end in spans
-            )
 
         try:
+            document_score_by_value: dict[str, float] = {}
+            context_score_by_value: dict[str, float] = {}
+            context_spans_by_value: dict[
+                str,
+                list[tuple[int, int, float]],
+            ] = {}
+            if self.full_text_gate:
+                full_texts = [_mask_nonlinguistic_tokens(value) for value, _spans, _truncated in prepared]
+                if hasattr(self.classifier, "classify_many"):
+                    document_scores = self.classifier.classify_many(full_texts)
+                else:
+                    document_scores = [self.classifier.classify(item) for item in full_texts]
+                document_scores = [min(1.0, max(0.0, float(score or 0.0))) for score in document_scores]
+                gated_prepared = []
+                for prepared_item, document_score in zip(
+                    prepared,
+                    document_scores,
+                    strict=True,
+                ):
+                    value, spans, truncated = prepared_item
+                    if document_score >= self.threshold:
+                        gated_prepared.append(prepared_item)
+                        document_score_by_value[value] = document_score
+                        continue
+
+                    context_windows = self._context_window_spans(value)
+                    if not context_windows:
+                        result = self._decorate_result(
+                            InjectionScanResult(
+                                suspected=False,
+                                score=document_score,
+                                threshold=self.threshold,
+                                chunk_count=1,
+                                detector=self.detector_name,
+                                truncated=truncated,
+                            )
+                        )
+                        for result_index in pending_by_value[value]:
+                            results[result_index] = result
+                        continue
+
+                    context_texts = [
+                        _mask_nonlinguistic_tokens(value[context_start:context_end])
+                        for (
+                            context_start,
+                            context_end,
+                            _unit_start,
+                            _unit_end,
+                        ) in context_windows
+                    ]
+                    if hasattr(self.classifier, "classify_many"):
+                        context_scores = self.classifier.classify_many(context_texts)
+                    else:
+                        context_scores = [self.classifier.classify(item) for item in context_texts]
+                    context_scores = [min(1.0, max(0.0, float(score or 0.0))) for score in context_scores]
+                    suspicious_contexts = [
+                        (
+                            unit_start,
+                            unit_end,
+                            context_score,
+                        )
+                        for (
+                            _context_start,
+                            _context_end,
+                            unit_start,
+                            unit_end,
+                        ), context_score in zip(
+                            context_windows,
+                            context_scores,
+                            strict=True,
+                        )
+                        if context_score >= self.threshold
+                    ]
+                    if suspicious_contexts:
+                        gated_prepared.append(prepared_item)
+                        context_spans_by_value[value] = suspicious_contexts
+                        context_score_by_value[value] = max(score for _start, _end, score in suspicious_contexts)
+                    else:
+                        result = self._decorate_result(
+                            InjectionScanResult(
+                                suspected=False,
+                                score=document_score,
+                                threshold=self.threshold,
+                                chunk_count=len(context_windows),
+                                detector=self.detector_name,
+                                truncated=truncated,
+                            )
+                        )
+                        for result_index in pending_by_value[value]:
+                            results[result_index] = result
+                prepared = gated_prepared
+
+            chunk_texts = [
+                _mask_nonlinguistic_tokens(value[start:end])
+                for value, spans, _truncated in prepared
+                for start, end in spans
+            ]
             if hasattr(self.classifier, "classify_many"):
                 scores = self.classifier.classify_many(chunk_texts)
             else:
-                scores = [
-                    self.classifier.classify(item) for item in chunk_texts
-                ]
+                scores = [self.classifier.classify(item) for item in chunk_texts]
             scores = [min(1.0, max(0.0, float(score or 0.0))) for score in scores]
             score_cursor = 0
             for value, spans, truncated in prepared:
@@ -392,23 +526,83 @@ class InjectionScanner:
                                 text=value[start:end],
                             )
                         )
-                result = InjectionScanResult(
-                    suspected=bool(chunks),
-                    score=max_score,
-                    threshold=self.threshold,
-                    chunks=chunks,
-                    chunk_count=len(spans),
-                    detector=self.detector_name,
-                    truncated=truncated,
+                document_score = document_score_by_value.get(value)
+                if document_score is not None and not chunks:
+                    chunks = [
+                        InjectionChunk(
+                            index=0,
+                            start=0,
+                            end=len(value),
+                            score=document_score,
+                            text=value,
+                        )
+                    ]
+                contextual_candidates = context_spans_by_value.get(
+                    value,
+                    [],
+                )
+                if contextual_candidates and not chunks:
+                    chunks = [
+                        InjectionChunk(
+                            index=index,
+                            start=start,
+                            end=end,
+                            score=score,
+                            text=value[start:end],
+                        )
+                        for index, (start, end, score) in enumerate(contextual_candidates)
+                    ]
+                    max_score = max(
+                        max_score,
+                        context_score_by_value.get(value, 0.0),
+                    )
+                trusted_command_without_marker = bool(
+                    self.trusted_instruction_mode
+                    and self.full_text_gate
+                    and chunks
+                    and not _DIRECT_INJECTION_MARKER_RE.search(value)
+                )
+                if trusted_command_without_marker:
+                    # A trusted user's ordinary imperative ("then send Bob a
+                    # message") is an authorization request, not an attempt
+                    # to override the system. Privilege-escalation language
+                    # still enters quarantine below.
+                    chunks = []
+                    document_score = None
+                    context_score_by_value[value] = 0.0
+                    max_score = 0.0
+                result = self._decorate_result(
+                    InjectionScanResult(
+                        suspected=bool(chunks) or document_score is not None,
+                        score=(
+                            max(
+                                max_score,
+                                document_score or 0.0,
+                                context_score_by_value.get(value, 0.0),
+                            )
+                            if document_score is not None
+                            else max(
+                                max_score,
+                                context_score_by_value.get(value, 0.0),
+                            )
+                        ),
+                        threshold=self.threshold,
+                        chunks=chunks,
+                        chunk_count=len(spans),
+                        detector=self.detector_name,
+                        truncated=truncated,
+                    )
                 )
                 for result_index in pending_by_value[value]:
                     results[result_index] = result
         except Exception as exc:
-            result = InjectionScanResult(
-                threshold=self.threshold,
-                detector=self.detector_name,
-                available=False,
-                error=str(exc),
+            result = self._decorate_result(
+                InjectionScanResult(
+                    threshold=self.threshold,
+                    detector=self.detector_name,
+                    available=False,
+                    error=str(exc),
+                )
             )
             for indices in pending_by_value.values():
                 for result_index in indices:
@@ -420,11 +614,14 @@ class InjectionScanner:
                 if result is not None:
                     self._cache[key] = result
         return [
-            result or InjectionScanResult(
-                threshold=self.threshold,
-                detector=self.detector_name,
-                available=False,
-                error="scanner did not produce a result",
+            result
+            or self._decorate_result(
+                InjectionScanResult(
+                    threshold=self.threshold,
+                    detector=self.detector_name,
+                    available=False,
+                    error="scanner did not produce a result",
+                )
             )
             for result in results
         ]
@@ -432,14 +629,10 @@ class InjectionScanner:
     def _scan_native_value(self, value: str) -> InjectionScanResult:
         """Use native document/span heads and merge long-text windows."""
         window_spans = self._native_window_spans(value)
+        fallback_executed = False
         try:
-            predictions: list[NativeInjectionPrediction] = (
-                self.classifier.predict_many(
-                    [
-                        _mask_nonlinguistic_tokens(value[start:end])
-                        for start, end in window_spans
-                    ]
-                )
+            predictions: list[NativeInjectionPrediction] = self.classifier.predict_many(
+                [_mask_nonlinguistic_tokens(value[start:end]) for start, end in window_spans]
             )
             merged: list[InjectionChunk] = []
             doc_score = 0.0
@@ -506,9 +699,8 @@ class InjectionScanner:
                 truncated=False,
             )
             if not result.suspected and self.fallback_classifier is not None:
-                fallback_chunks, fallback_count, fallback_score = (
-                    self._scan_fallback_units(value)
-                )
+                fallback_executed = True
+                fallback_chunks, fallback_count, fallback_score = self._scan_fallback_units(value)
                 result.chunk_count += fallback_count
                 if fallback_chunks:
                     result.chunks = fallback_chunks
@@ -518,19 +710,22 @@ class InjectionScanner:
                         result.span_score,
                         fallback_score,
                     )
-                    result.detector = (
-                        f"{self.detector_name}+"
-                        f"{self.fallback_detector_name}"
-                    )
-            return result
+                    result.detector = f"{self.detector_name}+{self.fallback_detector_name}"
+            return self._decorate_result(
+                result,
+                fallback_executed=fallback_executed,
+            )
         except Exception as exc:
-            return InjectionScanResult(
-                threshold=self.threshold,
-                span_threshold=DEFAULT_SPAN_THRESHOLD,
-                doc_threshold=DEFAULT_DOC_THRESHOLD,
-                detector=self.detector_name,
-                available=False,
-                error=str(exc),
+            return self._decorate_result(
+                InjectionScanResult(
+                    threshold=self.threshold,
+                    span_threshold=DEFAULT_SPAN_THRESHOLD,
+                    doc_threshold=DEFAULT_DOC_THRESHOLD,
+                    detector=self.detector_name,
+                    available=False,
+                    error=str(exc),
+                ),
+                fallback_executed=fallback_executed,
             )
 
     def _scan_fallback_units(
@@ -561,11 +756,10 @@ class InjectionScanner:
                     overlap_chars=DEFAULT_NATIVE_OVERLAP_CHARS,
                 )
             )
+        if self.fallback_classifier is None:
+            return [], len(expanded), 0.0
         scores = self.fallback_classifier.classify_many(
-            [
-                _mask_nonlinguistic_tokens(value[start:end])
-                for start, end in expanded
-            ]
+            [_mask_nonlinguistic_tokens(value[start:end]) for start, end in expanded]
         )
         chunks: list[InjectionChunk] = []
         max_score = 0.0
@@ -623,10 +817,7 @@ class InjectionScanner:
                     unit_spans = []
             if not unit_spans:
                 unit_spans = self._char_spans(unit)
-            spans.extend(
-                (unit_start + start, unit_start + end)
-                for start, end in unit_spans
-            )
+            spans.extend((unit_start + start, unit_start + end) for start, end in unit_spans)
         return spans or self._char_spans(text)
 
     def _semantic_unit_spans(self, text: str) -> list[tuple[int, int]]:
@@ -644,11 +835,35 @@ class InjectionScanner:
                 start = end
         if start < len(text):
             units.append((start, len(text)))
-        return [
-            (start, end)
-            for start, end in units
-            if text[start:end].strip()
-        ]
+        return [(start, end) for start, end in units if text[start:end].strip()]
+
+    def _context_window_spans(
+        self,
+        text: str,
+    ) -> list[tuple[int, int, int, int]]:
+        """Return semantic windows with one neighbouring unit of context.
+
+        A whole-document score can be diluted by long benign text. Context
+        windows keep local instruction boundaries visible without reverting to
+        isolated sentence classification, which is prone to normal-action false
+        positives.
+        """
+        units = self._semantic_unit_spans(text)
+        if len(units) <= 1:
+            if len(text) <= DEFAULT_CONTEXT_WINDOW_CHARS:
+                return []
+            spans = self._char_spans(
+                text,
+                chunk_chars=DEFAULT_CONTEXT_WINDOW_CHARS,
+                overlap_chars=DEFAULT_CONTEXT_OVERLAP_CHARS,
+            )
+            return [(start, end, start, end) for start, end in spans]
+        windows: list[tuple[int, int, int, int]] = []
+        for index, (unit_start, unit_end) in enumerate(units):
+            context_start = units[index - 1][0] if index > 0 else unit_start
+            context_end = units[index + 1][1] if index + 1 < len(units) else unit_end
+            windows.append((context_start, context_end, unit_start, unit_end))
+        return windows
 
     def _token_spans(self, offsets: list[tuple[int, int]]) -> list[tuple[int, int]]:
         step = self.chunk_tokens - self.overlap_tokens
@@ -754,9 +969,7 @@ def redact_injection_chunks_with_metrics(
             flagged_spans=[],
             operations=[],
             residual_scan=(
-                residual_scan.to_dict()
-                if isinstance(residual_scan, InjectionScanResult)
-                else residual_scan
+                residual_scan.to_dict() if isinstance(residual_scan, InjectionScanResult) else residual_scan
             ),
         )
     chunks = sorted(chunks, key=lambda item: (item[0], item[1]))
@@ -778,11 +991,7 @@ def redact_injection_chunks_with_metrics(
         raw_chunks = scan.get("chunks", []) if isinstance(scan, Mapping) else scan.chunks
         if index < len(raw_chunks):
             raw_chunk = raw_chunks[index]
-            score = float(
-                raw_chunk.get("score", 0.0)
-                if isinstance(raw_chunk, Mapping)
-                else raw_chunk.score
-            )
+            score = float(raw_chunk.get("score", 0.0) if isinstance(raw_chunk, Mapping) else raw_chunk.score)
         operations.append(
             RedactionOperation(
                 original_start=int(chunk_start),
@@ -804,31 +1013,20 @@ def redact_injection_chunks_with_metrics(
         sanitized=sanitized,
         flagged_spans=flagged_spans,
         operations=operations,
-        residual_scan=(
-            residual_scan.to_dict()
-            if isinstance(residual_scan, InjectionScanResult)
-            else residual_scan
-        ),
+        residual_scan=(residual_scan.to_dict() if isinstance(residual_scan, InjectionScanResult) else residual_scan),
     )
     return sanitized, metrics
 
 
 def contains_security_placeholder(text: str) -> bool:
     value = str(text or "")
-    return (
-        DIRECT_INJECTION_PLACEHOLDER in value
-        or INDIRECT_INJECTION_PLACEHOLDER in value
-    )
+    return DIRECT_INJECTION_PLACEHOLDER in value or INDIRECT_INJECTION_PLACEHOLDER in value
 
 
 def _scan_chunks(
     scan: InjectionScanResult | Mapping[str, Any],
 ) -> list[tuple[int, int]]:
-    raw_chunks = (
-        scan.get("chunks", [])
-        if isinstance(scan, Mapping)
-        else scan.chunks
-    )
+    raw_chunks = scan.get("chunks", []) if isinstance(scan, Mapping) else scan.chunks
     result = []
     for chunk in raw_chunks:
         if isinstance(chunk, Mapping):
@@ -842,16 +1040,43 @@ def _scan_chunks(
 
 
 _DEFAULT_SCANNER: InjectionScanner | None = None
+_DIRECT_INJECTION_SCANNER: InjectionScanner | None = None
 _DEFAULT_SCANNER_LOCK = threading.Lock()
+_DIRECT_INJECTION_SCANNER_LOCK = threading.Lock()
 
 
 def get_injection_scanner() -> InjectionScanner:
+    """Return the untrusted-content scanner used by Ring 1.
+
+    Unplug remains the primary detector so Ring 1 retains field-level span
+    localization and the multilingual prompt-injection-guard fallback.
+    """
     global _DEFAULT_SCANNER
     if _DEFAULT_SCANNER is None:
         with _DEFAULT_SCANNER_LOCK:
             if _DEFAULT_SCANNER is None:
                 _DEFAULT_SCANNER = InjectionScanner()
     return _DEFAULT_SCANNER
+
+
+def get_direct_injection_scanner() -> InjectionScanner:
+    """Return the DeBERTa scanner used for trusted direct user instructions."""
+    global _DIRECT_INJECTION_SCANNER
+    if _DIRECT_INJECTION_SCANNER is None:
+        with _DIRECT_INJECTION_SCANNER_LOCK:
+            if _DIRECT_INJECTION_SCANNER is None:
+                model_path = resolve_direct_injection_model_path()
+                classifier = TransformersInjectionClassifier(
+                    model_name=DIRECT_INJECTION_MODEL_ID,
+                    model_path=model_path,
+                )
+                _DIRECT_INJECTION_SCANNER = InjectionScanner(
+                    classifier,
+                    threshold=DIRECT_INJECTION_THRESHOLD,
+                    full_text_gate=True,
+                    trusted_instruction_mode=True,
+                )
+    return _DIRECT_INJECTION_SCANNER
 
 
 def configure_injection_classifier(
@@ -869,7 +1094,25 @@ def configure_injection_classifier(
         return _DEFAULT_SCANNER
 
 
+def configure_direct_injection_classifier(
+    classifier: Any,
+    *,
+    threshold: float = DIRECT_INJECTION_THRESHOLD,
+) -> InjectionScanner:
+    """Replace the direct-prompt classifier, primarily for tests."""
+    global _DIRECT_INJECTION_SCANNER
+    with _DIRECT_INJECTION_SCANNER_LOCK:
+        _DIRECT_INJECTION_SCANNER = InjectionScanner(
+            classifier,
+            threshold=threshold,
+            full_text_gate=True,
+        )
+        return _DIRECT_INJECTION_SCANNER
+
+
 def reset_injection_scanner() -> None:
-    global _DEFAULT_SCANNER
+    global _DEFAULT_SCANNER, _DIRECT_INJECTION_SCANNER
     with _DEFAULT_SCANNER_LOCK:
         _DEFAULT_SCANNER = None
+    with _DIRECT_INJECTION_SCANNER_LOCK:
+        _DIRECT_INJECTION_SCANNER = None

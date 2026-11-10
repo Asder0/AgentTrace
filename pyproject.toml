@@ -101,13 +101,24 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentdojo"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["external_data", ".venv", "build", "dist"]
+markers = [
+    "llm: requires a live external language-model API",
+]
+
 [tool.ruff]
 line-length = 120
 exclude = ["**/experimental", "**/notebooks"]
 # include = ["src/", "examples/", "scripts/", "tests/"]
 
 [tool.ruff.lint]
-ignore = []
+ignore = [
+    "RUF001", # Chinese prose intentionally uses full-width punctuation.
+    "RUF002",
+    "RUF003",
+]
 select = [
     "F",   # pyflakes
     "UP",  # pyupgrade
@@ -118,6 +129,9 @@ select = [
     "UP",  # pyupgrade
     "RUF",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"src/agentdojo/method/modeling/graph_db.py" = ["N803", "N806"]
 
 [tool.ruff.format]
 docstring-code-format = true

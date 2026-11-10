@@ -1,12 +1,18 @@
 import dataclasses
 import inspect
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from contextvars import ContextVar
 from typing import Annotated, Any, Concatenate, Generic, TypeAlias, get_origin, get_type_hints, overload
 
 from docstring_parser import parse
 from docstring_parser.common import DocstringParam
 from pydantic import BaseModel, Field, ValidationError, create_model
 from typing_extensions import ParamSpec, TypeVar
+
+FUNCTION_CALL_ID: ContextVar[str | None] = ContextVar(
+    "agentdojo_function_call_id",
+    default=None,
+)
 
 
 class TaskEnvironment(BaseModel):

@@ -14,9 +14,10 @@ APP 域划分直接取自原版 AgentDojo 各 suite 的 ``task_suite.py`` 中的
 
 from __future__ import annotations
 
-# This is the single backend source of truth for APP/suite ownership.
+from collections.abc import Iterable, Mapping
 
-from typing import Any, Iterable, Mapping, Optional
+# This is the single backend source of truth for APP/suite ownership.
+from typing import Any
 
 SYSTEM_APP = "system"
 
@@ -154,7 +155,7 @@ for _domain, _config in APP_DOMAINS.items():
         _TOOL_DOMAINS.setdefault(_tool, []).append(_domain)
 
 
-def domain_for_tool(tool_name: str, suite: Optional[str] = None) -> Optional[str]:
+def domain_for_tool(tool_name: str, suite: str | None = None) -> str | None:
     """工具函数名 → APP 域。
 
     同名工具（calendar / send_email）优先使用实际 suite；否则仅当归属唯一时返回。
@@ -168,7 +169,7 @@ def domain_for_tool(tool_name: str, suite: Optional[str] = None) -> Optional[str
     return owners[0] if len(owners) == 1 else None
 
 
-def domain_for_module(module_name: str, suite: Optional[str] = None) -> Optional[str]:
+def domain_for_module(module_name: str, suite: str | None = None) -> str | None:
     """工具模块名 → APP 域（歧义模块优先使用实际 suite）。"""
     module = str(module_name or "")
     if not module:
@@ -181,9 +182,9 @@ def domain_for_module(module_name: str, suite: Optional[str] = None) -> Optional
     return owners[0] if len(owners) == 1 else None
 
 
-def infer_suite(nodes: Iterable[Mapping[str, Any]]) -> Optional[str]:
+def infer_suite(nodes: Iterable[Mapping[str, Any]]) -> str | None:
     """根据节点中的模块/工具信息推断唯一 task suite。"""
-    candidates: Optional[set[str]] = None
+    candidates: set[str] | None = None
     for node in nodes:
         if node.get("type") in ("AIAgent", "Prompt"):
             continue
@@ -218,9 +219,9 @@ def _id_of(value: Any) -> str:
 
 def normalize_graph_nodes(
     nodes: list[dict[str, Any]],
-    links: Optional[list[dict[str, Any]]] = None,
-    suite: Optional[str] = None,
-    tool_app: Optional[Mapping[str, str]] = None,
+    links: list[dict[str, Any]] | None = None,
+    suite: str | None = None,
+    tool_app: Mapping[str, str] | None = None,
 ) -> None:
     """原地规范化图谱节点：
 
@@ -255,7 +256,7 @@ def normalize_graph_nodes(
                 node["suite"] = suite
             continue
 
-        domain: Optional[str] = None
+        domain: str | None = None
         if node_type == "AgentTool":
             tool_name = str(node.get("label") or "")
             domain = (
@@ -293,8 +294,8 @@ def normalize_graph_nodes(
 
 def normalize_graph(
     graph: Mapping[str, Any],
-    suite: Optional[str] = None,
-    tool_app: Optional[Mapping[str, str]] = None,
+    suite: str | None = None,
+    tool_app: Mapping[str, str] | None = None,
 ) -> None:
     """规范化 ``{nodes, links}`` 结构的图谱数据。"""
     nodes = graph.get("nodes") or []

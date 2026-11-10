@@ -9,15 +9,17 @@ import math
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from agentdojo.types import get_text_content_as_str
 
 from ..modeling.policy import security_thresholds
 from .access_plan import parse_plan_json
+from .defense_config import auto_confirmations_enabled
 from .parameter_binding import action_flow_contract
+from .plan_identity import plan_hash_valid
 
 L2_CHAIN_CHECK_PROMPT = """You are checking the causal consistency of a
 high-impact Agent action that requires user confirmation. You do not receive
@@ -122,6 +124,10 @@ def confirmation_matches_request(
 ) -> tuple[bool, list[str]]:
     """Verify that approval still refers to the exact pending action."""
     mismatches: list[str] = []
+    if plan.get("contract_digest") and not plan_hash_valid(
+        plan
+    ):
+        mismatches.append("plan_integrity")
     if str(confirmation.get("tool_name", "")) != str(tool_name):
         mismatches.append("tool_name")
     expected_plan = (
@@ -136,14 +142,8 @@ def confirmation_matches_request(
     )
     if approved_plan != expected_plan:
         mismatches.append("plan_version")
-    approved_arguments_hash = str(
-        confirmation.get("args_hash", "")
-    )
-    if (
-        not approved_arguments_hash
-        or approved_arguments_hash
-        != stable_arguments_hash(arguments)
-    ):
+    approved_arguments_hash = str(confirmation.get("args_hash", ""))
+    if not approved_arguments_hash or approved_arguments_hash != stable_arguments_hash(arguments):
         mismatches.append("arguments")
     return not mismatches, mismatches
 
@@ -156,39 +156,40 @@ def _presentation_parameters(
     parameter_resolutions: list[dict[str, Any]] | None,
 ) -> list[str]:
     parameters: set[str] = set()
+    parameter_roles: dict[str, str] = {}
     contract = action_flow_contract(
         plan,
         tool_name,
         step_id=plan_step_id,
     )
-    bindings = (
-        contract.get("parameter_bindings", {})
-        if isinstance(contract, Mapping)
-        else {}
-    )
+    bindings = contract.get("parameter_bindings", {}) if isinstance(contract, Mapping) else {}
     if isinstance(bindings, Mapping):
         for parameter, binding in bindings.items():
             if not isinstance(binding, Mapping):
                 continue
-            generation_kind = str(
-                binding.get("generation_kind", "")
-            ).lower()
-            parameter_role = str(
-                binding.get("parameter_role", "")
-            ).lower()
-            if (
-                generation_kind == "presentation"
-                or parameter_role == "presentation"
-            ):
+            generation_kind = str(binding.get("generation_kind", "")).lower()
+            parameter_role = str(binding.get("parameter_role", "")).lower()
+            parameter_roles[str(parameter)] = parameter_role
+            if generation_kind == "presentation" or parameter_role == "presentation":
                 parameters.add(str(parameter))
     for resolution in parameter_resolutions or []:
         if not isinstance(resolution, Mapping):
             continue
+        parameter = str(resolution.get("parameter", ""))
+        parameter_roles.setdefault(
+            parameter,
+            str(resolution.get("parameter_role", "")).lower(),
+        )
         if resolution.get("validation_mode") in {
             "natural_language_manual",
             "natural_language_source",
         }:
-            parameters.add(str(resolution.get("parameter", "")))
+            parameters.add(parameter)
+    parameters = {
+        parameter
+        for parameter in parameters
+        if parameter_roles.get(parameter, "") not in {"destination", "control", "value"}
+    }
     parameters.discard("")
     return sorted(parameters)
 
@@ -201,7 +202,7 @@ def _bounded_execution_context(
 ) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     remaining = max(0, int(max_chars))
-    for raw in list(messages or [])[-max(0, int(max_messages)):]:
+    for raw in list(messages or [])[-max(0, int(max_messages)) :]:
         if not isinstance(raw, Mapping):
             continue
         role = str(raw.get("role", "")).strip()
@@ -258,12 +259,8 @@ def check_l2_chain_with_model(
     deterministic_checks = dict(deterministic_checks or {})
     ring_2_check = deterministic_checks.get("ring_2")
     ring_3_check = deterministic_checks.get("ring_3")
-    if (
-        isinstance(ring_2_check, Mapping)
-        and ring_2_check.get("passed") is False
-    ) or (
-        isinstance(ring_3_check, Mapping)
-        and ring_3_check.get("passed") is False
+    if (isinstance(ring_2_check, Mapping) and ring_2_check.get("passed") is False) or (
+        isinstance(ring_3_check, Mapping) and ring_3_check.get("passed") is False
     ):
         return {
             "consistent": False,
@@ -292,9 +289,7 @@ def check_l2_chain_with_model(
         "parameter_resolutions": parameter_resolutions or [],
         "effective_egress": effective_egress or [],
         "execution_history": execution_history or [],
-        "execution_context": _bounded_execution_context(
-            execution_context
-        ),
+        "execution_context": _bounded_execution_context(execution_context),
         "plan_usage": plan_usage or {},
         "presentation_parameters_do_not_validate": presentation_parameters,
         "deterministic_checks": deterministic_checks,
@@ -350,24 +345,15 @@ def check_l2_chain_with_model(
                 if not isinstance(item, Mapping):
                     structured_issues.append("invalid_violation")
                     continue
-                normalized = {
-                    str(key): value
-                    for key, value in item.items()
-                }
-                if not normalized.get("parameter") or not normalized.get(
-                    "kind"
-                ):
+                normalized = {str(key): value for key, value in item.items()}
+                if not normalized.get("parameter") or not normalized.get("kind"):
                     structured_issues.append("incomplete_violation")
-                if str(normalized.get("parameter", "")) in (
-                    presentation_parameter_set
-                ):
+                if str(normalized.get("parameter", "")) in (presentation_parameter_set):
                     manual_review_notes.append(normalized)
                 else:
                     violations.append(normalized)
         known_steps = {
-            str(step.get("id", ""))
-            for step in plan.get("steps", [])
-            if isinstance(step, Mapping) and step.get("id")
+            str(step.get("id", "")) for step in plan.get("steps", []) if isinstance(step, Mapping) and step.get("id")
         }
         known_actions = {
             str(action.get("name", ""))
@@ -377,14 +363,10 @@ def check_l2_chain_with_model(
             if isinstance(action, Mapping) and action.get("name")
         }
         known_actions.add(str(tool_name))
-        known_parameters = {
-            str(item)
-            for item in tool_args
-        } | {
+        known_parameters = {str(item) for item in tool_args} | {
             str(item.get("parameter", ""))
             for item in parameter_resolutions or []
-            if isinstance(item, Mapping)
-            and item.get("parameter")
+            if isinstance(item, Mapping) and item.get("parameter")
         }
         execution_count = len(execution_history or [])
         raw_evidence = raw.get("evidence", [])
@@ -395,7 +377,18 @@ def check_l2_chain_with_model(
             raw_evidence = []
         for item in raw_evidence:
             if not isinstance(item, Mapping):
-                unverified_evidence.append(item)
+                # Accept exact legacy anchors only. Free-form prose remains
+                # unverifiable; these two values are controller-known strings.
+                if isinstance(item, str) and user_prompt and item == user_prompt:
+                    verified_labels.append("用户指令")
+                elif (
+                    isinstance(item, str)
+                    and str(plan.get("plan_id", "")).strip()
+                    and item == str(plan.get("plan_id", "")).strip()
+                ):
+                    verified_labels.append("当前计划")
+                else:
+                    unverified_evidence.append(item)
                 continue
             kind = str(item.get("kind", "")).strip()
             ref = str(item.get("ref", "")).strip()
@@ -425,38 +418,24 @@ def check_l2_chain_with_model(
                 verified_labels.append(label)
             else:
                 unverified_evidence.append(dict(item))
-                structured_issues.append(
-                    f"invalid_evidence_ref:{kind}:{ref}"
-                )
+                structured_issues.append(f"invalid_evidence_ref:{kind}:{ref}")
         verified_evidence = list(dict.fromkeys(verified_labels))
         other_failed_checks = [
-            issue
-            for issue in structured_issues
-            if issue != "check_failed:semantic_parameter_relevance"
+            issue for issue in structured_issues if issue != "check_failed:semantic_parameter_relevance"
         ]
         presentation_only_override = (
             bool(manual_review_notes)
             and not violations
             and not other_failed_checks
-            and all(
-                checks.get(name, False)
-                for name in required_checks
-                if name != "semantic_parameter_relevance"
-            )
+            and all(checks.get(name, False) for name in required_checks if name != "semantic_parameter_relevance")
         )
         if presentation_only_override:
             checks["semantic_parameter_relevance"] = True
             structured_issues = [
-                issue
-                for issue in structured_issues
-                if issue != "check_failed:semantic_parameter_relevance"
+                issue for issue in structured_issues if issue != "check_failed:semantic_parameter_relevance"
             ]
             consistent = True
-            reason = (
-                reason
-                + "（自然语言参数不参与 L2 事实与来源覆盖判定，"
-                "相关内容已转入人工核对。）"
-            )
+            reason = reason + "（自然语言参数不参与 L2 事实与来源覆盖判定，相关内容已转入人工核对。）"
         if consistent and (structured_issues or violations):
             consistent = False
             reason = (
@@ -465,13 +444,7 @@ def check_l2_chain_with_model(
                 + ", ".join(
                     [
                         *structured_issues,
-                        *(
-                            [
-                                f"violation:{item.get('parameter', '-')}:"
-                                f"{item.get('kind', '-')}"
-                                for item in violations
-                            ]
-                        ),
+                        *([f"violation:{item.get('parameter', '-')}:{item.get('kind', '-')}" for item in violations]),
                     ]
                 )
                 + "）"
@@ -481,13 +454,7 @@ def check_l2_chain_with_model(
             reason = reason + "（未提供可核验的链证据，已阻断。）"
         if consistent and confidence < minimum:
             consistent = False
-            reason = (
-                reason
-                + (
-                    f"（判定置信度 {confidence:.2f} 低于阈值 "
-                    f"{minimum:.2f}，已阻断）"
-                )
-            )
+            reason = reason + (f"（判定置信度 {confidence:.2f} 低于阈值 {minimum:.2f}，已阻断）")
         return {
             "consistent": consistent,
             "available": True,
@@ -535,6 +502,7 @@ class PendingConfirmation:
     decision: dict[str, Any] | None = None
     decision_hash: str = ""
     flow_check: dict[str, Any] = field(default_factory=dict)
+    approval_source: str = "user"
     event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -558,23 +526,22 @@ class PendingConfirmation:
             "decision_kind": self.decision_kind,
             "options": list(self.options),
             "payload": dict(self.payload),
-            "decision": (
-                dict(self.decision)
-                if isinstance(self.decision, Mapping)
-                else None
-            ),
+            "decision": (dict(self.decision) if isinstance(self.decision, Mapping) else None),
             "decision_hash": self.decision_hash,
             "flow_check": dict(self.flow_check),
+            "approval_source": self.approval_source,
         }
 
 
 class ConfirmationBroker:
     """Thread-safe L2 confirmation bridge used by Flask and the Agent thread."""
 
-    _instance: "ConfirmationBroker | None" = None
+    _instance: ConfirmationBroker | None = None
     _lock = threading.Lock()
+    _pending: dict[str, PendingConfirmation]
+    _pending_lock: Any
 
-    def __new__(cls) -> "ConfirmationBroker":
+    def __new__(cls) -> ConfirmationBroker:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
@@ -614,7 +581,7 @@ class ConfirmationBroker:
             chain_check=dict(chain_check),
             confirmation_kind=str(confirmation_kind or "l2_action"),
             decision_kind=str(decision_kind or "approve_reject"),
-            options=copy.deepcopy(list(options or [])),
+            options=[copy.deepcopy(dict(item)) for item in (options or []) if isinstance(item, Mapping)],
             payload=copy.deepcopy(dict(payload or {})),
             flow_check=dict(flow_check or {}),
             created_at=now,
@@ -624,6 +591,56 @@ class ConfirmationBroker:
             self._pending[pending.request_id] = pending
         if on_pending is not None:
             on_pending(pending.to_dict())
+        if auto_confirmations_enabled():
+            pending.approval_source = "automatic_default"
+            if pending.decision_kind == "approve_reject":
+                pending.approved = True
+                pending.status = "approved"
+                pending.decision = {
+                    "decision": "approve",
+                    "source": "automatic_default",
+                }
+            elif pending.decision_kind == "requirement_resolution":
+                requirement_ids = sorted(
+                    {
+                        str(requirement_id)
+                        for option in pending.options
+                        if isinstance(option, Mapping)
+                        and option.get("kind")
+                        == "waive_requirement"
+                        for requirement_id in option.get(
+                            "requirement_ids",
+                            [],
+                        )
+                        if str(requirement_id).strip()
+                    }
+                )
+                pending.decision = {
+                    "decision": (
+                        "waive_requirement"
+                        if requirement_ids
+                        else "cancel_task"
+                    ),
+                    "requirement_ids": requirement_ids,
+                    "source": "automatic_default",
+                }
+                pending.approved = bool(requirement_ids)
+                pending.status = (
+                    "resolved"
+                    if pending.approved
+                    else "cancelled"
+                )
+            else:
+                pending.approved = False
+                pending.status = "cancelled"
+                pending.decision = {
+                    "decision": "cancel_task",
+                    "source": "automatic_default",
+                }
+            pending.decision_hash = stable_arguments_hash(
+                pending.decision
+            )
+            pending.event.set()
         pending.event.wait()
         with self._pending_lock:
             result = pending.to_dict()
@@ -644,9 +661,7 @@ class ConfirmationBroker:
                 if not isinstance(decision, Mapping):
                     return None
                 normalized_decision = copy.deepcopy(dict(decision))
-                decision_name = str(
-                    normalized_decision.get("decision") or ""
-                )
+                decision_name = str(normalized_decision.get("decision") or "")
                 selected_requirements = {
                     str(value)
                     for value in normalized_decision.get(
@@ -663,34 +678,23 @@ class ConfirmationBroker:
                 allowed_requirement_ids = {
                     str(value)
                     for option in pending.options
-                    if isinstance(option, Mapping)
-                    and option.get("kind") == "waive_requirement"
+                    if isinstance(option, Mapping) and option.get("kind") == "waive_requirement"
                     for value in option.get("requirement_ids", [])
                     if str(value).strip()
                 }
                 if decision_name == "waive_requirement":
-                    if (
-                        not selected_requirements
-                        or not selected_requirements.issubset(
-                            allowed_requirement_ids
-                        )
-                    ):
+                    if not selected_requirements or not selected_requirements.issubset(allowed_requirement_ids):
                         return None
                 elif selected_requirements:
                     return None
                 pending.decision = normalized_decision
-                pending.decision_hash = stable_arguments_hash(
-                    normalized_decision
-                )
+                pending.decision_hash = stable_arguments_hash(normalized_decision)
                 pending.approved = decision_name != "cancel_task"
-                pending.status = (
-                    "cancelled"
-                    if decision_name == "cancel_task"
-                    else "resolved"
-                )
+                pending.status = "cancelled" if decision_name == "cancel_task" else "resolved"
             else:
                 pending.approved = bool(approved)
                 pending.status = "approved" if approved else "rejected"
+                pending.approval_source = "user"
             pending.event.set()
             return pending.to_dict()
 

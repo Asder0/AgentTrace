@@ -123,6 +123,9 @@ src/agentdojo/method/
 │   ├── l2_chain.py
 │   ├── requirement_audit.py
 │   ├── outcome_audit.py
+│   ├── execution_contract.py
+│   ├── architecture_metrics.py
+│   ├── security_metrics.py
 │   ├── risk_types.py
 │   └── defense_config.py
 ├── tasks/
@@ -163,7 +166,7 @@ flowchart LR
     Agent --> Trace[Graph + events + snapshots]
 ```
 
-预设任务、自定义任务、攻击任务和 `/api/reset` 共用该执行锁。锁是进程内锁，适用于当前单进程 Flask 服务；多进程部署需要外部锁或任务级隔离存储。
+预设任务、跨 APP 攻击任务和 `/api/reset` 共用该执行锁。后端仍保留仅供内部调试的自定义执行接口。锁是进程内锁，适用于当前单进程 Flask 服务；多进程部署需要外部锁或任务级隔离存储。
 
 ## 5. Capture Layer
 
@@ -265,6 +268,10 @@ flowchart LR
 
 `belongsTo`、`wasAssociatedWith`、`wasAttributedTo`、`hasState`、`contains` 等 PROV 或归属边保留在底层图谱和节点详情中，但不进入默认主视图。
 
+画布不显示低层审计边，也不提供全局“审计边”开关。风险证据、来源、泄漏出口和
+`transition_to` 等辅助关系仍完整保存在 trace 与节点关系中，可通过审计数据或节点详情核对；
+画布仅展示跨 APP 数据流和风险判定所必需的主要关系，避免把全量低层关系同时画成连线。
+
 ### 6.3 信息流标签
 
 每个数据节点和工具结果包含：
@@ -316,27 +323,22 @@ outcome 仍保留为必需结果。
 
 ### 7.1 Ring 0：用户输入直接注入
 
-默认检测器为项目本地的 `Unplug-AI/unplug-tiny-v1`。该模型使用 DeBERTa-v2 双头结构：
+默认检测器为项目本地的 `deberta-v3-base-prompt-injection-v2`，用于直接用户指令：
 
-- 文档头判断整段文本是否包含注入；
-- BIOES 令牌头将攻击定位为原文字符 span；
-- 文档阈值默认为 `0.9`，span 阈值默认为 `0.45`；
-- 只有超过模型上下文时才使用分块，默认 `2048` 字符窗口和 `256` 字符重叠。
+- 先对完整用户 prompt 做文档级门控，避免把正常的发送、转账命令按短句误判；
+- 完整 prompt 命中后，再按段落和句子定位可疑片段；
+- 阈值默认为 `0.5`；
+- 默认模式为 `quarantine`，命中的输入片段会替换为 `[[DATA_REMOVED]]` 后再进入 Agent。
 
-控制器只把攻击 span 替换为 `[[DATA_REMOVED]]`，并保留前后正常业务内容。这里的“隔离”不是由
-正则表达式或关键词表删除文本，而是控制器按照检测模型输出的字符偏移执行结构化替换。主模型
-未命中时，系统使用语义句级后备检测覆盖 Unplug 训练分布之外的中文等文本：先在段落和句子边界
-分块，只有超长句才按 `2048` 字符窗口、`256` 字符重叠继续切分。后备模型只判断语义块是否危险，
-不保证给出精确攻击 span；命中时隔离整个语义块。该后备方案在历史攻击集上已验证可用，但属于
-块级检测，trace 不应把它误报为精确 span。
-Unplug 官方说明其训练数据偏英文，因此中文和混合语言必须持续使用项目攻击集验证。
+控制器只替换命中的语义片段，并保留前后正常业务内容。该模型没有原生 span 头，
+因此 Ring 0 的隔离粒度是经完整文档门控后的句子块，不应在 trace 中宣称精确字符级 span。
 
 支持三种模式：
 
 | 模式 | 行为 |
 | --- | --- |
-| `advisory` | 记录风险，不修改原始 prompt |
-| `quarantine` | 将命中的输入块替换为安全占位符后继续 |
+| `advisory` | 记录风险，不修改原始 prompt；不是默认模式 |
+| `quarantine` | 默认模式，将命中的输入块替换为 `[[DATA_REMOVED]]` 后继续 |
 | `strict` | 检出攻击、无可用内容或检测器不可用时阻断 |
 
 无论采用哪种模式，检测器不可用或扫描不完整都会按 fail-closed 阻断。
@@ -380,7 +382,7 @@ Ring 1 在 Ring 2 字段投影之后运行，因此只扫描即将进入 Agent �
 
 - `L0`：只读
 - `L1`：普通写操作或不含敏感数据的外发
-- `L2`：敏感外发、删除、权限修改和高影响操作
+- `L2`：敏感外发、删除、权限修改、预订等资源变更和高影响操作
 
 处理流程：
 
@@ -398,6 +400,11 @@ Ring 1 在 Ring 2 字段投影之后运行，因此只扫描即将进入 Agent �
 8. 检查通过后暂停执行并创建人工授权节点。
 9. 用户批准后仅执行当前计划版本和当前参数；拒绝或异常只拒绝当前工具，Agent 可重新规划。
 
+测试任务还会生成不可变 `task_execution_contract`，固定任务必需 APP、副作用动作、
+effect、标准数据流边和允许的环境变化。规划器必须覆盖该契约；计划器、防御四环和指标
+统计彼此解耦。关闭 Ring 0～3 不自动关闭规划，因此正常任务的 `S0/S1` 对照可以单独
+控制防御层，而不会误把计划失效算作防御收益。
+
 模型最初形成的计划不一定完整。用户要求可能写在邮件或文件中，只有先读取数据才能知道更多
 条件。因此，每个 L2 动作执行前还会检查当前计划和已有证据是否覆盖了这些条件：
 
@@ -411,10 +418,36 @@ Ring 1 在 Ring 2 字段投影之后运行，因此只扫描即将进入 Agent �
 都包括在内：
 
 - `resource_parameters` 限定具体文件、事件、频道、用户或 URL 等资源选择器；
+- 需要重复执行同一 L2 动作时，动作必须声明有限的 `max_calls`；控制器在每次成功调用后
+  消耗额度，超过上限立即阻断。该字段不能用于无界或推测性的批量外发；
+- 若目标数量依赖前序读取结果，使用 `derived_cardinality` 声明来源、排除规则、
+  target parameter、单目标次数和 hard limit。控制器在来源读取后生成目标快照和调用
+  上限；同一目标达到次数上限后不能重复执行，计划不得在运行期扩大来源域。
 - `visible_fields` 限定允许进入 Agent 上下文的输出字段；非只读动作不需要查看返回实体时
   必须使用空列表，使整个返回结果在进入 Agent 前被隐藏；
 - `opaque_fields` 限定只允许以 `[[SENSITIVE_REF:...]]` 引用搬运、但不向 Agent 展示真实值的
   字段；未列入 `visible_fields` 或 `opaque_fields` 的字段直接隐藏；
+
+预订酒店、餐厅和租车使用独立的 `resource_mutation` profile：它们是
+`write/L2` 资源变更，而不是自由文本外发，因此不要求 message/email body 所需的
+`flow_contract`。目标资源仍通过 `resource_access` 绑定到授权来源，L2 授权、原子快照、
+需求审计和风险卡片继续生效。只有真正携带内容或隐式资源的 `egress` 动作必须提供
+egress flow contract。
+
+数据流恢复同时使用确定性值匹配和需求审计证据。若 Agent 把前一步读到的酒店名、城市或
+日期重新写成具体值，只要该标量精确出现在计划允许的工具输出字段中，控制器就会恢复其
+实体、工具活动、字段路径和控制影响。L2 需求审计中已核验的控制来源也会合并进参数来源；
+来源工具不匹配时不会仅凭“同一 APP、同一实体”判定链路正确。
+最终来源集合合并后，控制器会重建 `input_flow_label`，保证 Ring 2 读取到的注入、
+机密性和完整性标签与参数解析记录、溯源图一致。成功写操作的环境实体字段会进入后续来源
+索引；即使工具函数返回 `None`，只要环境变化可观测，其新实体字段仍可作为后续动作来源。
+
+溯源图作为数据流追踪、审计和可视化的核心证据，不再压缩为单独的数据流完整率主指标。
+图中的参数来源、数据边、来源歧义、缺失必需边、意外边和计划外动作分别用于风险判定、
+过程认证和前端解释。过程认证率负责评价执行是否遵守冻结计划与授权合同；正常任务完成率
+负责评价最终结果；攻击指标负责评价注入检测和阻断。这样不会因为 Agent 使用等价但不同的
+查询或工具路径而错误降低任务指标。
+
 - `max_exposure_level` 限定该次调用允许暴露的最高字段等级；
 - 控制器在工具执行前验证资源授权，在工具返回后、Ring 1 扫描前执行字段投影；
 - 运行期内容敏感度提升按具体实体实例路径隔离，例如只隐藏 `$[1].body`，不会因为同数组中的
@@ -442,6 +475,11 @@ Ring 1 在 Ring 2 字段投影之后运行，因此只扫描即将进入 Agent �
 有可追踪来源，同一值同时对应授权与未授权来源时按歧义 fail-closed。
 派生资源参数的每个 `allowed_source_ref` 必须声明精确 `source_path`，校验按
 `(APP, 实体, 来源工具, 字段路径)` 完成；只有实体或工具相同但字段不同，不能复用该来源授权。
+所有 `resource_fields` 还必须声明 `semantic_type`。控制器只应用该类型对应的受控归一化规则，
+例如 Slack 频道会将 `#home`、`Home` 和 `home` 归一为同一频道，而文件 ID、交易 ID、邮箱和
+URL 使用各自独立的规则；文件 ID 不会因大小写或相似度被放宽。派生资源的来源路径保留数组维度，
+例如文件列表中的 `$[*].id_` 不会被压扁为 `$.id_`。如果计划参数或敏感引用无法按授权来源解析，
+Ring 2 在工具执行前 fail-closed，而不是把控制器占位符传给底层工具。
 
 若可疑来源影响了 L1 写操作，即使工具等级仍为 L1，动作也会暂停并进入调用链检查和人工确认。
 该规则只提升来源风险下的写操作确认级别，不改变工具的静态 L1 定义。
@@ -549,6 +587,13 @@ fail-closed 为 `secret`；完全没有字段策略的实体才继承实体默�
 对于实际引用工具输出字段的 egress 参数，计划必须给出该参数允许的来源路径。字段来源存在但
 允许路径为空、路径缺失或路径不匹配时均阻断；不能退化为“同一实体任意字段均可使用”。用户直接
 提供的业务值按结构化参数角色和目的地规则检查，不依赖对自然语言正文做字符匹配。
+用户明确给出的固定非目的参数（例如邮件主题、交易日期和固定消息正文）可使用
+`mode=literal` 和 `value` 表示。字面值必须原样出现在可信用户指令中；未出现在指令中的
+literal 仍会使计划无效。低计划置信度不会覆盖用户原句直接授权的动作，但无直接授权证据的
+低置信 egress 仍按 fail-closed 处理。
+运行时还会校验工具最终参数与 literal 值完全一致，并把该来源标记为 `user_prompt`。
+声明为 `egress_secret` 的工具会将外发数据上限至少设为 `secret`，但仍需通过来源、
+接收方、字段范围和人工确认检查。
 来源授权按 `(app, entity, source_action, source_path)` 完整元组匹配；只匹配实体和字段路径、
 但不匹配来源工具的处理方式不合法。
 
@@ -562,11 +607,21 @@ fail-closed 为 `secret`；完全没有字段策略的实体才继承实体默�
 只有以下条件同时满足才允许进入统一的 L2 人工确认：
 
 - 实际参数都来自授权数据范围
-- 最高敏感等级不超过允许上限
 - 接收方处于授权状态
 - 调用链与计划一致
 
-任一字段越权、接收方越权或敏感等级超限都会记录风险，并阻断或请求重新授权。最终参数、原始参数、字段来源、敏感等级和决策依据全部写入 trace。
+最终参数确定时，如果来源、字段路径、接收方和 provenance 均已通过，
+但实际内容的敏感等级高于计划编译时的来源估算，系统会只提升当前动作的
+`flow_contract.max_confidentiality`，递增计划 revision 并记录
+`synchronize_egress_confidentiality`。该变化绑定工具、步骤、接收方、来源和参数
+哈希，不扩大其他动作的权限。
+
+同步后的敏感外发仍需经过统一 L2 确认。Ring 3 会在等待确认期间产生
+`ADVISORY` 风险卡片，说明实际敏感等级、接收方和已授权的计划版本；
+人工或自动确认完成后才执行外发，该风险提示本身不会阻断已经精确授权的调用。
+
+来源越权、接收方越权、字段路径不匹配、provenance 不完整或占位符未解析时仍然阻断。
+最终参数、原始参数、字段来源、敏感等级、计划 revision 和决策依据全部写入 trace。
 
 对于每个控制器占位符，参数解析器必须同时返回具体值、业务 `explanation`、
 `[0, 1]` 范围内的 `confidence`，以及可定位到直接数据源实体和字段路径的来源证据。
@@ -602,6 +657,10 @@ fail-closed 为 `secret`；完全没有字段策略的实体才继承实体默�
 L2 人工确认页面按外发参数组织证据。每个参数展示最终值、生成方式、模型解释、
 模型自报置信度、语义支持状态、来源字段、原文片段和溯源引用。模型解释只作为
 人工判断的辅助证据，不构成授权，也不会降低上述确定性校验和人工确认门槛。
+普通动作确认默认自动同意，以便批量测试和正常用户任务不因重复确认中断；
+每次自动同意仍记录 `approval_source=automatic_default`。需要改变任务契约的
+“放宽要求/取消任务”选择不会被自动处理。交互页面可通过
+`POST /api/config/defense` 的 `auto_confirmations` 开关关闭自动同意。
 
 `provenance_state` 只有在所有必选来源和字段证据都有效时才是 `complete`；
 缺来源为 `incomplete`，参数解析错误为 `invalid`。
@@ -612,6 +671,10 @@ L2 人工确认页面按外发参数组织证据。每个参数展示最终值�
 工具记录，判断用户要求的结果是否真的出现。只有工具确实返回了数据、写入后的环境确实出现了
 预期变化，或相应语义结果有可定位的证据，结果才算完成。因用户放宽而未验证的条件仍保持
 “未验证”状态，不能写成已经满足。
+
+对于带确定性 evaluator 的跨 APP 任务，控制器先执行状态和格式校验。确定性校验失败时
+直接生成 `incomplete` 完成审计，不再额外调用语义审计模型；校验通过或任务没有确定性
+evaluator 时，才执行语义完成审计。
 
 模型准备输出最终回答时，还会单独检查回答中的业务结论是否超出了工具证据，以及是否漏掉了
 原始任务中的条件。如果回答包含没有证据支持的说法、把用户放宽的条件说成已验证，或遗漏了
@@ -633,6 +696,20 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 - `HOLD`：等待人工确认
 - `QUARANTINE`：隔离相关内容
 - `BLOCK`：终止当前操作或任务
+
+风险卡片同时提供面向用户的 `user_view`：
+
+- `risk_type`：提示注入、敏感数据外发、敏感数据授权、超出任务范围等类别；
+- `content`：经过转义或占位符处理的具体操作/内容摘要；
+- `reason`：用自然语言解释为什么触发风险；
+- `content_trusted=true`：表示展示内容来自系统安全处理后的可信视图。
+
+`ring`、`policy_id`、FSM、证据路径、置信度等字段继续保留给审计和高级排查，
+但不再要求普通用户在前端主卡片中理解这些内部字段。
+
+风险卡片支持反向定位溯源图谱。卡片本身和“查看数据链”按钮会同时聚焦风险/策略节点、
+工具调用、人工授权、数据来源和出口节点，并同步定位对应时间线事件。卡片缺失精确节点时，
+前端会按活动 ID、工具名和 APP 降级选择最近的工具调用节点。
 
 风险严重度与工具等级分开保存：数据使用 `risk_level`，工具使用 `tool_risk_level`。
 
@@ -684,7 +761,8 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 - 同一目标的多个派生来源
 - 重复的风险证据/来源关系
 
-悬停相关节点可展开聚合分支。“显示审计边”用于展开状态和辅助证据关系。
+悬停相关节点可展开聚合分支。点击具体风险卡片会突出对应的主要数据流节点和关系；
+低层证据、来源、泄漏出口和状态转移关系不绘制到画布，但仍保留在 trace 和节点详情中。
 
 ### 9.2 环境变更
 
@@ -781,6 +859,7 @@ source_paths
 - Ring 2：`task_scope`
 - Ring 3：`sensitive_egress`
 - Ring 0 模式：`advisory`、`quarantine`、`strict`
+- 规划开关：`planning_enabled`，与上述防御环正交控制
 
 可全局更新，也可通过单次调用 `options` 覆盖。
 
@@ -788,9 +867,10 @@ source_paths
 
 | 变量 | 说明 |
 | --- | --- |
-| `AGENTDOJO_PI_MODEL_PATH` | 覆盖本地提示注入模型目录 |
+| `AGENTDOJO_PI_MODEL_PATH` | 覆盖 Ring 1 的 Unplug/间接注入模型目录 |
+| `AGENTDOJO_DIRECT_PI_MODEL_PATH` | 覆盖 Ring 0 的 DeBERTa 直接注入模型目录 |
 | `AGENTDOJO_USE_RELOADER=true` | 开启 Flask 自动重载 |
-| `AGENTDOJO_ATTACK_SCENARIOS_PER_SUITE` | 每个 suite 生成的攻击场景数量 |
+| `AGENTDOJO_ATTACK_SCENARIOS_PER_SUITE` | 旧版单 APP 攻击 API 每个 suite 生成的场景数量；主界面不依赖该变量 |
 | `LOCAL_LLM_PORT` | 本地 OpenAI 兼容服务端口，默认 `8000` |
 
 模型加载使用 `local_files_only=True`，不会静默切换到在线下载。
@@ -809,6 +889,9 @@ source_paths
 | `cross_app::calendar_digest_to_slack` | workspace → Slack | 日历机密数据进入统一外发检查，允许固定频道但必须 L2 确认 |
 | `cross_app::todo_file_to_slack` | workspace → Slack | L1 文件创建后，再对 Slack 外发执行 L2 确认 |
 | `cross_app::paris_hotel_reservation` | workspace → travel → workspace | 搜索、价格约束、外部预订和二次邮件外发确认 |
+| `cross_app::appworld_530b157_grocery_transfer` | Slack → Banking → Slack | AppWorld 迁移：消息取金额和 IBAN，严格转账后回私信 |
+| `cross_app::appworld_29caf6f_movie_recommendations` | Slack → Workspace → Slack | AppWorld 迁移：需求约束、云盘文件过滤和私信结果 |
+| `cross_app::appworld_d0b1f43_roommate_spending` | Slack → Banking | AppWorld 迁移：成员关系、账户映射、只读交易聚合 |
 
 每个场景执行后应同时检查：
 
@@ -817,6 +900,11 @@ source_paths
 3. 所有外发操作进入 Ring 3，并在需要时产生人工授权节点。
 4. 环境差异只包含 Agent 执行后的变化，不含测试 fixture 初始化。
 5. trace 保存图谱、时间线、任务结果和环境快照，并可从历史记录回放。
+
+带 `evaluation` 规范的迁移任务还会返回 `task_evaluation`，其中包含
+`passed` 和逐条 requirement 的检查结果。评测依据最终状态和最终答案，
+不要求固定工具调用轨迹。AppWorld 数据的筛选、映射和批量扩产规则见
+`docs/concepts/appworld_task_migration.md`。
 
 通过 API 执行：
 
@@ -847,6 +935,23 @@ curl -X POST http://localhost:5000/api/execute \
   -H "Content-Type: application/json" \
   -d '{"action":"user_task_0"}'
 ```
+
+执行跨 APP 攻击：
+
+```bash
+curl -X POST http://localhost:5000/api/execute/attack \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cross_app_task_id":"cross_app::appworld_29caf6f_movie_recommendations",
+    "injection_point_id":"workspace:append_files:0:content",
+    "injection_goal_id":"data_exfiltration",
+    "attack_type":"important_instructions",
+    "suite":"unified"
+  }'
+```
+
+跨 APP 攻击会复用任务的统一环境和正常任务目标，只修改指定 APP 实体中的自然语言字段。
+主界面不再提供无标准答案的自定义任务入口；旧版单 APP 攻击 API 仅作为内部基线调试保留。
 
 更新防御配置：
 

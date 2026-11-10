@@ -11,7 +11,8 @@ import difflib
 import json
 import re
 import time
-from typing import Any, Iterable, Optional
+from collections.abc import Iterable
+from typing import Any
 
 from ..modeling.data_sensitivity import (
     APP_LEVELS,
@@ -39,33 +40,20 @@ _INBOX_PATH_ALIASES = (
 def _container_model_ids(value: Any) -> set[int]:
     if isinstance(value, dict):
         items = value.values()
-    elif isinstance(value, (list, tuple, set)):
+    elif isinstance(value, list | tuple | set):
         items = value
     else:
         return set()
-    return {
-        id(item)
-        for item in items
-        if hasattr(type(item), "model_fields")
-    }
+    return {id(item) for item in items if hasattr(type(item), "model_fields")}
 
 
 def _model_snapshot(model: Any) -> dict:
     """Serialize declared fields only and collapse alias containers."""
     fields = getattr(type(model), "model_fields", {})
-    values = {
-        str(name): getattr(model, name, None)
-        for name in fields
-    }
-    item_ids = {
-        name: _container_model_ids(value)
-        for name, value in values.items()
-    }
+    values = {str(name): getattr(model, name, None) for name in fields}
+    item_ids = {name: _container_model_ids(value) for name, value in values.items()}
     omitted: set[str] = {
-        name
-        for name in values
-        if name.startswith("initial_")
-        and name.removeprefix("initial_") in values
+        name for name in values if name.startswith("initial_") and name.removeprefix("initial_") in values
     }
     for source, source_ids in item_ids.items():
         if not source_ids or source in omitted:
@@ -73,29 +61,21 @@ def _model_snapshot(model: Any) -> dict:
         for target, target_ids in item_ids.items():
             if target == source or target in omitted or not target_ids:
                 continue
-            source_is_list = isinstance(values[source], (list, tuple))
+            source_is_list = isinstance(values[source], list | tuple)
             target_is_dict = isinstance(values[target], dict)
-            if (
-                source_ids == target_ids
-                and source_is_list
-                and target_is_dict
-            ):
+            if source_ids == target_ids and source_is_list and target_is_dict:
                 omitted.add(source)
                 break
-    return {
-        name: _jsonable(value)
-        for name, value in values.items()
-        if name not in omitted
-    }
+    return {name: _jsonable(value) for name, value in values.items() if name not in omitted}
 
 
 def _jsonable(value: Any) -> Any:
     """把 pydantic 模型 / 日期等转换为可 JSON 序列化的结构。"""
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if value is None or isinstance(value, str | int | float | bool):
         return value
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, list | tuple | set):
         return [_jsonable(item) for item in value]
     if hasattr(type(value), "model_fields"):
         return _model_snapshot(value)
@@ -126,7 +106,7 @@ def get_current_snapshot(suite_name: str) -> dict:
 
 
 def capture_task_baseline(
-    suite_names: Optional[Iterable[str]] = None,
+    suite_names: Iterable[str] | None = None,
 ) -> None:
     """在测试数据准备完成后、Agent 执行前记录任务基线。"""
     names = tuple(suite_names or mock_apps.SUITE_NAMES)
@@ -134,9 +114,7 @@ def capture_task_baseline(
     for suite_name in names:
         if suite_name not in mock_apps.SUITE_NAMES:
             continue
-        _task_baselines[suite_name] = snapshot_env(
-            mock_apps.get_current_env(suite_name)
-        )
+        _task_baselines[suite_name] = snapshot_env(mock_apps.get_current_env(suite_name))
         _task_baseline_times[suite_name] = captured_at
 
 
@@ -148,15 +126,13 @@ def reset_task_baselines() -> None:
 def get_task_baseline(suite_name: str) -> tuple[dict, str]:
     """返回任务基线；未显式捕获时以当前状态为基线，避免历史误报。"""
     if suite_name not in _task_baselines:
-        _task_baselines[suite_name] = snapshot_env(
-            mock_apps.get_current_env(suite_name)
-        )
+        _task_baselines[suite_name] = snapshot_env(mock_apps.get_current_env(suite_name))
         _task_baseline_times[suite_name] = time.strftime("%H:%M:%S")
     return _task_baselines[suite_name], _task_baseline_times[suite_name]
 
 
 def export_task_snapshots(
-    suite_names: Optional[Iterable[str]] = None,
+    suite_names: Iterable[str] | None = None,
 ) -> dict[str, dict]:
     """导出任务基线与执行后快照，供历史 trace 回放。"""
     names = tuple(suite_names or mock_apps.SUITE_NAMES)
@@ -178,7 +154,7 @@ def export_task_snapshots(
     return snapshots
 
 
-def _list_id_key(items: list) -> Optional[str]:
+def _list_id_key(items: list) -> str | None:
     dict_items = [item for item in items if isinstance(item, dict)]
     if not dict_items:
         return None
@@ -191,12 +167,14 @@ def _list_id_key(items: list) -> Optional[str]:
 def _append_change(changes: list, path: str, kind: str, before: Any, after: Any) -> None:
     if len(changes) >= _MAX_CHANGES:
         return
-    changes.append({
-        "path": path or "$",
-        "kind": kind,
-        "before": _jsonable(before),
-        "after": _jsonable(after),
-    })
+    changes.append(
+        {
+            "path": path or "$",
+            "kind": kind,
+            "before": _jsonable(before),
+            "after": _jsonable(after),
+        }
+    )
 
 
 def _normalized_token(value: Any) -> str:
@@ -258,7 +236,7 @@ def _canonical_change_path(path: str) -> str:
     value = str(path or "")
     for alias, canonical in _INBOX_PATH_ALIASES:
         if value.startswith(alias):
-            suffix = value[len(alias):].replace("]", "", 1)
+            suffix = value[len(alias) :].replace("]", "", 1)
             return f"{canonical}{suffix}"
     return value
 
@@ -279,14 +257,15 @@ def _deduplicate_changes(changes: list) -> list:
         if existing is None:
             deduplicated[key] = candidate
             continue
-        existing["source_paths"] = list(dict.fromkeys([
-            *existing.get("source_paths", []),
-            source_path,
-        ]))
-        if (
-            ".emails." in canonical
-            and source_path == canonical
-        ):
+        existing["source_paths"] = list(
+            dict.fromkeys(
+                [
+                    *existing.get("source_paths", []),
+                    source_path,
+                ]
+            )
+        )
+        if ".emails." in canonical and source_path == canonical:
             deduplicated[key] = candidate
     return list(deduplicated.values())
 
@@ -309,16 +288,8 @@ def _diff(initial: Any, current: Any, path: str, changes: list) -> None:
     if isinstance(initial, list) and isinstance(current, list):
         id_key = _list_id_key(initial) or _list_id_key(current)
         if id_key:
-            initial_map = {
-                str(item.get(id_key)): item
-                for item in initial
-                if isinstance(item, dict)
-            }
-            current_map = {
-                str(item.get(id_key)): item
-                for item in current
-                if isinstance(item, dict)
-            }
+            initial_map = {str(item.get(id_key)): item for item in initial if isinstance(item, dict)}
+            current_map = {str(item.get(id_key)): item for item in current if isinstance(item, dict)}
             for item_id in sorted(set(initial_map) | set(current_map)):
                 child_path = f"{path}[{item_id}]"
                 if item_id not in initial_map:
@@ -413,7 +384,7 @@ def _diff(initial: Any, current: Any, path: str, changes: list) -> None:
 def diff_snapshots(
     initial: dict,
     current: dict,
-    suite_name: Optional[str] = None,
+    suite_name: str | None = None,
 ) -> dict:
     """比较初始与当前快照，返回 changes 列表与统计。"""
     changes: list = []
@@ -445,7 +416,7 @@ def summarize_snapshot(snapshot: dict) -> list:
             entry["collections"] = {
                 str(child_key): len(child_value)
                 for child_key, child_value in value.items()
-                if isinstance(child_value, (list, dict))
+                if isinstance(child_value, list | dict)
             }
         elif isinstance(value, list):
             entry["count"] = len(value)
@@ -493,14 +464,16 @@ def list_suite_storage() -> list:
         initial, _ = get_task_baseline(suite_name)
         current = get_current_snapshot(suite_name)
         diff = diff_snapshots(initial, current, suite_name)
-        result.append({
-            "suite": suite_name,
-            "label": APP_DOMAINS[suite_name]["label"],
-            "color": APP_DOMAINS[suite_name]["color"],
-            "tool_count": len(APP_DOMAINS[suite_name]["tools"]),
-            "summary": summarize_snapshot(current),
-            "change_total": diff["total"],
-            "change_counts": diff["counts"],
-            "has_changes": diff["total"] > 0,
-        })
+        result.append(
+            {
+                "suite": suite_name,
+                "label": APP_DOMAINS[suite_name]["label"],
+                "color": APP_DOMAINS[suite_name]["color"],
+                "tool_count": len(APP_DOMAINS[suite_name]["tools"]),
+                "summary": summarize_snapshot(current),
+                "change_total": diff["total"],
+                "change_counts": diff["counts"],
+                "has_changes": diff["total"] > 0,
+            }
+        )
     return result

@@ -40,7 +40,10 @@ def check_prompt_for_injection(
         return True
     if scan_result is not None:
         return bool(not scan_result.get("suspected", False))
-    if _valid_judgment(judge_result, threshold):
+    if isinstance(judge_result, dict) and _valid_judgment(
+        judge_result,
+        threshold,
+    ):
         return not bool(judge_result.get("injection"))
     return False
 
@@ -71,12 +74,15 @@ def check_prompt_for_injection_with_details(
             {
                 "passed": available and not suspected,
                 "safety_score": score if suspected else (1.0 - score if available else 0.0),
-                "detection_method": (
-                    "small_model_chunked"
-                    if available
-                    else "small_model_unavailable"
-                ),
+                "detection_method": ("small_model_chunked" if available else "small_model_unavailable"),
                 "detection_granularity": "attack_span",
+                "detector": str(scan_result.get("detector", "")),
+                "primary_detector": str(scan_result.get("primary_detector", "")),
+                "fallback_detector": str(scan_result.get("fallback_detector", "")),
+                "fallback_available": bool(scan_result.get("fallback_available", False)),
+                "fallback_executed": bool(scan_result.get("fallback_executed", False)),
+                "coverage_scope": str(scan_result.get("coverage_scope", "primary_only")),
+                "coverage_complete": bool(scan_result.get("coverage_complete", available)),
                 "evidence_spans": list(scan_result.get("evidence_spans", [])),
                 "injection_target": "instruction_hierarchy",
                 "reason": (
@@ -94,18 +100,19 @@ def check_prompt_for_injection_with_details(
             }
         )
         return result
-    if judge_result and judge_result.get("error"):
+    if isinstance(judge_result, dict) and judge_result.get("error"):
         result["judge_error"] = judge_result["error"]
 
-    if _valid_judgment(judge_result, threshold):
+    if isinstance(judge_result, dict) and _valid_judgment(
+        judge_result,
+        threshold,
+    ):
         injection = bool(judge_result.get("injection"))
         confidence = float(judge_result.get("confidence", 0.0) or 0.0)
         result.update(
             {
                 "passed": not injection,
-                "safety_score": (
-                    1.0 - confidence if injection else confidence
-                ),
+                "safety_score": (1.0 - confidence if injection else confidence),
                 "detection_method": "main_llm_judge",
                 "evidence_spans": judge_result.get("evidence_spans", []),
                 "injection_target": judge_result.get("target", "none"),
@@ -115,21 +122,14 @@ def check_prompt_for_injection_with_details(
         )
         return result
 
-    confidence = (
-        float(judge_result.get("confidence", 0.0) or 0.0)
-        if judge_result
-        else None
-    )
+    confidence = float(judge_result.get("confidence", 0.0) or 0.0) if isinstance(judge_result, dict) else None
     result.update(
         {
             "passed": False,
             "safety_score": confidence if confidence is not None else 0.0,
             "detection_method": "main_llm_uncertain",
             "judge_confidence": confidence,
-            "reason": (
-                "The semantic prompt-injection judgement was unavailable or "
-                "below the confidence threshold."
-            ),
+            "reason": ("The semantic prompt-injection judgement was unavailable or below the confidence threshold."),
         }
     )
     return result

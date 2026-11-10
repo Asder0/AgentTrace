@@ -35,11 +35,16 @@ const STATUS_PANEL = {
         panel.className = 'card status-panel';
         panel.id = 'statusPanel';
         panel.innerHTML = `
-            <div class="status-panel-header" id="statusPanelHeader">
+            <div class="status-panel-header"
+                 id="statusPanelHeader"
+                 role="button"
+                 tabindex="0"
+                 aria-expanded="false"
+                 aria-controls="statusPanelBody">
                 <h3>系统状态</h3>
-                <span class="status-panel-toggle" id="statusPanelToggle">▼</span>
+                <span class="status-panel-toggle" id="statusPanelToggle" aria-hidden="true">▶</span>
             </div>
-            <div class="status-panel-body" id="statusPanelBody">
+            <div class="status-panel-body" id="statusPanelBody" hidden>
                 <!-- 系统概览 -->
                 <div class="status-overview">
                     <div class="status-overview-item">
@@ -88,17 +93,18 @@ const STATUS_PANEL = {
                         <span class="status-info-label">状态</span>
                         <span class="status-info-value" id="statusDefenseMode">加载中...</span>
                     </div>
+                    <div class="status-ring-grid" id="statusDefenseRings"></div>
                 </div>
 
                 <!-- 图谱统计 -->
                 <div class="status-section">
                     <div class="status-section-title">图谱统计</div>
                     <div class="status-info-row">
-                        <span class="status-info-label">节点数</span>
+                        <span class="status-info-label">当前节点</span>
                         <span class="status-info-value" id="statusGraphNodes">0</span>
                     </div>
                     <div class="status-info-row">
-                        <span class="status-info-label">边数</span>
+                        <span class="status-info-label">当前关系</span>
                         <span class="status-info-value" id="statusGraphEdges">0</span>
                     </div>
                 </div>
@@ -113,6 +119,7 @@ const STATUS_PANEL = {
 
                 <!-- 刷新按钮 -->
                 <button class="status-refresh-btn" id="statusRefreshBtn" type="button">刷新状态</button>
+                <div class="status-refresh-meta" id="statusRefreshMeta"></div>
             </div>
         `;
 
@@ -135,6 +142,11 @@ const STATUS_PANEL = {
             header.addEventListener('click', () => {
                 this._toggleExpand();
             });
+            header.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter' && event.key !== ' ') return;
+                event.preventDefault();
+                this._toggleExpand();
+            });
         }
 
         // 刷新按钮
@@ -153,11 +165,18 @@ const STATUS_PANEL = {
         this._expanded = !this._expanded;
         const body = document.getElementById('statusPanelBody');
         const toggle = document.getElementById('statusPanelToggle');
+        const header = document.getElementById('statusPanelHeader');
         if (body) {
-            body.style.display = this._expanded ? 'block' : 'none';
+            body.hidden = !this._expanded;
         }
         if (toggle) {
             toggle.textContent = this._expanded ? '▼' : '▶';
+        }
+        if (header) {
+            header.setAttribute(
+                'aria-expanded',
+                this._expanded ? 'true' : 'false',
+            );
         }
     },
 
@@ -179,8 +198,15 @@ const STATUS_PANEL = {
             const status = await API.getSystemStatus();
             if (status && status.status === 'ok') {
                 this._updateStatus(status);
+            } else {
+                throw new Error('invalid status response');
             }
         } catch (err) {
+            const meta = document.getElementById('statusRefreshMeta');
+            if (meta) {
+                meta.textContent = '刷新失败，显示上一次状态';
+                meta.className = 'status-refresh-meta stale';
+            }
             console.warn('刷新系统状态失败:', err.message);
         }
     },
@@ -247,11 +273,22 @@ const STATUS_PANEL = {
 
         // 更新防御机制状态
         const defenseEl = document.getElementById('statusDefenseMode');
+        const defenseRings = status.defense_rings || {};
+        const ringStates = Object.values(defenseRings);
+        const enabledRings = ringStates.filter(Boolean).length;
         if (defenseEl) {
             const defenseEnabled = status.defense_enabled;
             if (defenseEnabled === true) {
-                defenseEl.textContent = '已启用';
-                defenseEl.className = 'status-info-value status-ok';
+                if (ringStates.length && enabledRings === 0) {
+                    defenseEl.textContent = '已关闭';
+                    defenseEl.className = 'status-info-value status-warn';
+                } else if (ringStates.length && enabledRings < ringStates.length) {
+                    defenseEl.textContent = '部分启用';
+                    defenseEl.className = 'status-info-value status-warn';
+                } else {
+                    defenseEl.textContent = '已启用';
+                    defenseEl.className = 'status-info-value status-ok';
+                }
             } else if (defenseEnabled === false) {
                 defenseEl.textContent = '已关闭';
                 defenseEl.className = 'status-info-value status-warn';
@@ -260,21 +297,72 @@ const STATUS_PANEL = {
                 defenseEl.className = 'status-info-value';
             }
         }
+        this._renderDefenseRings(defenseRings);
 
-        // 更新图谱统计（历史回放期间由回放数据接管，避免被实时轮询覆盖）
+        // 更新当前画布规模（历史回放期间由回放数据接管）
         const replaying = typeof Store !== 'undefined' && Store.get('replaying');
+        const displayedStats = (
+            typeof GRAPH !== 'undefined'
+            && typeof GRAPH.getDisplayedStats === 'function'
+        )
+            ? GRAPH.getDisplayedStats()
+            : null;
         const nodesEl = document.getElementById('statusGraphNodes');
-        if (!replaying && nodesEl && status.graph_stats) {
-            nodesEl.textContent = status.graph_stats.nodes || 0;
+        if (!replaying && nodesEl) {
+            nodesEl.textContent = displayedStats?.nodes
+                ?? status.graph_stats?.nodes
+                ?? 0;
         }
 
         const edgesEl = document.getElementById('statusGraphEdges');
-        if (!replaying && edgesEl && status.graph_stats) {
-            edgesEl.textContent = status.graph_stats.edges || 0;
+        if (!replaying && edgesEl) {
+            edgesEl.textContent = displayedStats?.relations
+                ?? status.graph_stats?.edges
+                ?? 0;
         }
 
         // 更新功能清单
         this._updateFeatures(status.features);
+        const meta = document.getElementById('statusRefreshMeta');
+        if (meta) {
+            const refreshedAt = status.server_time
+                ? new Date(status.server_time * 1000)
+                : new Date();
+            meta.textContent = `最近刷新 ${refreshedAt.toLocaleTimeString()}`;
+            meta.className = 'status-refresh-meta';
+        }
+    },
+
+    _renderDefenseRings(ringStates) {
+        const container = document.getElementById('statusDefenseRings');
+        if (!container) return;
+        container.innerHTML = '';
+        const labels = {
+            ring_0: 'Ring 0',
+            ring_1: 'Ring 1',
+            ring_2: 'Ring 2',
+            ring_3: 'Ring 3',
+        };
+        for (const ring of ['ring_0', 'ring_1', 'ring_2', 'ring_3']) {
+            if (!(ring in ringStates)) continue;
+            const enabled = Boolean(ringStates[ring]);
+            const item = document.createElement('div');
+            item.className = `status-ring-item ${enabled ? 'ok' : 'off'}`;
+
+            const dot = document.createElement('span');
+            dot.className = 'status-ring-dot';
+            dot.setAttribute('aria-hidden', 'true');
+
+            const label = document.createElement('span');
+            label.textContent = labels[ring];
+
+            const state = document.createElement('span');
+            state.className = 'status-ring-state';
+            state.textContent = enabled ? '启用' : '关闭';
+
+            item.append(dot, label, state);
+            container.appendChild(item);
+        }
     },
 
     /**

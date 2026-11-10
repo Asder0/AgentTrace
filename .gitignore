@@ -397,6 +397,9 @@ models/
 .pytest_*/
 .pytest_tmp/
 
+# Downloaded external benchmark repositories and task data.
+external_data/
+
 # Local-only research notes and test content.
 /开题报告.md
 /tests/

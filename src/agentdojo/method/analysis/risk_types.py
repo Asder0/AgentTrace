@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Literal
 
 from ..modeling.policy import security_thresholds
-
 
 DECISION_PASS = "PASS"
 DECISION_ADVISORY = "ADVISORY"
@@ -16,6 +16,59 @@ DECISION_MITIGATE = "MITIGATE"
 DECISION_QUARANTINE = "QUARANTINE"
 DECISION_HOLD = "HOLD"
 DECISION_BLOCK = "BLOCK"
+
+BLOCK_CATEGORY_OUT_OF_SCOPE = "out_of_scope"
+BLOCK_CATEGORY_AUTHORIZATION = "authorization"
+BLOCK_CATEGORY_CONFIDENTIALITY = "confidentiality"
+BLOCK_CATEGORY_INVALID_ACTION = "invalid_action"
+BLOCK_CATEGORY_PROVENANCE = "provenance"
+BLOCK_CATEGORY_SYSTEM_UNAVAILABLE = "system_unavailable"
+BLOCK_CATEGORY_SEMANTIC_MISMATCH = "semantic_mismatch"
+BLOCK_CATEGORY_REQUIREMENT_UNRESOLVED = "requirement_unresolved"
+BLOCK_CATEGORY_CONFIRMATION = "confirmation"
+BLOCK_CATEGORY_INJECTION = "injection"
+BLOCK_CATEGORY_UNKNOWN = "unknown"
+
+BlockCategory = Literal[
+    "out_of_scope",
+    "authorization",
+    "confidentiality",
+    "invalid_action",
+    "provenance",
+    "system_unavailable",
+    "semantic_mismatch",
+    "requirement_unresolved",
+    "confirmation",
+    "injection",
+    "unknown",
+]
+ALL_BLOCK_CATEGORIES: frozenset[BlockCategory] = frozenset(
+    {
+        BLOCK_CATEGORY_OUT_OF_SCOPE,
+        BLOCK_CATEGORY_AUTHORIZATION,
+        BLOCK_CATEGORY_CONFIDENTIALITY,
+        BLOCK_CATEGORY_INVALID_ACTION,
+        BLOCK_CATEGORY_PROVENANCE,
+        BLOCK_CATEGORY_SYSTEM_UNAVAILABLE,
+        BLOCK_CATEGORY_SEMANTIC_MISMATCH,
+        BLOCK_CATEGORY_REQUIREMENT_UNRESOLVED,
+        BLOCK_CATEGORY_CONFIRMATION,
+        BLOCK_CATEGORY_INJECTION,
+        BLOCK_CATEGORY_UNKNOWN,
+    }
+)
+
+# Categories that demonstrate the policy rejected an out-of-scope action
+# rather than preventing an authorized action from completing.
+PROTECTIVE_BLOCK_CATEGORIES: frozenset[BlockCategory] = frozenset(
+    {
+        BLOCK_CATEGORY_OUT_OF_SCOPE,
+        BLOCK_CATEGORY_AUTHORIZATION,
+        BLOCK_CATEGORY_CONFIDENTIALITY,
+        BLOCK_CATEGORY_INVALID_ACTION,
+        BLOCK_CATEGORY_INJECTION,
+    }
+)
 
 DECISION_TO_STATE = {
     DECISION_PASS: "ADMITTED",
@@ -26,9 +79,7 @@ DECISION_TO_STATE = {
     DECISION_BLOCK: "BLOCKED",
 }
 
-MAX_RISK_EVIDENCE = int(
-    security_thresholds().get("max_risk_evidence", 50)
-)
+MAX_RISK_EVIDENCE = int(security_thresholds().get("max_risk_evidence", 50))
 _TASK_RISK_IDENTITIES: dict[tuple[str, int, str, str], dict[str, Any]] = {}
 
 
@@ -107,8 +158,7 @@ class RiskAssessment:
             "sink_ids": list(self.sink_ids),
             "taint_roots": list(self.taint_roots),
             "fsm_before": self.fsm_before,
-            "fsm_after": self.fsm_after
-            or DECISION_TO_STATE.get(self.decision, "ADMITTED"),
+            "fsm_after": self.fsm_after or DECISION_TO_STATE.get(self.decision, "ADMITTED"),
         }
 
 
@@ -138,10 +188,7 @@ def make_risk(
         ring=ring,
         decision=decision,
         reason=reason,
-        event_kind=(
-            event_kind
-            or ("policy" if decision == DECISION_MITIGATE else "security")
-        ),
+        event_kind=(event_kind or ("policy" if decision == DECISION_MITIGATE else "security")),
         severity=severity,
         policy_id=policy_id,
         confidence=confidence,

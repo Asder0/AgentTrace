@@ -43,27 +43,65 @@ const AUDIT_SUMMARY = {
             && node.terminal === true
         );
         const taskOutcome = String(taskState?.state || '').toUpperCase();
+        const hasTaskOutcome = Boolean(taskOutcome);
+        const taskBlocked = taskOutcome === 'BLOCKED';
+        const taskQuarantined = [
+            'QUARANTINED',
+            'SANITIZED',
+        ].includes(taskOutcome);
+        const taskHeld = taskOutcome === 'HELD';
         const taskIncomplete = [
             'INCOMPLETE',
             'FAILED',
             'CANCELLED',
         ].includes(taskOutcome);
+        const taskCompleted = taskOutcome === 'COMPLETED';
 
-        let statusClass = 'ok';
-        let statusText = tools.length ? '检查通过' : '等待任务';
-        if (blocked || taskOutcome === 'BLOCKED') {
+        let statusClass = '';
+        let statusText = '等待任务';
+        let auditKind = 'waiting';
+        if (blocked || taskBlocked) {
             statusClass = 'blocked';
             statusText = '已阻断';
+            auditKind = 'blocked';
+        } else if (taskQuarantined) {
+            statusClass = 'warning';
+            statusText = '内容已隔离';
+            auditKind = 'quarantined';
+        } else if (taskHeld) {
+            statusClass = 'warning';
+            statusText = '等待人工决策';
+            auditKind = 'held';
         } else if (taskIncomplete) {
             statusClass = 'warning';
             statusText = '任务未完成';
+            auditKind = 'incomplete';
         } else if (advisory || mitigated) {
             statusClass = 'warning';
             statusText = mitigated ? '已隔离风险' : '存在提醒';
+            auditKind = mitigated ? 'mitigated' : 'advisory';
+        } else if (taskCompleted) {
+            statusClass = 'ok';
+            statusText = '检查通过';
+            auditKind = 'completed';
+        } else if (tools.length || hasTaskOutcome) {
+            statusClass = 'warning';
+            statusText = '结果待核验';
+            auditKind = 'unverified';
         }
 
-        statusEl.className = `audit-summary-status ${statusClass}`;
+        statusEl.className = [
+            'audit-summary-status',
+            statusClass,
+        ].filter(Boolean).join(' ');
         statusEl.textContent = statusText;
+        const statusIcon = statusClass === 'ok'
+            ? '✓'
+            : statusClass === 'blocked'
+                ? '!'
+                : statusClass === 'warning'
+                    ? '△'
+                    : '·';
 
         const allowedActions = this._unique(plan.allowed_actions || []);
         const allowedEffects = this._unique(
@@ -100,13 +138,6 @@ const AUDIT_SUMMARY = {
                 String(item.status || '') === 'uncertain'
             ).length,
         };
-        const auditKind = blocked
-            ? 'blocked'
-            : taskIncomplete
-                ? 'incomplete'
-                : advisory || mitigated
-                    ? (mitigated ? 'mitigated' : 'advisory')
-                    : 'completed';
         const localizedSummaryText = labels.auditSummaryText
             ? labels.auditSummaryText(auditKind, null, outcomeCounts)
             : '审计状态已记录。';
@@ -284,7 +315,7 @@ const AUDIT_SUMMARY = {
                 <div class="audit-chips">${chips(localizedOutcomeChecks, 'effect')}</div>
             </div>` : ''}
             <div class="audit-verdict ${statusClass}">
-                <span class="audit-verdict-icon">${blocked || taskIncomplete ? '!' : advisory ? '△' : '✓'}</span>
+                <span class="audit-verdict-icon">${statusIcon}</span>
                 <span>${this._escape(localizedSummaryText)}</span>
             </div>
             <div class="audit-footer">

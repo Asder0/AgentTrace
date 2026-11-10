@@ -32,9 +32,7 @@ from .sensitive_ner import elevate_policy_for_content
 
 
 def _load_policy() -> dict[str, Any]:
-    text = files("agentdojo.method.modeling").joinpath(
-        "data_sensitivity.json"
-    ).read_text(encoding="utf-8")
+    text = files("agentdojo.method.modeling").joinpath("data_sensitivity.json").read_text(encoding="utf-8")
     value = json.loads(text)
     return value if isinstance(value, dict) else {}
 
@@ -42,10 +40,7 @@ def _load_policy() -> dict[str, Any]:
 _POLICY = _load_policy()
 DEFAULT_LEVEL = str(_POLICY.get("default_level", "secret")).lower()
 APP_LEVELS: dict[str, dict[str, str]] = {
-    str(app): {
-        str(entity): str(level).lower()
-        for entity, level in entities.items()
-    }
+    str(app): {str(entity): str(level).lower() for entity, level in entities.items()}
     for app, entities in (_POLICY.get("apps") or {}).items()
     if isinstance(entities, Mapping)
 }
@@ -91,30 +86,22 @@ FIELD_POLICIES: dict[
     if isinstance(entities, Mapping)
 }
 TOOL_OUTPUT_ENTITIES: dict[str, str] = {
-    str(tool): str(entity)
-    for tool, entity in (_POLICY.get("tool_output_entities") or {}).items()
-    if tool and entity
+    str(tool): str(entity) for tool, entity in (_POLICY.get("tool_output_entities") or {}).items() if tool and entity
 }
+
+
 def _snake_case(name: str) -> str:
     value = re.sub(r"(?<!^)(?=[A-Z])", "_", str(name or "")).lower()
     return re.sub(r"[^a-z0-9_]+", "_", value).strip("_")
 
 
 ENVIRONMENT_ONLY_ENTITIES: dict[str, set[str]] = {
-    str(app): {
-        _snake_case(str(entity))
-        for entity in entities
-    }
-    for app, entities in (
-        _POLICY.get("environment_only_entities") or {}
-    ).items()
+    str(app): {_snake_case(str(entity)) for entity in entities}
+    for app, entities in (_POLICY.get("environment_only_entities") or {}).items()
     if isinstance(entities, list)
 }
 ENTITY_ALIASES: dict[str, dict[str, str]] = {
-    str(app): {
-        _snake_case(str(alias)): _snake_case(str(entity))
-        for alias, entity in aliases.items()
-    }
+    str(app): {_snake_case(str(alias)): _snake_case(str(entity)) for alias, entity in aliases.items()}
     for app, aliases in (_POLICY.get("entity_aliases") or {}).items()
     if isinstance(aliases, Mapping)
 }
@@ -140,11 +127,7 @@ def field_policy(
     canonical = canonical_entity_name(suite, entity)
     normalized = normalize_data_path(path)
     policies = FIELD_POLICIES.get(suite, {}).get(canonical, {})
-    matches = [
-        (pattern, policy)
-        for pattern, policy in policies.items()
-        if _path_matches(normalized, pattern)
-    ]
+    matches = [(pattern, policy) for pattern, policy in policies.items() if _path_matches(normalized, pattern)]
     if not matches:
         if policies:
             return {
@@ -159,11 +142,7 @@ def field_policy(
         }
     pattern, selected = max(matches, key=lambda item: len(item[0]))
     level = str(selected.get("level", entity_level(suite, canonical))).lower()
-    categories = [
-        str(item)
-        for item in selected.get("categories", [])
-        if str(item).strip()
-    ]
+    categories = [str(item) for item in selected.get("categories", []) if str(item).strip()]
     return {
         **selected,
         "level": level,
@@ -185,37 +164,19 @@ def combined_field_policy(
     content_detection: bool = True,
 ) -> dict[str, Any]:
     """Combine semantic output-field policies for entity-keyed maps."""
-    policies = [
-        field_policy(app, entity, str(path))
-        for path in paths
-        if str(path).strip()
-    ]
+    policies = [field_policy(app, entity, str(path)) for path in paths if str(path).strip()]
     if not policies:
         return field_policy(app, entity, "$")
     level = max(
-        (
-            str(policy.get("level", DEFAULT_LEVEL)).lower()
-            for policy in policies
-        ),
+        (str(policy.get("level", DEFAULT_LEVEL)).lower() for policy in policies),
         key=lambda item: CONFIDENTIALITY_LEVELS.get(item, 3),
     )
-    categories = sorted(
-        {
-            str(category)
-            for policy in policies
-            for category in policy.get("categories", [])
-            if category
-        }
-    )
+    categories = sorted({str(category) for policy in policies for category in policy.get("categories", []) if category})
     return {
         "level": level,
         "categories": categories,
         "content_detection": (
-            content_detection
-            and any(
-                policy.get("content_detection") is not False
-                for policy in policies
-            )
+            content_detection and any(policy.get("content_detection") is not False for policy in policies)
         ),
         "source": "dynamic_entity_map",
     }
@@ -235,8 +196,7 @@ def sensitivity_catalog() -> dict[str, dict[str, str]]:
         app: {
             entity: level
             for entity, level in entities.items()
-            if entity
-            not in ENVIRONMENT_ONLY_ENTITIES.get(app, set())
+            if entity not in ENVIRONMENT_ONLY_ENTITIES.get(app, set())
         }
         for app, entities in APP_LEVELS.items()
     }
@@ -278,11 +238,7 @@ def entity_level(app: str, entity: str) -> str:
     suite = str(app or "").lower()
     name = canonical_entity_name(suite, entity)
     candidate = APP_LEVELS.get(suite, {}).get(name, DEFAULT_LEVEL)
-    return (
-        candidate
-        if candidate in CONFIDENTIALITY_LEVELS
-        else DEFAULT_LEVEL
-    )
+    return candidate if candidate in CONFIDENTIALITY_LEVELS else DEFAULT_LEVEL
 
 
 def has_entity(app: str, entity: str) -> bool:
@@ -351,6 +307,7 @@ class ValueOrigin:
     def to_dict(self) -> dict[str, Any]:
         injection = self.label.get("injection", {})
         return {
+            "source_kind": "tool_output",
             "source_app": self.app,
             "source_entity": self.entity,
             "source": entity_source(self.app, self.entity),
@@ -362,17 +319,9 @@ class ValueOrigin:
             "source_key": self.container_key,
             "sensitivity_policy": dict(self.sensitivity_policy),
             "source_risk": bool(
-                isinstance(injection, Mapping)
-                and (
-                    injection.get("source_flagged")
-                    or injection.get("risky_entities")
-                )
+                isinstance(injection, Mapping) and (injection.get("source_flagged") or injection.get("risky_entities"))
             ),
-            "risky_entities": list(
-                injection.get("risky_entities", [])
-                if isinstance(injection, Mapping)
-                else []
-            ),
+            "risky_entities": list(injection.get("risky_entities", []) if isinstance(injection, Mapping) else []),
         }
 
 
@@ -455,9 +404,7 @@ def _walk_values(
                     risky_entities=risky_entities,
                     inherited_label=inherited_label,
                     container_key=str(key),
-                    dynamic_mapping_policy_paths=(
-                        dynamic_mapping_policy_paths
-                    ),
+                    dynamic_mapping_policy_paths=(dynamic_mapping_policy_paths),
                     content_detection=content_detection,
                 )
             )
@@ -486,9 +433,7 @@ def _walk_values(
                     risky_entities=risky_entities,
                     inherited_label=inherited_label,
                     container_key=str(key),
-                    dynamic_mapping_policy_paths=(
-                        dynamic_mapping_policy_paths
-                    ),
+                    dynamic_mapping_policy_paths=(dynamic_mapping_policy_paths),
                     content_detection=content_detection,
                 )
             )
@@ -509,9 +454,7 @@ def _walk_values(
                     risky_entities=risky_entities,
                     inherited_label=inherited_label,
                     container_key=container_key,
-                    dynamic_mapping_policy_paths=(
-                        dynamic_mapping_policy_paths
-                    ),
+                    dynamic_mapping_policy_paths=(dynamic_mapping_policy_paths),
                     content_detection=content_detection,
                 )
             )
@@ -524,9 +467,7 @@ def _walk_values(
         inherited_entity or tool_output_entity(source_tool) or "unknown",
     )
     source_path = "$" if dynamic_mapping_policy_paths else path
-    entity_id = inherited_entity_id or hashlib.sha256(
-        f"{source_tool}\0{source_path}\0{key}".encode()
-    ).hexdigest()[:12]
+    entity_id = inherited_entity_id or hashlib.sha256(f"{source_tool}\0{source_path}\0{key}".encode()).hexdigest()[:12]
     policy = (
         (
             combined_field_policy(
@@ -553,8 +494,7 @@ def _walk_values(
         (
             risk_entity
             for risk_entity in risky_entities
-            if path == risk_entity or path.startswith(f"{risk_entity}.")
-            or path.startswith(f"{risk_entity}[")
+            if path == risk_entity or path.startswith(f"{risk_entity}.") or path.startswith(f"{risk_entity}[")
         ),
         "",
     )
@@ -563,12 +503,7 @@ def _walk_values(
             level=level,
             categories=(
                 [
-                    *(
-                        [entity]
-                        if entity != "unknown"
-                        and entity in CATEGORY_MIN_LEVEL
-                        else []
-                    ),
+                    *([entity] if entity != "unknown" and entity in CATEGORY_MIN_LEVEL else []),
                     *policy_categories,
                     *fallback_categories,
                 ]
@@ -598,9 +533,7 @@ def _walk_values(
         ValueOrigin(
             app=app,
             entity=entity,
-            level=str(
-                origin_label.get("confidentiality", {}).get("level", level)
-            ),
+            level=str(origin_label.get("confidentiality", {}).get("level", level)),
             source_tool=source_tool,
             source_activity_id=activity_id,
             entity_id=entity_id,
@@ -614,9 +547,7 @@ def _walk_values(
                 "categories": policy_categories,
                 "source": str(policy.get("source", "field_policy")),
                 "matched_path": str(policy.get("matched_path", "")),
-                "gliner_entities": list(
-                    policy.get("gliner_entities", [])
-                ),
+                "gliner_entities": list(policy.get("gliner_entities", [])),
             },
         )
     )
@@ -649,11 +580,7 @@ def collect_value_origins(
         fallback_categories=tuple(fallback_categories),
         risky_entities=set(risky_entities),
         inherited_label=inherited_label,
-        dynamic_mapping_policy_paths=tuple(
-            str(path)
-            for path in dynamic_mapping_policy_paths
-            if str(path).strip()
-        ),
+        dynamic_mapping_policy_paths=tuple(str(path) for path in dynamic_mapping_policy_paths if str(path).strip()),
         content_detection=content_detection,
     )
 
@@ -692,9 +619,7 @@ def origins_for_entity_refs(
             str(raw_ref.get("entity", "")),
         )
         entity_id = str(raw_ref.get("entity_id", ""))
-        source_action = str(
-            raw_ref.get("source_action", raw_ref.get("source_tool", ""))
-        )
+        source_action = str(raw_ref.get("source_action", raw_ref.get("source_tool", "")))
         candidates = [
             origin
             for origin in materialised
@@ -704,10 +629,26 @@ def origins_for_entity_refs(
             and (
                 not source_action
                 or origin.source_tool == source_action
-                or base_tool_name(origin.source_tool)
-                == base_tool_name(source_action)
+                or base_tool_name(origin.source_tool) == base_tool_name(source_action)
             )
         ]
+        if not candidates and entity_id:
+            # Some tools return values under a stable APP entity record whose
+            # transient activity-local ID differs from the ID echoed by the
+            # model. The caller still verifies the exact source path, value and
+            # producer step, so APP, entity and source action remain mandatory.
+            candidates = [
+                origin
+                for origin in materialised
+                if origin.app.lower() == app
+                and _snake_case(origin.entity) == entity
+                and (
+                    not source_action
+                    or origin.source_tool == source_action
+                    or base_tool_name(origin.source_tool)
+                    == base_tool_name(source_action)
+                )
+            ]
         if not candidates:
             invalid.append(
                 {
@@ -736,17 +677,13 @@ def label_for_origins(
     categories = {
         category
         for origin in materialised
-        for category in (
-            origin.label.get("confidentiality", {}) or {}
-        ).get("categories", [])
+        for category in (origin.label.get("confidentiality", {}) or {}).get("categories", [])
         if category
     }
     source_ids = {
         source_id
         for origin in materialised
-        for source_id in (
-            origin.label.get("confidentiality", {}) or {}
-        ).get("source_ids", [])
+        for source_id in (origin.label.get("confidentiality", {}) or {}).get("source_ids", [])
         if source_id
     }
     source_entities = {

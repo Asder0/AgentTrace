@@ -53,9 +53,7 @@ def build_quarantine_metrics(
     applied_spans = [(item.original_start, item.original_end) for item in applied]
     applied_merged, _ = merged_character_spans(applied_spans)
     expected_merged, _ = merged_character_spans(merged_spans)
-    covered_characters = sum(
-        end - start for start, end in expected_merged
-    )
+    covered_characters = sum(end - start for start, end in expected_merged)
     required = len(expected_merged)
     covered = sum(
         1
@@ -81,11 +79,7 @@ def build_quarantine_metrics(
             0,
             len(original) - covered_characters,
         ),
-        "covered_character_ratio": (
-            covered_characters / len(original)
-            if original
-            else 0.0
-        ),
+        "covered_character_ratio": (covered_characters / len(original) if original else 0.0),
         "sanitized_length": len(sanitized),
         "sanitized_rescan_available": (
             bool(residual_scan.get("available", True)) if isinstance(residual_scan, Mapping) else None

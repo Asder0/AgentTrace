@@ -40,10 +40,6 @@
                 <h2>数据流拓扑图</h2>
                 <div class="graph-controls">
                     <button type="button" id="btnReset" title="恢复结构化节点位置，清理高亮并适应画布">重置布局</button>
-                    <label class="control-checkbox" title="显示任务状态转移、风险证据和辅助来源关系">
-                        <input type="checkbox" id="chkShowAuditEdges">
-                        <span>显示审计边</span>
-                    </label>
                     <label class="control-checkbox">
                         <input type="checkbox" id="chkShowLabels" checked>
                         <span>显示标签</span>
@@ -58,8 +54,8 @@
                 <svg id="graph-svg" role="img" aria-label="数据流拓扑图"></svg>
 
                 <!-- 图例：节点类型与关系 -->
-                <div class="legend" aria-label="图例">
-                    <button type="button" class="legend-toggle" id="btnToggleLegend" aria-expanded="true" aria-controls="legendContent">
+                <div class="legend collapsed" aria-label="图例">
+                    <button type="button" class="legend-toggle" id="btnToggleLegend" aria-expanded="false" aria-controls="legendContent">
                         <span>图例说明</span>
                         <span class="legend-toggle-icon" aria-hidden="true">▾</span>
                     </button>
@@ -73,8 +69,8 @@
                             <button type="button" class="legend-item" data-node-filter="prompt" aria-pressed="false" title="点击隐藏或显示用户提示节点"><span class="legend-color legend-prompt"></span><span>用户提示</span></button>
                             <button type="button" class="legend-item" data-node-filter="data" aria-pressed="false" title="点击隐藏或显示数据实体节点"><span class="legend-color legend-data"></span><span>数据实体</span></button>
                             <button type="button" class="legend-item" data-node-filter="sensitive" aria-pressed="false" title="点击隐藏或显示敏感数据节点"><span class="legend-color legend-sensitive"></span><span>敏感数据</span></button>
-                            <button type="button" class="legend-item" data-node-filter="untrusted" aria-pressed="false" title="点击隐藏或显示不可信输入节点"><span class="legend-color legend-untrusted"></span><span>不可信输入</span></button>
-                            <button type="button" class="legend-item" data-node-filter="risk" aria-pressed="false" title="点击隐藏或显示异常与阻断节点"><span class="legend-color legend-risk"></span><span>异常 / 阻断</span></button>
+                            <button type="button" class="legend-item" data-node-filter="untrusted" aria-pressed="false" title="点击隐藏或显示不可信或存在注入风险的数据节点"><span class="legend-color legend-untrusted"></span><span>不可信 / 注入风险</span></button>
+                            <button type="button" class="legend-item" data-node-filter="risk" aria-pressed="false" title="点击隐藏或显示风险、策略与阻断节点"><span class="legend-color legend-risk"></span><span>风险 / 策略</span></button>
                             <button type="button" class="legend-item" data-node-filter="authorization" aria-pressed="false" title="点击隐藏或显示人工授权节点"><span class="legend-color legend-authorization"></span><span>人工授权</span></button>
                         </div>
                         <div class="legend-actions">
@@ -89,13 +85,14 @@
                             <div class="legend-item"><span class="legend-line legend-line-produce"></span><span>工具产出数据</span></div>
                             <div class="legend-item"><span class="legend-line legend-line-risk"></span><span>派生 / 风险关联</span></div>
                             <div class="legend-item"><span class="legend-line legend-line-egress"></span><span>数据外发</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-policy"></span><span>策略判定</span></div>
                             <div class="legend-item"><span class="legend-line legend-line-auth"></span><span>人工授权</span></div>
                             <div class="legend-item"><span class="legend-line legend-line-cross-app"></span><span>跨 APP 数据/控制流</span></div>
                             <div class="legend-item"><span class="legend-hop"></span><span>跨 APP 切换点</span></div>
                             <div class="legend-item"><span class="legend-bundle">×N</span><span>聚合分支，悬停节点展开</span></div>
                         </div>
                     </div>
-                    <div class="legend-note">悬停节点可聚焦并展开聚合分支；风险、策略和授权关联也在悬停相关节点时显示。辅助证据可通过“显示审计边”展开。</div>
+                    <div class="legend-note">默认显示主要数据流；悬停节点可展开聚合分支及其风险、策略和授权关联。</div>
                     </div>
                 </div>
 
@@ -138,20 +135,10 @@
                     </div>
                 </div>
 
-                <div class="console-section">
-                    <div class="console-label">自定义指令</div>
-                    <div class="custom-input-group">
-                        <input type="text" id="inputCustomAction"
-                               placeholder="输入指令，如：读取邮件、查询余额..."
-                               class="custom-input" autocomplete="off">
-                        <button type="button" id="btnCustomAction" class="btn-execute" title="发送指令给 Agent 执行">执行</button>
-                    </div>
-                </div>
-
                 <div class="console-section attack-section">
                     <div class="console-label attack-section-header">
-                        <span>攻击场景（注入测试）</span>
-                        <span class="attack-hint">按当前防护配置执行，可切换 Ring 对比检测、隔离和阻断效果</span>
+                        <span>跨 APP 攻击测试</span>
+                        <span class="attack-hint">选择跨 APP 任务、注入位置和攻击模板，验证跨域数据流防护效果</span>
                     </div>
                     <div class="attack-scenario-buttons" id="attackScenarioButtons">
                         <p class="hint">加载中...</p>
@@ -169,11 +156,11 @@
                 <div class="stats-grid">
                     <div class="stat-item">
                         <span class="stat-value" id="statNodes">0</span>
-                        <span class="stat-label">总节点</span>
+                        <span class="stat-label">当前节点</span>
                     </div>
                     <div class="stat-item">
                         <span class="stat-value" id="statEdges">0</span>
-                        <span class="stat-label">总边数</span>
+                        <span class="stat-label">当前关系</span>
                     </div>
                     <div class="stat-item">
                         <span class="stat-value" id="statEvents">0</span>

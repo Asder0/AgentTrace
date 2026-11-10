@@ -8,8 +8,9 @@ keywords.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Mapping
 from importlib.resources import files
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any
 
 CONFIDENTIALITY_LEVELS = {
     "public": 0,
@@ -20,25 +21,15 @@ CONFIDENTIALITY_LEVELS = {
 
 INTEGRITY_KINDS = {"trusted", "untrusted", "tainted"}
 
-_POLICY_TEXT = files("agentdojo.method.modeling").joinpath(
-    "tool_security.json"
-).read_text(encoding="utf-8")
+_POLICY_TEXT = files("agentdojo.method.modeling").joinpath("tool_security.json").read_text(encoding="utf-8")
 _POLICY = json.loads(_POLICY_TEXT)
 CATEGORY_MIN_LEVEL = dict(_POLICY.get("category_min_level", {}))
 _THRESHOLDS = _POLICY.get("thresholds", {})
-UNKNOWN_CATEGORY_LEVEL = str(
-    _THRESHOLDS.get("unknown_category_level", "secret")
-).lower()
-UNKNOWN_SOURCE_INTEGRITY = str(
-    _THRESHOLDS.get("unknown_source_integrity", "untrusted")
-).lower()
+UNKNOWN_CATEGORY_LEVEL = str(_THRESHOLDS.get("unknown_category_level", "secret")).lower()
+UNKNOWN_SOURCE_INTEGRITY = str(_THRESHOLDS.get("unknown_source_integrity", "untrusted")).lower()
 _SOURCE_POLICY = _POLICY.get("source_kinds", {})
-_TRUSTED_SOURCE_KINDS = {
-    str(item) for item in _SOURCE_POLICY.get("trusted", []) if item
-}
-_EXTERNAL_SOURCE_KINDS = {
-    str(item) for item in _SOURCE_POLICY.get("external", []) if item
-}
+_TRUSTED_SOURCE_KINDS = {str(item) for item in _SOURCE_POLICY.get("trusted", []) if item}
+_EXTERNAL_SOURCE_KINDS = {str(item) for item in _SOURCE_POLICY.get("external", []) if item}
 _SOURCE_LEVELS = {
     str(source): str(level).lower()
     for source, level in (_SOURCE_POLICY.get("levels", {}) or {}).items()
@@ -117,7 +108,7 @@ def make_injection(
     source_flagged: bool = False,
     max_score: float = 0.0,
     detector: str = "",
-    field_statuses: Optional[Mapping[str, str]] = None,
+    field_statuses: Mapping[str, str] | None = None,
     evidence_refs: Iterable[str] = (),
     available: bool = True,
     flagged_fields: Iterable[str] = (),
@@ -125,11 +116,23 @@ def make_injection(
     unscanned_fields: Iterable[str] = (),
     risky_entities: Iterable[str] = (),
     incomplete: bool = False,
+    primary_detector: str = "",
+    fallback_detector: str = "",
+    fallback_available: bool = False,
+    fallback_executed: bool = False,
+    coverage_scope: str = "primary_only",
+    coverage_complete: bool = True,
 ) -> dict[str, Any]:
     return {
         "source_flagged": bool(source_flagged),
         "max_score": max(0.0, min(1.0, float(max_score or 0.0))),
         "detector": str(detector or ""),
+        "primary_detector": str(primary_detector or ""),
+        "fallback_detector": str(fallback_detector or ""),
+        "fallback_available": bool(fallback_available),
+        "fallback_executed": bool(fallback_executed),
+        "coverage_scope": str(coverage_scope or "primary_only"),
+        "coverage_complete": bool(coverage_complete),
         "field_statuses": dict(field_statuses or {}),
         "evidence_refs": _unique(evidence_refs),
         "available": bool(available),
@@ -143,9 +146,9 @@ def make_injection(
 
 def make_flow_label(
     *,
-    confidentiality: Optional[Mapping[str, Any]] = None,
-    integrity: Optional[Mapping[str, Any]] = None,
-    injection: Optional[Mapping[str, Any]] = None,
+    confidentiality: Mapping[str, Any] | None = None,
+    integrity: Mapping[str, Any] | None = None,
+    injection: Mapping[str, Any] | None = None,
     data_influence: bool = True,
     control_influence: bool = False,
 ) -> dict[str, Any]:
@@ -158,9 +161,7 @@ def make_flow_label(
                 source_ids=(),
             )
         ),
-        "integrity": dict(
-            integrity or make_integrity(kind="trusted", taint_roots=())
-        ),
+        "integrity": dict(integrity or make_integrity(kind="trusted", taint_roots=())),
         "injection": dict(injection or make_injection()),
         "influence": {
             "data": bool(data_influence),
@@ -185,15 +186,9 @@ def join_confidentiality(
         candidate = _normalise_level(str(conf.get("level", "public")))
         if CONFIDENTIALITY_LEVELS[candidate] > CONFIDENTIALITY_LEVELS[level]:
             level = candidate
-        categories.update(
-            str(item) for item in conf.get("categories", []) if item
-        )
-        source_ids.extend(
-            str(item) for item in conf.get("source_ids", []) if item
-        )
-        source_entities.extend(
-            str(item) for item in conf.get("source_entities", []) if item
-        )
+        categories.update(str(item) for item in conf.get("categories", []) if item)
+        source_ids.extend(str(item) for item in conf.get("source_ids", []) if item)
+        source_entities.extend(str(item) for item in conf.get("source_entities", []) if item)
     required = minimum_level_for_categories(categories)
     if CONFIDENTIALITY_LEVELS[required] > CONFIDENTIALITY_LEVELS[level]:
         level = required
@@ -227,13 +222,9 @@ def join_integrity(
             continue
         kind = str(integ.get("kind", "trusted")).lower()
         saw_untrusted = saw_untrusted or (
-            kind not in INTEGRITY_KINDS
-            or kind in {"untrusted", "tainted"}
-            or bool(integ.get("taint_roots"))
+            kind not in INTEGRITY_KINDS or kind in {"untrusted", "tainted"} or bool(integ.get("taint_roots"))
         )
-        roots.extend(
-            str(item) for item in integ.get("taint_roots", []) if item
-        )
+        roots.extend(str(item) for item in integ.get("taint_roots", []) if item)
     if saw_untrusted:
         return make_integrity(
             kind="untrusted",
@@ -248,6 +239,11 @@ def join_injection(
     source_flagged = False
     max_score = 0.0
     detectors: list[str] = []
+    primary_detectors: list[str] = []
+    fallback_detectors: list[str] = []
+    fallback_available = False
+    fallback_executed = False
+    coverage_scopes: list[str] = []
     field_statuses: dict[str, str] = {}
     evidence_refs: list[str] = []
     flagged_fields: list[str] = []
@@ -256,44 +252,49 @@ def join_injection(
     risky_entities: list[str] = []
     available = True
     incomplete = False
+    coverage_complete = True
     for label in labels:
         if not label:
             continue
         injection = label.get("injection")
         if not isinstance(injection, Mapping):
             continue
-        source_flagged = source_flagged or bool(
-            injection.get("source_flagged", False)
-        )
+        source_flagged = source_flagged or bool(injection.get("source_flagged", False))
         max_score = max(max_score, float(injection.get("max_score", 0.0) or 0.0))
         if injection.get("detector"):
             detectors.append(str(injection["detector"]))
+        if injection.get("primary_detector"):
+            primary_detectors.append(str(injection["primary_detector"]))
+        if injection.get("fallback_detector"):
+            fallback_detectors.append(str(injection["fallback_detector"]))
+        fallback_available = fallback_available or bool(injection.get("fallback_available", False))
+        fallback_executed = fallback_executed or bool(injection.get("fallback_executed", False))
+        if injection.get("coverage_scope"):
+            coverage_scopes.append(str(injection["coverage_scope"]))
         statuses = injection.get("field_statuses")
         if isinstance(statuses, Mapping):
-            field_statuses.update(
-                {str(key): str(value) for key, value in statuses.items()}
-            )
-        evidence_refs.extend(
-            str(item) for item in injection.get("evidence_refs", []) if item
-        )
-        flagged_fields.extend(
-            str(item) for item in injection.get("flagged_fields", []) if item
-        )
-        quarantined_fields.extend(
-            str(item) for item in injection.get("quarantined_fields", []) if item
-        )
-        unscanned_fields.extend(
-            str(item) for item in injection.get("unscanned_fields", []) if item
-        )
-        risky_entities.extend(
-            str(item) for item in injection.get("risky_entities", []) if item
-        )
+            field_statuses.update({str(key): str(value) for key, value in statuses.items()})
+        evidence_refs.extend(str(item) for item in injection.get("evidence_refs", []) if item)
+        flagged_fields.extend(str(item) for item in injection.get("flagged_fields", []) if item)
+        quarantined_fields.extend(str(item) for item in injection.get("quarantined_fields", []) if item)
+        unscanned_fields.extend(str(item) for item in injection.get("unscanned_fields", []) if item)
+        risky_entities.extend(str(item) for item in injection.get("risky_entities", []) if item)
         available = available and bool(injection.get("available", True))
         incomplete = incomplete or bool(injection.get("incomplete", False))
+        coverage_complete = coverage_complete and bool(injection.get("coverage_complete", True))
+    unique_scopes = list(dict.fromkeys(coverage_scopes))
     return make_injection(
         source_flagged=source_flagged,
         max_score=max_score,
         detector=detectors[-1] if detectors else "",
+        primary_detector="+".join(dict.fromkeys(primary_detectors)),
+        fallback_detector="+".join(dict.fromkeys(fallback_detectors)),
+        fallback_available=fallback_available,
+        fallback_executed=fallback_executed,
+        coverage_scope=(
+            unique_scopes[0] if len(unique_scopes) == 1 else ("mixed" if unique_scopes else "primary_only")
+        ),
+        coverage_complete=coverage_complete,
         field_statuses=field_statuses,
         evidence_refs=evidence_refs,
         available=available,
@@ -312,13 +313,9 @@ def aggregate_flow_labels(
     control_influence: bool = False,
 ) -> dict[str, Any]:
     materialised = [label for label in labels if isinstance(label, Mapping)]
-    data_influence = any(
-        bool((label.get("influence") or {}).get("data", True))
-        for label in materialised
-    )
+    data_influence = any(bool((label.get("influence") or {}).get("data", True)) for label in materialised)
     control = control_influence or any(
-        bool((label.get("influence") or {}).get("control", False))
-        for label in materialised
+        bool((label.get("influence") or {}).get("control", False)) for label in materialised
     )
     return make_flow_label(
         confidentiality=join_confidentiality(materialised),
@@ -340,8 +337,7 @@ def derive_flow_label(
     parent_labels = [label for label in parents if isinstance(label, Mapping)]
     generated = source_kind in {"agent", "activity", "sanitized"}
     source_untrusted = not generated and (
-        source_kind in _EXTERNAL_SOURCE_KINDS
-        or source_kind not in _TRUSTED_SOURCE_KINDS
+        source_kind in _EXTERNAL_SOURCE_KINDS or source_kind not in _TRUSTED_SOURCE_KINDS
     )
     conf = join_confidentiality(parent_labels)
     source_level = _SOURCE_LEVELS.get(str(source_kind), "secret")
@@ -391,13 +387,8 @@ def is_tainted(label: Mapping[str, Any] | None) -> bool:
 def is_confidential(label: Mapping[str, Any] | None) -> bool:
     if not isinstance(label, Mapping):
         return False
-    level = str(
-        (label.get("confidentiality") or {}).get("level", "public")
-    ).lower()
-    return (
-        CONFIDENTIALITY_LEVELS.get(level, 0)
-        >= CONFIDENTIALITY_LEVELS["confidential"]
-    )
+    level = str((label.get("confidentiality") or {}).get("level", "public")).lower()
+    return CONFIDENTIALITY_LEVELS.get(level, 0) >= CONFIDENTIALITY_LEVELS["confidential"]
 
 
 def _unique(values: Iterable[str]) -> list[str]:

@@ -29,7 +29,7 @@ AgentTrace 在 AgentDojo 基准测试框架之上，通过 AOP 拦截器（Monke
 ## 功能特性
 
 - **可审计运行时策略（4-Ring，轻量实现）**
-  - Ring 0：本地 `Unplug-AI/unplug-tiny-v1` 双头模型检测直接注入并返回精确攻击 span；主模型未命中时使用语义句级后备检测，支持 ADVISORY、QUARANTINE 和 STRICT
+  - Ring 0：本地 DeBERTa 直接注入分类器先判断完整用户指令；完整指令命中后，再按句定位风险；默认使用 QUARANTINE，将命中内容替换为 `[[DATA_REMOVED]]`，同时支持 ADVISORY 和 STRICT
   - Ring 1：按 schema 字段类型扫描工具输出；普通字符串一律检测，Unplug 命中时隔离精确 span，后备检测命中时隔离语义块，并将来源实体标记为可疑
   - Ring 2：使用人工定义的 L0/L1/L2 工具等级，控制工具、数据字段和具体资源的访问范围；高风险操作、可疑来源影响的写操作以及任务条件无法确认的情况，均进入相应的检查和用户决策
   - Ring 3：在 egress 执行前检查最终参数及被引用资源内容；按 APP 实体字段的敏感等级、多来源最高等级继承、完整来源元组、来源风险和接收方授权状态进行判定
@@ -41,7 +41,7 @@ AgentTrace 在 AgentDojo 基准测试框架之上，通过 AOP 拦截器（Monke
   - `PASS / ADVISORY / MITIGATE / QUARANTINE / HOLD / BLOCK` 决策均写入图谱
   - 非阻断风险保持任务运行并在图谱、时间线和风险卡片中高亮
 - **全机制开关**
-  - Ring 0：小模型分块检测
+  - Ring 0：DeBERTa 完整指令门控、句级定位与占位符隔离
   - Ring 1：小模型分块扫描 + 不可信控制流提醒
   - Ring 2：任务范围、资源选择器和 Agent 字段暴露授权
   - Ring 3：APP 字段级敏感等级、接收方三态授权与控制器占位符解析
@@ -91,9 +91,11 @@ open frontend/index.html
 xdg-open frontend/index.html
 ```
 
-> 首次使用时，需在页面右上角“操作控制台”中配置 LLM（选择模型并填写 API Key，支持 OpenAI / Anthropic / DeepSeek / Gemini 等，详见 `src/agentdojo/agent_pipeline/llms/`），之后即可执行指令或攻击场景测试。
+> 首次使用时，需在页面右上角“操作控制台”中配置 LLM（选择模型并填写 API Key，支持 OpenAI / Anthropic / DeepSeek / Gemini 等，详见 `src/agentdojo/agent_pipeline/llms/`），之后即可执行跨 APP 预设任务或攻击测试。
 
-> Ring 0/Ring 1 使用项目内 `models/unplug-tiny-v1` 的双头小模型；
+> Ring 0 使用项目内 `models/deberta-v3-base-prompt-injection-v2`；
+> Ring 1 使用项目内 `models/unplug-tiny-v1` 的双头小模型和
+> `models/prompt-injection-guard-small` 多语言后备；
 > Ring 2/Ring 3 使用任务授权、声明式工具元数据、信息流标签和确定性路径检查。
 
 > 前端通过 `https://d3js.org` 加载 D3 v7。完全离线运行时需要把 D3 资源下载到 `frontend/` 并修改 `frontend/index.html` 的脚本地址。
@@ -103,6 +105,7 @@ xdg-open frontend/index.html
 | 变量 | 说明 |
 | :--- | :--- |
 | `AGENTDOJO_PI_MODEL_PATH=<dir>` | 覆盖本地提示注入检测模型目录；未设置时使用项目内 `models/unplug-tiny-v1` |
+| `AGENTDOJO_DIRECT_PI_MODEL_PATH=<dir>` | 覆盖 Ring 0 直接注入检测模型目录；未设置时使用项目内 `models/deberta-v3-base-prompt-injection-v2` |
 | `AGENTDOJO_GLINER_MODEL_PATH=<dir>` | 覆盖本地 GLiNER 目录；未设置时使用 `models/gliner_multi-v2.1`，模型不可用时读取 fail-closed |
 | `AGENTDOJO_USE_RELOADER=true` | 开启 Flask debug 自动重载（默认关闭，避免重复加载模型） |
 | `AGENTDOJO_ATTACK_SCENARIOS_PER_SUITE=<n>` | 每个攻击类型在每个 suite 中生成的预设场景数，默认 3 |
@@ -116,8 +119,13 @@ GLiNER 使用相同的离线约束，并且是 Ring 2 的强制组件。默认�
 
 ```bash
 hf download Unplug-AI/unplug-tiny-v1 --local-dir models/unplug-tiny-v1
+hf download protectai/deberta-v3-base-prompt-injection-v2 --local-dir models/deberta-v3-base-prompt-injection-v2
 hf download urchade/gliner_multi-v2.1 --local-dir models/gliner_multi-v2.1
 ```
+
+Ring 0 的 DeBERTa 阈值默认为 `0.5`。完整用户 prompt 先整体过门控，只有完整输入
+被判为可疑时才按句定位，然后以 `[[DATA_REMOVED]]` 替换命中片段；默认模式仍是
+`quarantine`，不会把正常任务静默放行为 `advisory`。
 
 Unplug 文档头阈值默认设为 `0.9`，BIOES span 阈值默认设为 `0.45`；最终写操作和外发仍由 Ring 2/3 决定。
 若项目内仍存在 `models/prompt-injection-guard-small`，它只作为 Unplug 无命中时的

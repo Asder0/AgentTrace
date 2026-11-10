@@ -137,7 +137,7 @@
         auto: '受来源约束的模型派生',
     };
 
-    function titleFor(ring, policyId) {
+    function titleFor(ring, policyId, phase = '') {
         if (policyId === 'ring0.direct_user_instruction') {
             return 'Ring 0：直接提示注入检测';
         }
@@ -157,6 +157,9 @@
             return 'Ring 2：L2 人工确认';
         }
         if (policyId === 'ring2.sensitive_data_exposure_confirmation') {
+            if (phase === 'post_execution_runtime_detection') {
+                return 'Ring 2：运行期敏感内容二次确认';
+            }
             return 'Ring 2：敏感数据读取授权';
         }
         if (policyId === 'ring2.sensitive_data_exposure_rejected') {
@@ -227,7 +230,7 @@
         }[normalized] || '已记录防护决策';
     }
 
-    function detailFor(card, decision, ring, policyId) {
+    function detailFor(card, decision, ring, policyId, phase = '') {
         const action = card.action || card.tool_name || '当前操作';
         if (policyId === 'ring0.direct_user_instruction') {
             if (decision === 'MITIGATE') {
@@ -248,6 +251,9 @@
             return `“${action}”属于计划内 L2 操作，调用链检查通过，等待人工确认。`;
         }
         if (policyId === 'ring2.sensitive_data_exposure_confirmation') {
+            if (phase === 'post_execution_runtime_detection') {
+                return `“${action}”读取后发现自然语言内容包含超出原计划的敏感信息，已暂停并等待用户再次授权。`;
+            }
             return `“${action}”需要读取任务必需的敏感字段，等待用户授权。`;
         }
         if (policyId === 'ring2.sensitive_data_exposure_rejected') {
@@ -395,9 +401,13 @@
     }
 
     function auditSummaryText(kind, item, outcomeCounts = {}) {
+        if (kind === 'waiting') return '等待任务执行后生成审计结论。';
         if (kind === 'blocked') return '安全策略已阻断该操作。';
+        if (kind === 'quarantined') return '检测到需隔离内容，相关结果未作为正常任务结果通过。';
+        if (kind === 'held') return '任务仍处于人工决策等待状态，尚未形成最终结果。';
         if (kind === 'mitigated') return '检测到不可信内容，高风险部分已隔离。';
         if (kind === 'advisory') return '检测到不可信内容影响，已记录审计提醒。';
+        if (kind === 'unverified') return '任务缺少可核验终态，当前结果需要人工复核。';
         if (kind === 'completed') {
             return '所有必需结果均已完成并通过证据核验。';
         }
@@ -463,7 +473,8 @@
             : 0;
         const decision = String(card.decision || 'ADVISORY').toUpperCase();
         const policyId = String(card.policy_id || '');
-        let title = titleFor(ring, policyId);
+        const phase = String(card.phase || '');
+        let title = titleFor(ring, policyId, phase);
         if (
             decision === 'MITIGATE'
             && ring === 0
@@ -477,22 +488,27 @@
             ring,
             decision,
             title,
-            decision_label: decisionLabels[decision] || decision,
+            decision_label: card.user_decision_label
+                || decisionLabels[decision]
+                || decision,
             severity_label: severityLabels[severity] || severity,
             defense_ring: title,
-            defense_action: actionFor(decision, ring, policyId),
-            defense_effect: effectFor(
-                decision,
-                ring,
-                policyId,
-                card.fsm_before,
-                card.fsm_after,
-            ),
+            defense_action: card.defense_action
+                || actionFor(decision, ring, policyId),
+            defense_effect: card.defense_effect
+                || effectFor(
+                    decision,
+                    ring,
+                    policyId,
+                    card.fsm_before,
+                    card.fsm_after,
+                ),
             defense_detail: detailFor(
                 card,
                 decision,
                 ring,
                 policyId,
+                phase,
             ),
         };
     }

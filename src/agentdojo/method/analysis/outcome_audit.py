@@ -10,13 +10,19 @@ associated with the relevant plan step.
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import math
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from ..modeling.policy import security_thresholds
-from ..modeling.policy import tool_effect
+from ..modeling.policy import (
+    base_tool_name,
+    security_thresholds,
+    tool_effect,
+    tool_identity,
+)
 from .access_plan import parse_plan_json
 from .requirement_audit import (
     RESOLVED_REQUIREMENT_STATUSES,
@@ -41,6 +47,7 @@ Return JSON only:
       "status": "satisfied|unsatisfied|uncertain",
       "reason": "concise evidence-based reason",
       "confidence": 0.0,
+      "constraint_basis": "final_response_format|execution_absence|tool_evidence",
       "evidence_quotes": [
         {
           "activity_id": "successful activity id",
@@ -110,8 +117,16 @@ Rules:
   If no event performs the prohibited side effect, classify the constraint as
   satisfied even though there is no positive tool call proving absence. Cite
   the successful activities that establish what the Agent did instead in
-  supporting_evidence_activity_ids; do not return uncertain merely because no
-  positive activity can directly prove a negative.
+  supporting_evidence_activity_ids and set constraint_basis=execution_absence;
+  do not return uncertain merely because no positive activity can directly
+  prove a negative.
+- Required for every outcome whose kind is constraint. Use
+  final_response_format when the constraint only governs the wording or shape
+  of the final answer and cite a final_response quote. Use execution_absence
+  for a prohibited side effect and cite successful activities that establish
+  what the Agent did instead. Use tool_evidence when a successful tool result
+  directly proves the constraint.
+- A final_response quote alone never proves execution_absence.
 - Trigger stop_conditions only when their declared structured conditions are
   actually met. A stop is an execution disposition, not task completion unless
   the user instruction explicitly makes that stop the desired outcome.
@@ -186,22 +201,136 @@ def normalize_required_outcomes(
     raw_outcomes = plan.get("required_outcomes", [])
     if not isinstance(raw_outcomes, list):
         return []
+    raw_registry = (
+        plan.get("source_refs", {})
+        if isinstance(plan.get("source_refs"), Mapping)
+        else {}
+    )
+
+    def contract_ref(source_ref: Mapping[str, Any]) -> dict[str, Any] | None:
+        app = str(source_ref.get("app") or "").strip().lower()
+        entity = str(source_ref.get("entity") or "").strip().lower()
+        source_action = str(
+            source_ref.get("source_action")
+            or source_ref.get("source_tool")
+            or ""
+        ).strip()
+        if not app or not entity or not source_action:
+            return None
+        source_id = str(
+            source_ref.get("source_id")
+            or source_ref.get("id")
+            or ""
+        ).strip()
+        registry_ref = (
+            raw_registry.get(source_id, {})
+            if source_id
+            else {}
+        )
+        if not isinstance(registry_ref, Mapping):
+            registry_ref = {}
+        if not source_id:
+            matching_ids = [
+                str(candidate_id)
+                for candidate_id, candidate in raw_registry.items()
+                if isinstance(candidate, Mapping)
+                and str(candidate.get("app", "")).lower() == app
+                and str(candidate.get("entity", "")).lower() == entity
+                and tool_identity(
+                    str(
+                        candidate.get(
+                            "source_action",
+                            "",
+                        )
+                    ),
+                    str(candidate.get("app", "")),
+                )
+                == tool_identity(source_action, app)
+            ]
+            if len(matching_ids) == 1:
+                source_id = matching_ids[0]
+                registry_ref = raw_registry.get(source_id, {})
+        normalized = {
+            **dict(registry_ref),
+            **dict(source_ref),
+            "app": app,
+            "entity": entity,
+            "source_action": source_action,
+        }
+        if source_id:
+            normalized["source_id"] = source_id
+        else:
+            normalized.pop("id", None)
+        for key in (
+            "source_path",
+            "producer_step",
+            "source_activity_id",
+            "source_tool_call_id",
+            "tool_call_id",
+        ):
+            if not str(normalized.get(key, "") or "").strip():
+                normalized.pop(key, None)
+        return normalized
+
+    def append_ref(
+        target: list[dict[str, Any]],
+        source_ref: Mapping[str, Any],
+    ) -> None:
+        normalized = contract_ref(source_ref)
+        if normalized is None:
+            return
+        key = (
+            str(normalized.get("app", "")).lower(),
+            str(normalized.get("entity", "")).lower(),
+            tool_identity(
+                str(normalized.get("source_action", "")),
+                str(normalized.get("app", "")),
+            ),
+            str(normalized.get("source_id", "") or ""),
+            str(normalized.get("producer_step", "") or ""),
+            str(normalized.get("source_path", "") or ""),
+            str(normalized.get("source_activity_id", "") or ""),
+            str(
+                normalized.get("source_tool_call_id")
+                or normalized.get("tool_call_id")
+                or ""
+            ),
+        )
+        if all(
+            (
+                str(existing.get("app", "")).lower(),
+                str(existing.get("entity", "")).lower(),
+                tool_identity(
+                    str(existing.get("source_action", "")),
+                    str(existing.get("app", "")),
+                ),
+                str(existing.get("source_id", "") or ""),
+                str(existing.get("producer_step", "") or ""),
+                str(existing.get("source_path", "") or ""),
+                str(
+                    existing.get("source_activity_id", "") or ""
+                ),
+                str(
+                    existing.get("source_tool_call_id")
+                    or existing.get("tool_call_id")
+                    or ""
+                ),
+            )
+            != key
+            for existing in target
+        ):
+            target.append(normalized)
+
     normalized: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for index, raw in enumerate(raw_outcomes):
         if isinstance(raw, Mapping):
-            description = str(
-                raw.get("description") or raw.get("text") or ""
-            ).strip()
+            description = str(raw.get("description") or raw.get("text") or "").strip()
             outcome_id = str(raw.get("id") or f"o{index + 1}").strip()
             raw_step_ids = raw.get("step_ids", [])
             if not isinstance(raw_step_ids, list):
                 raw_step_ids = []
-            step_ids = [
-                str(item)
-                for item in raw_step_ids
-                if str(item).strip()
-            ]
+            step_ids = [str(item) for item in raw_step_ids if str(item).strip()]
             raw_required_sources = raw.get("required_source_refs", [])
             if not isinstance(raw_required_sources, list):
                 raw_required_sources = []
@@ -209,60 +338,84 @@ def normalize_required_outcomes(
             for source_ref in raw_required_sources:
                 if not isinstance(source_ref, Mapping):
                     continue
-                app = str(source_ref.get("app") or "").strip().lower()
-                entity = str(
-                    source_ref.get("entity") or ""
-                ).strip().lower()
-                source_action = str(
-                    source_ref.get("source_action")
-                    or source_ref.get("source_tool")
-                    or ""
-                ).strip()
-                if app and entity and source_action:
-                    required_source_refs.append(
-                        {
-                            "app": app,
-                            "entity": entity,
-                            "source_action": source_action,
-                        }
-                    )
+                append_ref(required_source_refs, source_ref)
             raw_required_source_ids = raw.get("required_sources", [])
             if not isinstance(raw_required_source_ids, list):
                 raw_required_source_ids = []
-            required_sources = [
-                str(item).strip()
-                for item in raw_required_source_ids
-                if str(item).strip()
-            ]
+            required_sources = [str(item).strip() for item in raw_required_source_ids if str(item).strip()]
+            raw_applies_to = raw.get("applies_to", [])
+            applies_to = (
+                [
+                    str(item).strip()
+                    for item in raw_applies_to
+                    if str(item).strip()
+                ]
+                if isinstance(raw_applies_to, list)
+                else []
+            )
             required_source_steps = []
-            raw_registry = plan.get("source_refs", {})
             if isinstance(raw_registry, Mapping):
                 for source_id in required_sources:
                     source_ref = raw_registry.get(source_id)
                     if not isinstance(source_ref, Mapping):
                         continue
-                    producer_step = str(
-                        source_ref.get("producer_step") or ""
-                    ).strip()
+                    producer_step = str(source_ref.get("producer_step") or "").strip()
                     if producer_step:
                         required_source_steps.append(producer_step)
                     app = str(source_ref.get("app") or "").strip().lower()
-                    entity = str(
-                        source_ref.get("entity") or ""
-                    ).strip().lower()
-                    source_action = str(
-                        source_ref.get("source_action")
-                        or source_ref.get("source_tool")
-                        or ""
-                    ).strip()
+                    entity = str(source_ref.get("entity") or "").strip().lower()
+                    source_action = str(source_ref.get("source_action") or source_ref.get("source_tool") or "").strip()
                     if app and entity and source_action:
-                        required_source_refs.append(
+                        append_ref(
+                            required_source_refs,
                             {
-                                "app": app,
-                                "entity": entity,
-                                "source_action": source_action,
-                            }
+                                "source_id": source_id,
+                                **dict(source_ref),
+                            },
                         )
+            generic_refs = [
+                item
+                for item in required_source_refs
+                if not item.get("source_id")
+            ]
+            concrete_refs = [
+                item
+                for item in required_source_refs
+                if item.get("source_id")
+            ]
+            for generic in generic_refs:
+                matches = [
+                    item
+                    for item in concrete_refs
+                    if (
+                        str(item.get("app", "")).lower(),
+                        str(item.get("entity", "")).lower(),
+                        base_tool_name(
+                            str(item.get("source_action", ""))
+                        ),
+                    )
+                    == (
+                        str(generic.get("app", "")).lower(),
+                        str(generic.get("entity", "")).lower(),
+                        base_tool_name(
+                            str(generic.get("source_action", ""))
+                        ),
+                    )
+                ]
+                if not matches:
+                    continue
+                for concrete in matches:
+                    for key, value in generic.items():
+                        if (
+                            key not in concrete
+                            or concrete.get(key) in (None, "")
+                        ):
+                            concrete[key] = copy.deepcopy(value)
+                required_source_refs = [
+                    item
+                    for item in required_source_refs
+                    if item is not generic
+                ]
             kind = str(raw.get("kind") or "semantic").strip()
         else:
             description = str(raw or "").strip()
@@ -271,6 +424,7 @@ def normalize_required_outcomes(
             required_source_refs = []
             required_sources = []
             required_source_steps = []
+            applies_to = []
             kind = "semantic"
         if not description:
             continue
@@ -284,22 +438,10 @@ def normalize_required_outcomes(
                 "id": outcome_id,
                 "description": description,
                 "step_ids": list(dict.fromkeys(step_ids)),
-                "required_sources": list(
-                    dict.fromkeys(required_sources)
-                ),
-                "required_source_steps": list(
-                    dict.fromkeys(required_source_steps)
-                ),
-                "required_source_refs": list(
-                    {
-                        (
-                            item["app"],
-                            item["entity"],
-                            item["source_action"],
-                        ): item
-                        for item in required_source_refs
-                    }.values()
-                ),
+                "required_sources": list(dict.fromkeys(required_sources)),
+                "required_source_steps": list(dict.fromkeys(required_source_steps)),
+                "required_source_refs": required_source_refs,
+                "applies_to": list(dict.fromkeys(applies_to)),
                 "kind": kind,
             }
         )
@@ -333,9 +475,7 @@ def _bounded_text(text: str, max_chars: int) -> tuple[str, bool]:
     head_chars = (available * 2) // 3
     tail_chars = available - head_chars
     return (
-        text[:head_chars]
-        + marker
-        + (text[-tail_chars:] if tail_chars else ""),
+        text[:head_chars] + marker + (text[-tail_chars:] if tail_chars else ""),
         True,
     )
 
@@ -379,7 +519,7 @@ def _bounded_structured_text(
             truncated = truncated or clipped
         return bounded, truncated
 
-    if isinstance(value, (list, tuple)) and value:
+    if isinstance(value, list | tuple) and value:
         items = list(value)
         overhead = 2 + max(0, len(items) - 1) * 2
         item_budget = max(
@@ -417,18 +557,15 @@ def _bounded_evidence_text(
 def _allocate_evidence_budgets(lengths: Sequence[int]) -> list[int]:
     """Water-fill a shared budget so small records remain complete."""
     budgets = [0 for _ in lengths]
-    pending = {
-        index
-        for index, length in enumerate(lengths)
-        if length > 0
-    }
+    pending = {index for index, length in enumerate(lengths) if length > 0}
     remaining = _EVIDENCE_TOTAL_CHAR_BUDGET
     while pending and remaining > 0:
         share = max(1, remaining // len(pending))
         completed = {
             index
             for index in pending
-            if lengths[index] <= min(
+            if lengths[index]
+            <= min(
                 share,
                 _EVIDENCE_EVENT_CHAR_BUDGET,
             )
@@ -481,24 +618,45 @@ def _event_evidence(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
         structured_output, structured = _structured_output(output)
         environment_delta = event.get("environment_delta")
         if environment_delta is not None:
-            try:
-                full_environment_delta = json.dumps(
-                    environment_delta,
-                    ensure_ascii=False,
-                    default=str,
-                )
-            except (TypeError, ValueError):
-                full_environment_delta = str(environment_delta)
+            full_environment_delta = _compact_json_text(
+                environment_delta
+            )
         else:
             full_environment_delta = ""
+        tool_name = str(event.get("tool_intent") or "")
+        event_status = str(event.get("status") or "")
+        expected_environment_change = event_status == "success" and tool_effect(tool_name).effect != "read"
+        source_delta_complete = event.get("environment_delta_complete")
+        if source_delta_complete is None:
+            source_delta_complete = not (expected_environment_change and environment_delta is None)
         raw_evidence.append(
             {
-                "activity_id": str(
-                    event.get("activity_id") or f"event:{index}"
-                ),
-                "tool": str(event.get("tool_intent") or ""),
+                "activity_id": str(event.get("activity_id") or f"event:{index}"),
+                "tool": tool_name,
+                "tool_intent": tool_name,
                 "step_id": str(event.get("plan_step_id") or ""),
-                "status": str(event.get("status") or ""),
+                "plan_step_id": str(event.get("plan_step_id") or ""),
+                "app_domain": str(
+                    event.get("app_domain")
+                    or event.get("target_app")
+                    or ""
+                ),
+                "target_app": str(
+                    event.get("target_app")
+                    or event.get("app_domain")
+                    or ""
+                ),
+                "tool_call_id": str(
+                    event.get("tool_call_id")
+                    or event.get("source_tool_call_id")
+                    or ""
+                ),
+                "source_tool_call_id": str(
+                    event.get("source_tool_call_id")
+                    or event.get("tool_call_id")
+                    or ""
+                ),
+                "status": event_status,
                 "arguments": event.get("inputs") or {},
                 "output_value": structured_output,
                 "output_structured": structured,
@@ -507,13 +665,12 @@ def _event_evidence(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
                     len(full_environment_delta),
                 ),
                 "error": str(event.get("error") or ""),
-                "environment_delta": full_environment_delta,
+                "environment_delta_value": environment_delta,
+                "environment_delta_source_complete": bool(source_delta_complete),
             }
         )
 
-    budgets = _allocate_evidence_budgets(
-        [int(item["evidence_length"]) for item in raw_evidence]
-    )
+    budgets = _allocate_evidence_budgets([int(item["evidence_length"]) for item in raw_evidence])
     evidence: list[dict[str, Any]] = []
     for item, output_budget in zip(raw_evidence, budgets):
         output_text, output_truncated = _bounded_evidence_text(
@@ -521,20 +678,140 @@ def _event_evidence(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
             bool(item.pop("output_structured")),
             output_budget,
         )
-        environment_delta, environment_delta_truncated = _bounded_text(
-            str(item.get("environment_delta") or ""),
-            min(3_000, output_budget)
-            if output_budget
-            else 0,
+        (
+            environment_delta,
+            environment_delta_truncated,
+            environment_mutation_complete,
+            environment_access_complete,
+        ) = _bounded_environment_delta(
+            item.pop("environment_delta_value", None),
+            min(3_000, output_budget) if output_budget else 0,
         )
         item["output"] = output_text
         item["output_complete"] = not output_truncated
         item["environment_delta"] = environment_delta or None
-        item["environment_delta_complete"] = (
-            not environment_delta_truncated
+        item["environment_delta_complete"] = bool(item.pop("environment_delta_source_complete", True))
+        item["environment_delta_display_truncated"] = environment_delta_truncated
+        item["environment_delta_mutation_complete"] = (
+            environment_mutation_complete
+        )
+        item["environment_delta_access_complete"] = (
+            environment_access_complete
         )
         evidence.append(item)
     return evidence
+
+
+def _compact_json_text(value: Any) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _bounded_environment_delta(
+    value: Any,
+    budget: int,
+) -> tuple[str, bool, bool, bool]:
+    """Bound environment evidence without dropping state mutations.
+
+    State-changing sections are preserved first. Only the read-only
+    ``accessed`` context is reduced when the evidence budget is exhausted.
+    """
+    if value is None or str(value) == "":
+        return "", False, True, True
+    if not isinstance(value, Mapping):
+        text, truncated = _bounded_text(str(value), max(0, budget))
+        return text, truncated, not truncated, not truncated
+
+    mutation_keys = ("created", "updated", "deleted")
+    mutation_payload = {
+        key: copy.deepcopy(value.get(key, []))
+        for key in mutation_keys
+        if key in value
+    }
+    mutation_text = _compact_json_text(mutation_payload)
+    if budget <= 0 or len(mutation_text) > budget:
+        text, _truncated = _bounded_text(
+            mutation_text or _compact_json_text(value),
+            max(0, budget),
+        )
+        return text, True, False, False
+
+    raw_accessed = value.get("accessed", [])
+    if isinstance(raw_accessed, Sequence) and not isinstance(
+        raw_accessed,
+        str | bytes,
+    ):
+        accessed = list(raw_accessed)
+    elif raw_accessed in (None, ""):
+        accessed = []
+    else:
+        accessed = [raw_accessed]
+
+    payload: dict[str, Any] = {
+        **mutation_payload,
+        "accessed": [],
+    }
+    included = 0
+    for entry in accessed:
+        candidate = {
+            **payload,
+            "accessed": [*payload["accessed"], copy.deepcopy(entry)],
+        }
+        if len(_compact_json_text(candidate)) > budget:
+            break
+        payload = candidate
+        included += 1
+
+    access_complete = included == len(accessed)
+    if not access_complete:
+        summary = {
+            "total": len(accessed),
+            "included": included,
+            "omitted": len(accessed) - included,
+        }
+        payload["accessed_summary"] = summary
+        while (
+            included > 0
+            and len(_compact_json_text(payload)) > budget
+        ):
+            included -= 1
+            payload["accessed"] = payload["accessed"][:included]
+            payload["accessed_summary"] = {
+                "total": len(accessed),
+                "included": included,
+                "omitted": len(accessed) - included,
+            }
+
+    text = _compact_json_text(payload)
+    if len(text) > budget:
+        # The mutation evidence barely fit but even the access summary did
+        # not. Keep the complete state delta and drop read-only context.
+        payload.pop("accessed", None)
+        payload.pop("accessed_summary", None)
+        text = _compact_json_text(payload)
+        access_complete = len(accessed) == 0
+    return (
+        text,
+        not access_complete,
+        True,
+        access_complete,
+    )
+
+
+def _evidence_is_complete(item: Mapping[str, Any]) -> bool:
+    """Return whether relevant evidence is complete enough for auditing."""
+    return bool(
+        item.get("output_complete", True)
+        and item.get("environment_delta_complete", True)
+        and item.get("environment_delta_mutation_complete", True)
+    )
 
 
 def _incomplete_evidence_ids(
@@ -543,15 +820,9 @@ def _incomplete_evidence_ids(
 ) -> list[str]:
     incomplete: list[str] = []
     for item in evidence:
-        if (
-            allowed_step_ids
-            and str(item.get("step_id") or "") not in allowed_step_ids
-        ):
+        if allowed_step_ids and str(item.get("step_id") or "") not in allowed_step_ids:
             continue
-        if (
-            item.get("output_complete", True)
-            and item.get("environment_delta_complete", True)
-        ):
+        if _evidence_is_complete(item):
             continue
         activity_id = str(item.get("activity_id") or "")
         if activity_id:
@@ -631,16 +902,16 @@ def audit_final_response_claims(
         response_valid = False
     if not isinstance(raw.get("coverage_gaps"), list):
         response_valid = False
-    unsupported = [
-        dict(item)
-        for item in raw.get("unsupported_claims", [])
-        if isinstance(item, Mapping)
-    ] if isinstance(raw.get("unsupported_claims"), list) else []
-    coverage_gaps = [
-        dict(item)
-        for item in raw.get("coverage_gaps", [])
-        if isinstance(item, Mapping)
-    ] if isinstance(raw.get("coverage_gaps"), list) else []
+    unsupported = (
+        [dict(item) for item in raw.get("unsupported_claims", []) if isinstance(item, Mapping)]
+        if isinstance(raw.get("unsupported_claims"), list)
+        else []
+    )
+    coverage_gaps = (
+        [dict(item) for item in raw.get("coverage_gaps", []) if isinstance(item, Mapping)]
+        if isinstance(raw.get("coverage_gaps"), list)
+        else []
+    )
     corrected = str(raw.get("corrected_response") or "").strip()
     try:
         confidence = float(raw.get("confidence", 0.0) or 0.0)
@@ -655,20 +926,13 @@ def audit_final_response_claims(
             0.7,
         )
     )
-    safe = (
-        response_valid
-        and bool(raw.get("safe", False))
-        and not unsupported
-        and not coverage_gaps
-    )
+    safe = response_valid and bool(raw.get("safe", False)) and not unsupported and not coverage_gaps
     warnings: list[str] = []
     if not response_valid:
         warnings.append("final_response_audit_schema_invalid")
     if confidence < minimum:
         safe = False
-        warnings.append(
-            "final_response_audit_confidence_below_threshold"
-        )
+        warnings.append("final_response_audit_confidence_below_threshold")
     if not safe and not corrected:
         warnings.append("final_response_correction_missing")
     return {
@@ -700,11 +964,7 @@ def _validate_evidence_ids(
         warnings.append(f"evidence_not_successful:{invalid}")
     admitted = [item for item in normalized if item in successful_ids]
     if allowed_step_ids and admitted:
-        matching = [
-            item
-            for item in admitted
-            if event_steps.get(item, "") in allowed_step_ids
-        ]
+        matching = [item for item in admitted if event_steps.get(item, "") in allowed_step_ids]
         outside = [item for item in admitted if item not in matching]
         if outside:
             warnings.append(f"evidence_outside_outcome_steps:{outside}")
@@ -741,7 +1001,7 @@ def _argument_value_at_path(
                 return False, None
             if (
                 not isinstance(current, Sequence)
-                or isinstance(current, (str, bytes))
+                or isinstance(current, str | bytes)
                 or index < 0
                 or index >= len(current)
             ):
@@ -777,15 +1037,17 @@ def _argument_text_variants(
         return list(dict.fromkeys(candidates))
     values: list[Any] = []
     if not resolved:
+
         def collect(item: Any) -> None:
             if isinstance(item, Mapping):
                 for child in item.values():
                     collect(child)
-            elif isinstance(item, (list, tuple)):
+            elif isinstance(item, list | tuple):
                 for child in item:
                     collect(child)
-            elif isinstance(item, (str, int, float, bool)) or item is None:
+            elif isinstance(item, str | int | float | bool) or item is None:
                 values.append(item)
+
         collect(arguments)
     else:
         values = [value]
@@ -806,9 +1068,7 @@ def _argument_text_variants(
     for item in values:
         candidates.append(str(item))
         if not isinstance(item, str):
-            candidates.append(
-                json.dumps(item, ensure_ascii=False, default=str)
-            )
+            candidates.append(json.dumps(item, ensure_ascii=False, default=str))
     return list(dict.fromkeys(candidates))
 
 
@@ -822,6 +1082,20 @@ def _validate_evidence_quotes(
     warnings: list[str] = []
     if not isinstance(raw_quotes, list):
         return [], ["evidence_quotes_not_array"]
+
+    def normalized_evidence_text(value: str) -> str:
+        text = str(value or "")
+        for escaped, plain in (
+            ("\\r\\n", "\n"),
+            ("\\n", "\n"),
+            ("\\r", "\n"),
+            ("\\t", "\t"),
+            ('\\"', '"'),
+            ("\\/", "/"),
+        ):
+            text = text.replace(escaped, plain)
+        return re.sub(r"\s+", " ", text).strip()
+
     verified: list[dict[str, Any]] = []
     for raw in raw_quotes:
         if not isinstance(raw, Mapping):
@@ -863,12 +1137,10 @@ def _validate_evidence_quotes(
         if not evidence or evidence.get("status") != "success":
             warnings.append(f"evidence_quote_not_successful:{activity_id}")
             continue
-        if (
-            allowed_step_ids
-            and str(evidence.get("step_id") or "") not in allowed_step_ids
-        ):
+        if allowed_step_ids and str(evidence.get("step_id") or "") not in allowed_step_ids:
             warnings.append(f"evidence_quote_outside_steps:{activity_id}")
             continue
+        haystacks: list[str] = []
         if source == "tool_output":
             haystack = str(evidence.get("output") or "")
         elif source == "environment_delta":
@@ -880,13 +1152,14 @@ def _validate_evidence_quotes(
             )
             haystack = ""
         if source == "arguments":
-            quote_found = any(quote in candidate for candidate in haystacks)
-        else:
-            quote_found = quote in haystack
-        if not quote_found:
-            warnings.append(
-                f"evidence_quote_not_found:{activity_id}:{source}"
+            quote_found = any(
+                quote in candidate or normalized_evidence_text(quote) in normalized_evidence_text(candidate)
+                for candidate in haystacks
             )
+        else:
+            quote_found = quote in haystack or normalized_evidence_text(quote) in normalized_evidence_text(haystack)
+        if not quote_found:
+            warnings.append(f"evidence_quote_not_found:{activity_id}:{source}")
             continue
         verified.append(
             {
@@ -910,52 +1183,29 @@ def audit_task_outcomes(
     outcomes = normalize_required_outcomes(plan)
     requirements = normalize_requirements(plan)
     unmet_requirements = [
-        requirement
-        for requirement in requirements
-        if requirement.get("status") not in RESOLVED_REQUIREMENT_STATUSES
+        requirement for requirement in requirements if requirement.get("status") not in RESOLVED_REQUIREMENT_STATUSES
     ]
     if not outcomes:
         return {
             "schema_version": 1,
             "assessed": False,
-            "overall": (
-                "incomplete"
-                if unmet_requirements
-                else "not_applicable"
-            ),
+            "overall": ("incomplete" if unmet_requirements else "not_applicable"),
             "outcomes": [],
             "stop_conditions": [],
             "requirements": requirements,
             "requirement_coverage": {
                 "complete": not unmet_requirements,
-                "unmet_requirement_ids": [
-                    str(item.get("id") or "")
-                    for item in unmet_requirements
-                ],
+                "unmet_requirement_ids": [str(item.get("id") or "") for item in unmet_requirements],
             },
             "warnings": ["task_plan_has_no_required_outcomes"],
         }
 
     evidence = _event_evidence(events)
-    successful_ids = {
-        item["activity_id"]
-        for item in evidence
-        if item.get("status") == "success"
-    }
-    event_steps = {
-        item["activity_id"]: str(item.get("step_id") or "")
-        for item in evidence
-        if item.get("activity_id")
-    }
-    evidence_by_id = {
-        item["activity_id"]: item
-        for item in evidence
-        if item.get("activity_id")
-    }
+    successful_ids = {item["activity_id"] for item in evidence if item.get("status") == "success"}
+    event_steps = {item["activity_id"]: str(item.get("step_id") or "") for item in evidence if item.get("activity_id")}
+    evidence_by_id = {item["activity_id"]: item for item in evidence if item.get("activity_id")}
     side_effect_ids = {
-        item["activity_id"]
-        for item in evidence
-        if tool_effect(str(item.get("tool") or "")).effect != "read"
+        item["activity_id"] for item in evidence if tool_effect(str(item.get("tool") or "")).effect != "read"
     }
     minimum_confidence = float(
         security_thresholds().get(
@@ -973,14 +1223,10 @@ def audit_task_outcomes(
             + "\n\nOUTCOME_AUDIT_INPUT:\n"
             + json.dumps(
                 {
-                    "task_goal": str(
-                        (plan or {}).get("task_goal", "")
-                    ),
+                    "task_goal": str((plan or {}).get("task_goal", "")),
                     "required_outcomes": outcomes,
                     "requirements": requirements,
-                    "stop_conditions": list(
-                        (plan or {}).get("stop_conditions", [])
-                    ),
+                    "stop_conditions": list((plan or {}).get("stop_conditions", [])),
                     "final_response": str(final_response or ""),
                     "tool_evidence": evidence,
                 },
@@ -996,25 +1242,21 @@ def audit_task_outcomes(
             classified = {}
 
     raw_results = classified.get("outcomes", [])
-    by_id = {
-        str(item.get("id") or ""): item
-        for item in raw_results
-        if isinstance(item, Mapping)
-    } if isinstance(raw_results, list) else {}
+    by_id = (
+        {str(item.get("id") or ""): item for item in raw_results if isinstance(item, Mapping)}
+        if isinstance(raw_results, list)
+        else {}
+    )
     verified_results: list[dict[str, Any]] = []
     for outcome in outcomes:
         raw = by_id.get(outcome["id"], {})
         status = str(raw.get("status") or "uncertain").lower()
         if status not in {"satisfied", "unsatisfied", "uncertain"}:
-            warnings.append(
-                f"invalid_outcome_status:{outcome['id']}:{status}"
-            )
+            warnings.append(f"invalid_outcome_status:{outcome['id']}:{status}")
             status = "uncertain"
         allowed_evidence_steps = set(outcome["step_ids"])
         allowed_evidence_steps.update(
-            str(item)
-            for item in outcome.get("required_source_steps", [])
-            if str(item).strip()
+            str(item) for item in outcome.get("required_source_steps", []) if str(item).strip()
         )
         raw_registry = (plan or {}).get("source_refs", {})
         if isinstance(raw_registry, Mapping):
@@ -1022,28 +1264,35 @@ def audit_task_outcomes(
                 source_ref = raw_registry.get(source_id)
                 if not isinstance(source_ref, Mapping):
                     continue
-                producer_step = str(
-                    source_ref.get("producer_step") or ""
-                ).strip()
+                producer_step = str(source_ref.get("producer_step") or "").strip()
                 if producer_step:
                     allowed_evidence_steps.add(producer_step)
         try:
             confidence = float(raw.get("confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
             confidence = 0.0
-            warnings.append(
-                f"{outcome['id']}:invalid_confidence"
-            )
+            warnings.append(f"{outcome['id']}:invalid_confidence")
         confidence = min(1.0, max(0.0, confidence))
+        constraint_basis = str(raw.get("constraint_basis") or "").strip().lower()
+        if (
+            outcome.get("kind") == "constraint"
+            and constraint_basis
+            and constraint_basis
+            not in {
+                "final_response_format",
+                "execution_absence",
+                "tool_evidence",
+            }
+        ):
+            warnings.append(f"{outcome['id']}:invalid_constraint_basis:{constraint_basis}")
+            constraint_basis = ""
         validated_quotes, quote_warnings = _validate_evidence_quotes(
             raw.get("evidence_quotes", []),
             evidence_by_id=evidence_by_id,
             final_response=final_response,
             allowed_step_ids=allowed_evidence_steps,
         )
-        warnings.extend(
-            f"{outcome['id']}:{item}" for item in quote_warnings
-        )
+        warnings.extend(f"{outcome['id']}:{item}" for item in quote_warnings)
         raw_required_ids = raw.get("required_evidence_activity_ids")
         if not isinstance(raw_required_ids, list):
             raw_required_ids = raw.get("evidence_activity_ids", [])
@@ -1053,16 +1302,13 @@ def audit_task_outcomes(
             event_steps=event_steps,
             allowed_step_ids=allowed_evidence_steps,
         )
-        warnings.extend(
-            f"{outcome['id']}:{item}" for item in citation_warnings
-        )
+        warnings.extend(f"{outcome['id']}:{item}" for item in citation_warnings)
         if not required_cited:
             required_cited = list(
                 dict.fromkeys(
                     item["activity_id"]
                     for item in validated_quotes
-                    if item.get("activity_id")
-                    and item.get("source") != "final_response"
+                    if item.get("activity_id") and item.get("source") != "final_response"
                 )
             )
         supporting_cited, supporting_warnings = _validate_evidence_ids(
@@ -1072,105 +1318,76 @@ def audit_task_outcomes(
             allowed_step_ids=set(),
         )
         warnings.extend(
-            f"{outcome['id']}:support:{item}"
-            for item in supporting_warnings
-            if item != "evidence_ids_not_array"
+            f"{outcome['id']}:support:{item}" for item in supporting_warnings if item != "evidence_ids_not_array"
         )
-        required_source_steps = {
-            str(item)
-            for item in outcome.get("required_source_steps", [])
-            if str(item).strip()
-        }
+        required_source_steps = {str(item) for item in outcome.get("required_source_steps", []) if str(item).strip()}
         if status == "satisfied" and confidence < minimum_confidence:
             status = "uncertain"
-            warnings.append(
-                f"{outcome['id']}:confidence_below_threshold:"
-                f"{confidence:.2f}:{minimum_confidence:.2f}"
-            )
-        quoted_sources = {
-            str(item.get("source") or "")
-            for item in validated_quotes
-        }
+            warnings.append(f"{outcome['id']}:confidence_below_threshold:{confidence:.2f}:{minimum_confidence:.2f}")
+        quoted_sources = {str(item.get("source") or "") for item in validated_quotes}
         if (
             status == "satisfied"
             and outcome.get("kind") == "action"
-            and not quoted_sources.intersection(
-                {"tool_output", "environment_delta"}
-            )
+            and not quoted_sources.intersection({"tool_output", "environment_delta"})
         ):
             status = "uncertain"
-            warnings.append(
-                f"{outcome['id']}:action_without_structured_evidence"
-            )
+            warnings.append(f"{outcome['id']}:action_without_structured_evidence")
         if (
             status == "satisfied"
             and outcome.get("kind") == "action"
             and not any(
                 str(item.get("activity_id") or "") in side_effect_ids
-                and item.get("source")
-                in {"tool_output", "environment_delta"}
+                and item.get("source") in {"tool_output", "environment_delta"}
                 for item in validated_quotes
             )
         ):
             status = "uncertain"
-            warnings.append(
-                f"{outcome['id']}:action_without_side_effect_evidence"
-            )
+            warnings.append(f"{outcome['id']}:action_without_side_effect_evidence")
         if (
             status == "satisfied"
             and outcome.get("kind") == "data"
-            and not quoted_sources.intersection(
-                {"tool_output", "environment_delta"}
-            )
+            and not quoted_sources.intersection({"tool_output", "environment_delta"})
         ):
             status = "uncertain"
-            warnings.append(
-                f"{outcome['id']}:data_without_verifiable_quote"
-            )
+            warnings.append(f"{outcome['id']}:data_without_verifiable_quote")
         if (
             status == "satisfied"
             and outcome.get("kind") == "semantic"
-            and not quoted_sources.intersection(
-                {"tool_output", "final_response"}
-            )
+            and not quoted_sources.intersection({"tool_output", "final_response"})
         ):
             status = "uncertain"
-            warnings.append(
-                f"{outcome['id']}:semantic_outcome_without_quote"
-            )
+            warnings.append(f"{outcome['id']}:semantic_outcome_without_quote")
         if status == "satisfied" and not required_cited:
+            final_response_quoted = any(item.get("source") == "final_response" for item in validated_quotes)
             if (
                 outcome.get("kind") == "constraint"
+                and constraint_basis == "final_response_format"
+                and final_response_quoted
+            ):
+                warnings.append(f"{outcome['id']}:constraint_verified_by_final_response")
+            elif (
+                outcome.get("kind") == "constraint"
+                and constraint_basis
+                in {
+                    "execution_absence",
+                    "tool_evidence",
+                }
                 and not required_source_steps
                 and supporting_cited
             ):
                 # A prohibited side effect is verified by the closed set of
                 # successful execution evidence, not by a positive tool call.
-                warnings.append(
-                    f"{outcome['id']}:negative_constraint_verified_by_execution"
-                )
-            elif (
-                outcome.get("kind") == "semantic"
-                and validated_quotes
-            ):
-                warnings.append(
-                    f"{outcome['id']}:semantic_outcome_verified_by_quote"
-                )
+                warnings.append(f"{outcome['id']}:negative_constraint_verified_by_execution")
+            elif outcome.get("kind") == "semantic" and validated_quotes:
+                warnings.append(f"{outcome['id']}:semantic_outcome_verified_by_quote")
             else:
                 status = "uncertain"
-                warnings.append(
-                    f"{outcome['id']}:satisfied_without_valid_evidence"
-                )
-        required_cited_steps = {
-            event_steps.get(item, "")
-            for item in required_cited
-        }
+                warnings.append(f"{outcome['id']}:satisfied_without_valid_evidence")
+        required_cited_steps = {event_steps.get(item, "") for item in required_cited}
         required_coverage_steps = set(required_source_steps)
         if outcome.get("kind") == "action":
             required_coverage_steps.update(outcome["step_ids"])
-        missing_source_steps = sorted(
-            required_coverage_steps - required_cited_steps
-        )
+        missing_source_steps = sorted(required_coverage_steps - required_cited_steps)
         if (
             status == "satisfied"
             and outcome.get("kind") == "data"
@@ -1178,38 +1395,25 @@ def audit_task_outcomes(
             and not (set(outcome["step_ids"]) & required_cited_steps)
         ):
             status = "uncertain"
-            warnings.append(
-                f"{outcome['id']}:outcome_steps_not_cited"
-            )
+            warnings.append(f"{outcome['id']}:outcome_steps_not_cited")
         if status == "satisfied" and missing_source_steps:
             status = "uncertain"
-            warnings.append(
-                f"{outcome['id']}:required_source_steps_not_cited:"
-                f"{missing_source_steps}"
-            )
+            warnings.append(f"{outcome['id']}:required_source_steps_not_cited:{missing_source_steps}")
         incomplete_evidence = _incomplete_evidence_ids(
             evidence,
             allowed_evidence_steps,
         )
-        if (
-            status == "unsatisfied"
-            and incomplete_evidence
-            and outcome.get("kind") != "action"
-        ):
+        if status == "unsatisfied" and incomplete_evidence and outcome.get("kind") != "action":
             status = "uncertain"
-            warnings.append(
-                f"{outcome['id']}:incomplete_evidence_prevents_"
-                f"unsatisfied:{incomplete_evidence}"
-            )
-        cited = list(
-            dict.fromkeys([*required_cited, *supporting_cited])
-        )
+            warnings.append(f"{outcome['id']}:incomplete_evidence_prevents_unsatisfied:{incomplete_evidence}")
+        cited = list(dict.fromkeys([*required_cited, *supporting_cited]))
         verified_results.append(
             {
                 **outcome,
                 "status": status,
                 "reason": str(raw.get("reason") or ""),
                 "confidence": confidence,
+                "constraint_basis": constraint_basis,
                 "evidence_quotes": validated_quotes,
                 "evidence_activity_ids": cited,
                 "required_evidence_activity_ids": required_cited,
@@ -1220,9 +1424,7 @@ def audit_task_outcomes(
     raw_stops = classified.get("stop_conditions", [])
     verified_stops: list[dict[str, Any]] = []
     declared_stops = {
-        str(item.get("id") or ""): item
-        for item in (plan or {}).get("stop_conditions", [])
-        if isinstance(item, Mapping)
+        str(item.get("id") or ""): item for item in (plan or {}).get("stop_conditions", []) if isinstance(item, Mapping)
     }
     if isinstance(raw_stops, list):
         for raw_stop in raw_stops:
@@ -1235,31 +1437,22 @@ def audit_task_outcomes(
             raw_stop_step_ids = declared_stops[stop_id].get("step_ids", [])
             if not isinstance(raw_stop_step_ids, list):
                 raw_stop_step_ids = []
-            stop_step_ids = {
-                str(item)
-                for item in raw_stop_step_ids
-                if str(item).strip()
-            }
+            stop_step_ids = {str(item) for item in raw_stop_step_ids if str(item).strip()}
             cited, citation_warnings = _validate_evidence_ids(
                 raw_stop.get("evidence_activity_ids", []),
                 successful_ids=successful_ids,
                 event_steps=event_steps,
                 allowed_step_ids=stop_step_ids,
             )
-            warnings.extend(
-                f"stop:{stop_id}:{item}" for item in citation_warnings
-            )
+            warnings.extend(f"stop:{stop_id}:{item}" for item in citation_warnings)
             try:
-                stop_confidence = float(
-                    raw_stop.get("confidence", 0.0) or 0.0
-                )
+                stop_confidence = float(raw_stop.get("confidence", 0.0) or 0.0)
             except (TypeError, ValueError):
                 stop_confidence = 0.0
             stop_confidence = min(1.0, max(0.0, stop_confidence))
             if stop_confidence < minimum_confidence:
                 warnings.append(
-                    f"stop:{stop_id}:confidence_below_threshold:"
-                    f"{stop_confidence:.2f}:{minimum_confidence:.2f}"
+                    f"stop:{stop_id}:confidence_below_threshold:{stop_confidence:.2f}:{minimum_confidence:.2f}"
                 )
                 continue
             if not cited:
@@ -1270,18 +1463,13 @@ def audit_task_outcomes(
                 stop_step_ids,
             )
             if incomplete_evidence:
-                warnings.append(
-                    f"stop:{stop_id}:incomplete_evidence:"
-                    f"{incomplete_evidence}"
-                )
+                warnings.append(f"stop:{stop_id}:incomplete_evidence:{incomplete_evidence}")
                 continue
             verified_stops.append(
                 {
                     "id": stop_id,
                     "reason": str(raw_stop.get("reason") or ""),
-                    "behavior": str(
-                        declared_stops[stop_id].get("behavior") or ""
-                    ),
+                    "behavior": str(declared_stops[stop_id].get("behavior") or ""),
                     "step_ids": sorted(stop_step_ids),
                     "confidence": stop_confidence,
                     "evidence_activity_ids": cited,
@@ -1290,29 +1478,21 @@ def audit_task_outcomes(
 
     all_satisfied = (
         bool(verified_results)
-        and all(
-            item["status"] == "satisfied" for item in verified_results
-        )
+        and all(item["status"] == "satisfied" for item in verified_results)
         and not unmet_requirements
     )
     if unmet_requirements:
         warnings.append(
             "unmet_requirements:"
             + json.dumps(
-                [
-                    str(item.get("id") or "")
-                    for item in unmet_requirements
-                ],
+                [str(item.get("id") or "") for item in unmet_requirements],
                 ensure_ascii=False,
             )
         )
         overall = "incomplete"
     elif all_satisfied:
         overall = "completed"
-    elif any(
-        item["status"] in {"unsatisfied", "uncertain"}
-        for item in verified_results
-    ):
+    elif any(item["status"] in {"unsatisfied", "uncertain"} for item in verified_results):
         overall = "incomplete"
     else:
         overall = "uncertain"
@@ -1333,10 +1513,7 @@ def audit_task_outcomes(
         "requirements": requirements,
         "requirement_coverage": {
             "complete": not unmet_requirements,
-            "unmet_requirement_ids": [
-                str(item.get("id") or "")
-                for item in unmet_requirements
-            ],
+            "unmet_requirement_ids": [str(item.get("id") or "") for item in unmet_requirements],
         },
         "warnings": warnings,
     }

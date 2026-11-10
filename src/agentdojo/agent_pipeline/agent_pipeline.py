@@ -17,13 +17,14 @@ from typing_extensions import Self
 from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
 from agentdojo.agent_pipeline.basic_elements import InitQuery, SystemMessage
 from agentdojo.agent_pipeline.llms.anthropic_llm import AnthropicLLM
+
 try:
     from agentdojo.agent_pipeline.llms.cohere_llm import CohereLLM
 except ImportError:  # Optional SDK dependencies may be unavailable.
     CohereLLM = None  # type: ignore[assignment]
+from agentdojo.agent_pipeline.llms.deepseek_llm import DeepSeekLLM
 from agentdojo.agent_pipeline.llms.google_llm import GoogleLLM
 from agentdojo.agent_pipeline.llms.local_llm import LocalLLM
-from agentdojo.agent_pipeline.llms.deepseek_llm import DeepSeekLLM
 from agentdojo.agent_pipeline.llms.openai_llm import OpenAILLM, OpenAILLMToolFilter
 from agentdojo.agent_pipeline.llms.prompting_llm import PromptingLLM
 from agentdojo.agent_pipeline.pi_detector import TransformersBasedPIDetector

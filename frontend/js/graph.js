@@ -5,7 +5,7 @@
  * - 结构化布局：提示词 → 智能体 → 推理 → 输入数据 → 工具调用 → 输出数据
  * - 卡片式节点：类型 / 标题 / 摘要分层展示
  * - 列标题与迭代轮次（R1、R2…）引导
- * - 主信息流与审计边分层展示、关系分色、悬停聚焦关联路径
+ * - 主信息流分层展示、关系分色、悬停与风险卡片聚焦关联路径
  * - 单条平滑 S 曲线动态避障，并通过边缘端口和曲率分散重叠边
  * - 拖拽、缩放、平移、自适应画布
  * - 点击查看详情
@@ -34,13 +34,13 @@ const GRAPH = {
     _renderedLinks: null,
     _hiddenNodeFilters: new Set(),
     _routeObstacles: [],
+    _focusedContext: null,
 
     // 配置
     config: {
         width: 0,
         height: 0,
         showLabels: true,
-        linkMode: 'flow',
         maxCardWidth: 360,
         primaryLinkRelations: [
             'used',
@@ -136,6 +136,7 @@ const GRAPH = {
         const container = document.getElementById('graph-container');
         this.config.width = container.clientWidth;
         this.config.height = container.clientHeight;
+        this._ensureFocusBanner();
 
         this.svg = d3.select('#graph-svg')
             .attr('width', this.config.width)
@@ -182,25 +183,93 @@ const GRAPH = {
             this.config.showLabels = e.target.checked;
             this.updateLabels();
         });
-        document.getElementById('chkShowAuditEdges').addEventListener('change', (e) => {
-            this.config.linkMode = e.target.checked ? 'audit' : 'flow';
-            if (this.nodes.length > 0) {
-                this.render();
-                requestAnimationFrame(() => this.resetView());
+        this._bindLegendControls();
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && this._focusedContext) {
+                this.clearFocusContext();
             }
         });
 
-        this._bindLegendControls();
+    },
 
+    _ensureFocusBanner() {
+        const container = document.getElementById('graph-container');
+        if (!container) return;
+        let banner = document.getElementById('graphFocusBanner');
+        if (!banner) {
+            banner = document.createElement('div');
+            banner.id = 'graphFocusBanner';
+            banner.className = 'graph-focus-banner';
+            banner.hidden = true;
+            banner.setAttribute('role', 'status');
+            banner.setAttribute('aria-live', 'polite');
+
+            const badge = document.createElement('span');
+            badge.className = 'graph-focus-banner-badge';
+            badge.textContent = '风险聚焦';
+
+            const text = document.createElement('span');
+            text.className = 'graph-focus-banner-text';
+
+            const clear = document.createElement('button');
+            clear.type = 'button';
+            clear.className = 'graph-focus-clear';
+            clear.textContent = '退出聚焦';
+            clear.addEventListener('click', () => {
+                this.clearFocusContext();
+            });
+
+            banner.append(badge, text, clear);
+            container.appendChild(banner);
+        }
+        this._focusBanner = banner;
+    },
+
+    _showFocusBanner(context) {
+        this._ensureFocusBanner();
+        if (!this._focusBanner || !context) return;
+        const primary = context.primaryNode;
+        const title = primary?.__view?.title
+            || primary?.label
+            || primary?.id
+            || '关联数据链';
+        const text = this._focusBanner.querySelector(
+            '.graph-focus-banner-text'
+        );
+        const badge = this._focusBanner.querySelector(
+            '.graph-focus-banner-badge'
+        );
+        if (badge) {
+            badge.textContent = context.label || '风险聚焦';
+        }
+        if (text) {
+            text.textContent = `${title} · 突出显示 ${context.related.size} 个关联节点`;
+        }
+        this._focusBanner.hidden = false;
+    },
+
+    _hideFocusBanner() {
+        if (this._focusBanner) {
+            this._focusBanner.hidden = true;
+        }
     },
 
     _bindLegendControls() {
         const toggle = document.getElementById('btnToggleLegend');
         const legend = document.querySelector('.legend');
         if (toggle && legend) {
+            const syncToggleState = () => {
+                toggle.setAttribute(
+                    'aria-expanded',
+                    legend.classList.contains('collapsed')
+                        ? 'false'
+                        : 'true',
+                );
+            };
+            syncToggleState();
             toggle.addEventListener('click', () => {
-                const collapsed = legend.classList.toggle('collapsed');
-                toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+                legend.classList.toggle('collapsed');
+                syncToggleState();
             });
         }
 
@@ -406,6 +475,29 @@ const GRAPH = {
 
         this.nodes = displayedNodes;
         this.links = displayedLinks;
+        if (this._focusedContext) {
+            const primaryId = String(
+                this._focusedContext.primaryNode?.id || ''
+            );
+            const validSeeds = [...this._focusedContext.seeds]
+                .filter(id => displayedIds.has(String(id)));
+            if (
+                !primaryId
+                || !displayedIds.has(primaryId)
+                || !validSeeds.length
+            ) {
+                this.clearFocusContext();
+            } else {
+                this._focusedContext = {
+                    ...this._focusedContext,
+                    seeds: new Set(validSeeds),
+                    related: new Set(
+                        [...this._focusedContext.related]
+                            .filter(id => displayedIds.has(String(id)))
+                    ),
+                };
+            }
+        }
 
         console.log(`[graph] ${this.nodes.length} 节点, ${this.links.length} 边`);
     },
@@ -442,7 +534,27 @@ const GRAPH = {
             if (displayRisk) {
                 typeName = `${displayRisk} · ${typeName}`;
             }
-            const color = this.config.nodeColors[node.type] || '#6e7b8a';
+            let color = this.config.nodeColors[node.type] || '#6e7b8a';
+            if (node.type === 'RiskEvent' || node.type === 'PolicyEvent') {
+                const decisionColor = {
+                    block: '#f85149',
+                    quarantine: '#f85149',
+                    hold: '#e3b341',
+                    mitigate: '#56d4dd',
+                    advisory: '#6ea4ff',
+                }[
+                    String(
+                        node.decision || node.risk_decision || ''
+                    ).toLowerCase()
+                ];
+                const ringColor = {
+                    0: '#6ea4ff',
+                    1: '#e3b341',
+                    2: '#f87351',
+                    3: '#a371f7',
+                }[Number(node.ring)];
+                color = decisionColor || ringColor || color;
+            }
             const canonicalApp = this._canonicalApp(node);
             const appText = canonicalApp && canonicalApp !== 'unknown'
                 ? this._shortText(this._appLabel(canonicalApp), 8)
@@ -758,12 +870,32 @@ const GRAPH = {
                 ? ' injection-flagged'
                 : ' source-suspicious';
         }
-        const decision = String(node.decision || node.risk_decision || '').toLowerCase();
+        const decision = String(
+            node.decision || node.risk_decision || ''
+        ).toLowerCase();
         const severity = String(
             node.severity
             || (node.type === 'AgentTool' ? '' : node.risk_level)
             || ''
         ).toLowerCase();
+        if (node.type === 'RiskEvent' || node.type === 'PolicyEvent') {
+            const hasRing = node.ring !== null
+                && node.ring !== undefined
+                && node.ring !== '';
+            const ring = hasRing ? Number(node.ring) : NaN;
+            if (Number.isFinite(ring)) {
+                cls += ` ring-${Math.max(0, Math.trunc(ring))}`;
+            }
+            if (decision) {
+                const decisionClass = decision.replace(
+                    /[^a-z0-9_-]/g,
+                    ''
+                );
+                if (decisionClass) {
+                    cls += ` decision-${decisionClass}`;
+                }
+            }
+        }
         if (decision === 'block' || decision === 'quarantine' || severity === 'high') cls += ' risk-high';
         else if (decision === 'hold' || decision === 'mitigate' || severity === 'medium') cls += ' risk-medium';
         else if (decision === 'advisory' || severity === 'low') cls += ' risk-low';
@@ -940,6 +1072,7 @@ const GRAPH = {
      * 聚焦某个 APP 的全部节点与关联边。
      */
     _focusApp(app) {
+        this.clearFocusContext();
         const ids = new Set(
             this.nodes.filter(n => this._canonicalApp(n) === app).map(n => n.id)
         );
@@ -1293,6 +1426,13 @@ const GRAPH = {
             .attr('height', view.height)
             .attr('rx', 6);
 
+        selection.select('.node-focus-halo')
+            .attr('x', left - 5)
+            .attr('y', top - 5)
+            .attr('width', view.width + 10)
+            .attr('height', view.height + 10)
+            .attr('rx', 9);
+
         selection.select('.node-accent')
             .attr('x', left)
             .attr('y', top)
@@ -1630,6 +1770,7 @@ const GRAPH = {
             );
 
         nodeEnter.append('title');
+        nodeEnter.append('rect').attr('class', 'node-focus-halo');
         nodeEnter.append('rect').attr('class', 'node-card');
         nodeEnter.append('rect').attr('class', 'node-accent');
         nodeEnter.append('text').attr('class', 'node-type');
@@ -1650,6 +1791,7 @@ const GRAPH = {
 
         // --- 交互事件 ---
         nodeMerged.on('mouseenter', function(event, d) {
+            if (self._focusedContext) return;
             self._focusNode(d);
         });
 
@@ -1690,6 +1832,7 @@ const GRAPH = {
             });
 
         link.on('mouseenter', function(event, d) {
+            if (self._focusedContext) return;
             self._focusLink(d);
         });
 
@@ -1709,6 +1852,9 @@ const GRAPH = {
         // 仅在布局确实溢出时自动适配一次，避免普通刷新打断用户缩放。
         if (this._layoutNeedsFit) {
             requestAnimationFrame(() => this.resetView());
+        }
+        if (this._focusedContext) {
+            this._applyFocusedContext(this._focusedContext);
         }
     },
 
@@ -2063,7 +2209,7 @@ const GRAPH = {
     },
 
     /**
-     * 过滤连线：默认仅展示主因果链，审计模式再展开状态与证据边。
+     * 过滤连线：仅展示主数据流与风险判定必需的关系。
      */
     _visibleLinks(baseLinks = this.links, nodeIds = null) {
         const alwaysHiddenRelations = new Set([
@@ -2079,7 +2225,6 @@ const GRAPH = {
             'contains',
         ]);
         const primaryRelations = new Set(this.config.primaryLinkRelations);
-        const showAuditEdges = this.config.linkMode === 'audit';
         const filtered = baseLinks.filter(l => {
             const sourceType = l.source && l.source.type;
             const targetType = l.target && l.target.type;
@@ -2097,7 +2242,7 @@ const GRAPH = {
             if (alwaysHiddenRelations.has(l.relation)) {
                 return false;
             }
-            if (!showAuditEdges && !primaryRelations.has(l.relation)) {
+            if (!primaryRelations.has(l.relation)) {
                 return false;
             }
 
@@ -2292,27 +2437,159 @@ const GRAPH = {
             if (!frontier.size) break;
         }
 
-        this.g.selectAll('.node')
-            .classed('dimmed', node => !related.has(String(node.id)))
-            .classed('focused', node => seeds.has(String(node.id)));
-        this.g.selectAll('.link-group')
-            .classed('dimmed', link => {
-                const sourceId = String(link.source?.id || link.source || '');
-                const targetId = String(link.target?.id || link.target || '');
-                return !related.has(sourceId) || !related.has(targetId);
-            })
-            .classed('highlighted', link => {
-                const sourceId = String(link.source?.id || link.source || '');
-                const targetId = String(link.target?.id || link.target || '');
-                return related.has(sourceId) && related.has(targetId);
+        this._focusNodeSet(
+            related,
+            seeds,
+            authorization || toolActivity,
+            '证据聚焦',
+        );
+    },
+
+    /**
+     * Focus the risk event, tool activity, authorization and evidence subgraph
+     * represented by one user-facing risk card.
+     */
+    focusRiskContext(card) {
+        if (!card || !Array.isArray(this.nodes) || !this.nodes.length) {
+            return false;
+        }
+        const focus = card.graph_focus || card;
+        const rendered = Array.isArray(this._renderedNodes)
+            ? this._renderedNodes
+            : this.nodes;
+        const byId = new Map(
+            rendered.map(node => [String(node.id || ''), node])
+        );
+        const seeds = new Set();
+        const addCandidate = value => {
+            const candidate = String(value || '').trim();
+            if (!candidate) return;
+            if (byId.has(candidate)) {
+                seeds.add(candidate);
+                return;
+            }
+            const activityPrefix = candidate.split(':', 1)[0];
+            if (activityPrefix && byId.has(activityPrefix)) {
+                seeds.add(activityPrefix);
+            }
+        };
+
+        addCandidate(focus.risk_node_id);
+        addCandidate(focus.activity_node_id);
+        addCandidate(focus.authorization_node_id);
+        (focus.evidence_entity_ids || []).forEach(addCandidate);
+        (focus.source_ids || []).forEach(addCandidate);
+        (focus.sink_ids || []).forEach(addCandidate);
+
+        const action = String(
+            focus.action || card.action || ''
+        ).replace(/^[^_]+__/, '');
+        const app = String(focus.app || card.app || '');
+        if (!focus.activity_node_id && action) {
+            const activity = [...rendered].reverse().find(node => {
+                if (node.type !== 'AgentTool') return false;
+                const nodeTool = String(
+                    node.tool_base_name
+                    || node.tool_name
+                    || node.label
+                    || ''
+                ).replace(/^[^_]+__/, '');
+                return nodeTool === action
+                    && (!app || !node.app || String(node.app) === app);
             });
+            if (activity?.id) seeds.add(String(activity.id));
+        }
+
+        let primaryNode = null;
+        for (const id of seeds) {
+            const node = byId.get(id);
+            if (
+                node
+                && ['RiskEvent', 'PolicyEvent'].includes(node.type)
+            ) {
+                primaryNode = node;
+                break;
+            }
+        }
+        if (!primaryNode && focus.activity_node_id) {
+            primaryNode = byId.get(String(focus.activity_node_id)) || null;
+        }
+        if (!primaryNode) {
+            primaryNode = [...seeds]
+                .map(id => byId.get(id))
+                .find(Boolean) || null;
+        }
+        if (!seeds.size) {
+            return false;
+        }
+
+        const related = new Set(seeds);
+        let frontier = new Set(seeds);
+        const contextLinks = Array.isArray(this._renderedLinks)
+            ? this._renderedLinks
+            : this.links;
+        const expandableTypes = new Set([
+            'AgentTool',
+            'DomainData',
+            'RiskEvent',
+            'PolicyEvent',
+            'TaskState',
+            'EgressSink',
+            'HumanAuthorization',
+        ]);
+        for (let hop = 0; hop < 2; hop += 1) {
+            const next = new Set();
+            contextLinks.forEach(link => {
+                const sourceId = String(link.source?.id || link.source || '');
+                const targetId = String(link.target?.id || link.target || '');
+                const source = byId.get(sourceId);
+                const target = byId.get(targetId);
+                const expandSource = hop === 0
+                    || expandableTypes.has(source?.type);
+                const expandTarget = hop === 0
+                    || expandableTypes.has(target?.type);
+                if (
+                    expandSource
+                    && frontier.has(sourceId)
+                    && byId.has(targetId)
+                ) {
+                    if (!related.has(targetId)) next.add(targetId);
+                    related.add(targetId);
+                }
+                if (
+                    expandTarget
+                    && frontier.has(targetId)
+                    && byId.has(sourceId)
+                ) {
+                    if (!related.has(sourceId)) next.add(sourceId);
+                    related.add(sourceId);
+                }
+            });
+            frontier = next;
+            if (!frontier.size) break;
+        }
+
+        this._focusNodeSet(related, seeds, primaryNode);
+        return true;
+    },
+
+    _focusNodeSet(related, seeds, primaryNode, label = '风险聚焦') {
+        this._focusedContext = {
+            related: new Set(related),
+            seeds: new Set(seeds),
+            primaryNode: primaryNode || null,
+            label,
+        };
+        this._applyFocusedContext(this._focusedContext);
 
         const positioned = this.nodes.filter(node =>
             related.has(String(node.id))
             && Number.isFinite(Number(node.x))
             && Number.isFinite(Number(node.y))
         );
-        if (!positioned.length || !this.zoomBehavior || !this.svg) return;
+        if (!positioned.length || !this.zoomBehavior || !this.svg) {
+            return;
+        }
         const xs = positioned.map(node => Number(node.x));
         const ys = positioned.map(node => Number(node.y));
         const minX = Math.min(...xs);
@@ -2320,7 +2597,10 @@ const GRAPH = {
         const minY = Math.min(...ys);
         const maxY = Math.max(...ys);
         const reservedWidth = Math.min(500, this.config.width * 0.46);
-        const availableWidth = Math.max(320, this.config.width - reservedWidth);
+        const availableWidth = Math.max(
+            320,
+            this.config.width - reservedWidth,
+        );
         const scale = Math.max(
             0.18,
             Math.min(
@@ -2342,18 +2622,92 @@ const GRAPH = {
                     )
                     .scale(scale),
             );
+        if (primaryNode) this.showNodeDetail(primaryNode);
+    },
+
+    _applyFocusedContext(context) {
+        if (!context) return;
+        const related = context.related || new Set();
+        const seeds = context.seeds || new Set();
+        const primaryId = String(context.primaryNode?.id || '');
+        this.g.selectAll('.node')
+            .classed('dimmed', node => !related.has(String(node.id)))
+            .classed('focused', node => seeds.has(String(node.id)))
+            .classed(
+                'risk-focus-context',
+                node => seeds.has(String(node.id))
+                    && String(node.id) !== primaryId
+            )
+            .classed(
+                'risk-focus-related',
+                node => related.has(String(node.id))
+                    && !seeds.has(String(node.id))
+            )
+            .classed(
+                'risk-focus-primary',
+                node => String(node.id) === primaryId
+            );
+        this.g.selectAll('.link-group')
+            .classed('dimmed', link => {
+                const sourceId = String(link.source?.id || link.source || '');
+                const targetId = String(link.target?.id || link.target || '');
+                return !related.has(sourceId) || !related.has(targetId);
+            })
+            .classed('highlighted', link => {
+                const sourceId = String(link.source?.id || link.source || '');
+                const targetId = String(link.target?.id || link.target || '');
+                return related.has(sourceId) && related.has(targetId);
+            })
+            .classed('risk-primary-link', link => {
+                const sourceId = String(link.source?.id || link.source || '');
+                const targetId = String(link.target?.id || link.target || '');
+                return Boolean(primaryId)
+                    && (sourceId === primaryId || targetId === primaryId);
+            });
+
+        const primarySelection = this.g.selectAll('.node')
+            .filter(node => String(node.id) === primaryId);
+        if (!primarySelection.empty()) {
+            primarySelection.raise();
+        }
+        this._showFocusBanner(context);
     },
 
     /**
      * 清除高亮
      */
-    clearHighlight() {
+    clearHighlight(force = false) {
+        if (!force && this._focusedContext) {
+            this._applyFocusedContext(this._focusedContext);
+            return;
+        }
+        this._resetVisualFocus();
+    },
+
+    clearFocusContext() {
+        this._focusedContext = null;
+        this._hideFocusBanner();
+        this._resetVisualFocus();
+        if (
+            typeof RISK_PANEL !== 'undefined'
+            && RISK_PANEL.clearSelection
+        ) {
+            RISK_PANEL.clearSelection();
+        }
+    },
+
+    _resetVisualFocus() {
+        if (!this.g) return;
         this.g.selectAll('.node')
             .classed('dimmed', false)
-            .classed('focused', false);
+            .classed('focused', false)
+            .classed('risk-focus-context', false)
+            .classed('risk-focus-related', false)
+            .classed('risk-focus-primary', false);
         this.g.selectAll('.link-group')
             .classed('dimmed', false)
             .classed('highlighted', false)
+            .classed('risk-primary-link', false)
             .classed('bundle-expanded', false);
         document.querySelectorAll('.app-flow-chip').forEach((chip) => {
             chip.setAttribute('aria-pressed', 'false');
@@ -3152,14 +3506,31 @@ const GRAPH = {
         );
     },
 
+    getDisplayedStats() {
+        const nodes = Array.isArray(this._renderedNodes)
+            ? this._renderedNodes
+            : (Array.isArray(this.nodes) ? this.nodes : []);
+        const links = Array.isArray(this._renderedLinks)
+            ? this._renderedLinks
+            : [];
+        return {
+            nodes: nodes.length,
+            relations: links.filter(link => (
+                !link.__contextHidden
+                && !link.__bundleHidden
+            )).length,
+        };
+    },
+
     /**
      * 更新统计面板
      */
     updateStats(summary, riskCardCount, eventCount) {
         if (!summary) return;
 
-        document.getElementById('statNodes').textContent = summary.total_nodes || 0;
-        document.getElementById('statEdges').textContent = summary.total_edges || 0;
+        const displayed = this.getDisplayedStats();
+        document.getElementById('statNodes').textContent = displayed.nodes;
+        document.getElementById('statEdges').textContent = displayed.relations;
 
         const blocksEl = document.getElementById('statBlocks');
         const count = typeof riskCardCount === 'number' ? riskCardCount : 0;
@@ -3169,7 +3540,7 @@ const GRAPH = {
         const eventsEl = document.getElementById('statEvents');
         eventsEl.textContent = typeof eventCount === 'number'
             ? eventCount
-            : (summary.total_nodes || 0) + (summary.total_edges || 0);
+            : displayed.nodes + displayed.relations;
     },
 
     /**
@@ -3231,7 +3602,7 @@ const GRAPH = {
      * 恢复结构化节点位置，清理高亮并适应画布。
      */
     resetLayout() {
-        this.clearHighlight();
+        this.clearFocusContext();
         this.render();
         requestAnimationFrame(() => this.resetView());
     },

@@ -682,6 +682,44 @@ const TIMELINE = {
     },
 
     /**
+     * Focus and briefly highlight the timeline entry for a graph node.
+     */
+    focusNode(nodeId) {
+        const targetId = String(nodeId || '');
+        if (!targetId || !this.container) return false;
+        if (this._filter !== 'all') {
+            this._filter = 'all';
+            document.querySelectorAll('.timeline-filter').forEach((item) => {
+                const active = item.dataset.filter === 'all';
+                item.classList.toggle('active', active);
+                item.setAttribute(
+                    'aria-pressed',
+                    active ? 'true' : 'false'
+                );
+            });
+            this._render('none');
+        }
+        requestAnimationFrame(() => {
+            const entry = [...this.container.querySelectorAll(
+                '.timeline-event[data-node-id]'
+            )].find(
+                item => String(item.dataset.nodeId || '') === targetId
+            );
+            if (!entry) return;
+            entry.scrollIntoView({
+                behavior: 'smooth',
+                block: 'center',
+            });
+            entry.classList.add('timeline-event-focused');
+            setTimeout(
+                () => entry.classList.remove('timeline-event-focused'),
+                1400,
+            );
+        });
+        return true;
+    },
+
+    /**
      * HTML 转义，防止特殊字符破坏结构
      */
     _escape(text) {
@@ -991,9 +1029,13 @@ const TIMELINE = {
             180,
             'tool',
         );
+        const graphNodeId = String(
+            step.nodeId || event.activity_id || ''
+        );
 
         return `
-            <article class="timeline-event ${isRisk ? 'timeline-event-risk' : 'timeline-event-tool'}${body.expandable ? ' has-detail' : ''}">
+            <article class="timeline-event ${isRisk ? 'timeline-event-risk' : 'timeline-event-tool'}${body.expandable ? ' has-detail' : ''}"
+                     data-node-id="${this._escape(graphNodeId)}">
                 <div class="timeline-event-header">
                     <span class="timeline-seq">${seq}</span>
                     <span class="timeline-time">${time}</span>

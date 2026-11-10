@@ -13,9 +13,10 @@ source of truth; risks are attached to the activity and rendered by the graph.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any
 
 from ..modeling.data_sensitivity import tool_output_entity
+from ..modeling.policy import tool_effect
 from .data_access import action_data_access
 from .defense_config import (
     direct_injection_mode,
@@ -28,11 +29,14 @@ from .flow_policy import (
     check_untrusted_control,
 )
 from .injection_scanner import (
+    get_direct_injection_scanner,
     get_injection_scanner,
     redact_injection_chunks_with_metrics,
 )
 from .prompt_injection import check_prompt_for_injection_with_details
 from .risk_types import (
+    BLOCK_CATEGORY_INJECTION,
+    BLOCK_CATEGORY_SYSTEM_UNAVAILABLE,
     DECISION_ADVISORY,
     DECISION_BLOCK,
     DECISION_MITIGATE,
@@ -53,14 +57,14 @@ def _skipped_diagnostics(ring: str, reason: str = "ring_disabled") -> dict:
     }
 
 
-def validate_call_event(event: Dict[str, Any]) -> None:
+def validate_call_event(event: dict[str, Any]) -> None:
     """Compatibility hook used by external loggers."""
     return None
 
 
 def _append_risk(
-    event: Dict[str, Any],
-    diagnostics: Dict[str, Any],
+    event: dict[str, Any],
+    diagnostics: dict[str, Any],
     risk: dict[str, Any],
     *,
     discriminator: str,
@@ -75,10 +79,10 @@ def _append_risk(
 
 
 def process_before_execution(
-    event: Dict[str, Any],
+    event: dict[str, Any],
     prompt: str | None = None,
     options: dict | None = None,
-) -> Tuple[bool, Dict[str, Any], Dict[str, Any], set]:
+) -> tuple[bool, dict[str, Any], dict[str, Any], set]:
     """Run prompt, provenance-scope and sensitive-egress checks.
 
     The fourth return value is retained for backward compatibility. Data
@@ -86,7 +90,7 @@ def process_before_execution(
     legacy category set inferred from text.
     """
     kwargs = event.get("inputs", {})
-    diagnostics: Dict[str, Any] = {
+    diagnostics: dict[str, Any] = {
         "ring_0": {},
         "ring_1": {},
         "ring_2": {},
@@ -112,34 +116,21 @@ def process_before_execution(
                 options=options,
                 scan_result=event.get("injection_scan"),
                 judge_result=(
-                    event.get("injection_judge")
-                    if effective_method_enabled(
-                        "ring_0", "small_model", options
-                    )
-                    else None
+                    event.get("injection_judge") if effective_method_enabled("ring_0", "small_model", options) else None
                 ),
             )
             diagnostics["ring_0"] = details
             mode = direct_injection_mode(options)
-            detector_unavailable = (
-                details.get("detection_method")
-                in {
-                    "small_model_unavailable",
-                    "main_llm_uncertain",
-                }
-            )
-            scanner_incomplete = bool(
-                details.get("scanner_truncated", False)
-            )
-            detected = (
-                not details.get("passed", True)
-                and details.get("detection_method")
-                in {
-                    "small_model_span",
-                    "small_model_chunked",
-                    "main_llm_judge",
-                }
-            )
+            detector_unavailable = details.get("detection_method") in {
+                "small_model_unavailable",
+                "main_llm_uncertain",
+            }
+            scanner_incomplete = bool(details.get("scanner_truncated", False))
+            detected = not details.get("passed", True) and details.get("detection_method") in {
+                "small_model_span",
+                "small_model_chunked",
+                "main_llm_judge",
+            }
             details["mode"] = mode
             details["raw_prompt"] = prompt
             sanitized_prompt = prompt
@@ -149,67 +140,50 @@ def process_before_execution(
                 details["coverage_incomplete"] = True
             elif detected:
                 if mode == "quarantine":
-                    sanitized_prompt, quarantine_metrics = (
-                        redact_injection_chunks_with_metrics(
+                    sanitized_prompt, quarantine_metrics = redact_injection_chunks_with_metrics(
                         prompt,
                         event.get("injection_scan") or {},
-                        )
                     )
-                    residual_scan = get_injection_scanner().scan(
-                        sanitized_prompt
-                    )
+                    residual_scan = get_direct_injection_scanner().scan(sanitized_prompt)
                     quarantine_metrics.update(
                         {
-                            "sanitized_rescan_available": (
-                                residual_scan.available
-                            ),
+                            "sanitized_rescan_available": (residual_scan.available),
                             "sanitized_rescan_score": residual_scan.score,
-                            "sanitized_residual_suspected": (
-                                residual_scan.suspected
-                            ),
-                            "sanitized_rescan_unavailable": (
-                                not residual_scan.available
-                            ),
+                            "sanitized_residual_suspected": (residual_scan.suspected),
+                            "sanitized_rescan_unavailable": (not residual_scan.available),
                         }
                     )
-                    event.setdefault("injection_scan", {})[
-                        "quarantine_metrics"
-                    ] = quarantine_metrics
+                    event.setdefault("injection_scan", {})["quarantine_metrics"] = quarantine_metrics
                     details["quarantine_metrics"] = quarantine_metrics
                     if residual_scan.suspected or not residual_scan.available:
                         risk_decision = DECISION_BLOCK
-                        details["sanitized_residual_suspected"] = (
-                            residual_scan.suspected
-                        )
-                        details["sanitized_rescan_unavailable"] = (
-                            not residual_scan.available
-                        )
+                        details["sanitized_residual_suspected"] = residual_scan.suspected
+                        details["sanitized_rescan_unavailable"] = not residual_scan.available
                     details["sanitized_prompt"] = sanitized_prompt
                     details["prompt_modified"] = sanitized_prompt != prompt
-                    if (
-                        int(
-                            quarantine_metrics.get(
-                                "invalid_spans_total",
-                                0,
-                            )
-                            or 0
+                    if int(
+                        quarantine_metrics.get(
+                            "invalid_spans_total",
+                            0,
                         )
-                        > 0
-                        or not quarantine_metrics.get(
-                            "all_flagged_spans_replaced",
-                            False,
-                        )
+                        or 0
+                    ) > 0 or not quarantine_metrics.get(
+                        "all_flagged_spans_replaced",
+                        False,
                     ):
                         risk_decision = DECISION_BLOCK
                         details["quarantine_incomplete"] = True
                     if risk_decision is None:
-                        if int(
-                            quarantine_metrics.get(
-                                "uncovered_characters",
-                                1,
+                        if (
+                            int(
+                                quarantine_metrics.get(
+                                    "uncovered_characters",
+                                    1,
+                                )
+                                or 0
                             )
-                            or 0
-                        ) == 0:
+                            == 0
+                        ):
                             risk_decision = DECISION_BLOCK
                             details["quarantine_empty"] = True
                         else:
@@ -224,20 +198,16 @@ def process_before_execution(
                     0,
                     risk_decision,
                     (
-                        "The direct-injection detector is unavailable or "
-                        "uncertain in fail-closed mode."
+                        "The direct-injection detector is unavailable or uncertain in fail-closed mode."
                         if detector_unavailable
                         else (
-                            "The direct prompt was not fully scanned; "
-                            "execution was blocked to avoid unscanned input."
+                            "The direct prompt was not fully scanned; execution was blocked to avoid unscanned input."
                             if scanner_incomplete
                             else (
-                                "Direct prompt injection chunks were replaced "
-                                "before Agent invocation."
+                                "Direct prompt injection chunks were replaced before Agent invocation."
                                 if risk_decision == DECISION_MITIGATE
                                 else (
-                                    "Prompt injection detected; no usable task "
-                                    "remained after quarantine."
+                                    "Prompt injection detected; no usable task remained after quarantine."
                                     if details.get("quarantine_empty")
                                     else (
                                         "Prompt contains instruction "
@@ -258,11 +228,7 @@ def process_before_execution(
                     fsm_after=(
                         "BLOCKED"
                         if risk_decision == DECISION_BLOCK
-                        else (
-                            "SANITIZED"
-                            if risk_decision == DECISION_MITIGATE
-                            else "ADMITTED"
-                        )
+                        else ("SANITIZED" if risk_decision == DECISION_MITIGATE else "ADMITTED")
                     ),
                 )
                 _append_risk(
@@ -272,17 +238,15 @@ def process_before_execution(
                     discriminator=f"ring0:{prompt}",
                 )
                 if risk_decision == DECISION_BLOCK:
+                    event["block_category"] = BLOCK_CATEGORY_INJECTION
                     event["block_reason"] = (
-                        "Ring 0: injection detector unavailable or "
-                        "uncertain in fail-closed mode."
+                        "Ring 0: injection detector unavailable or uncertain in fail-closed mode."
                         if detector_unavailable
                         else (
-                            "Ring 0: the direct prompt was only partially "
-                            "scanned."
+                            "Ring 0: the direct prompt was only partially scanned."
                             if scanner_incomplete
                             else (
-                                "Ring 0: no usable task remained after prompt "
-                                "quarantine."
+                                "Ring 0: no usable task remained after prompt quarantine."
                                 if details.get("quarantine_empty")
                                 else "Ring 0: direct prompt injection detected."
                             )
@@ -301,10 +265,7 @@ def process_before_execution(
             event,
             diagnostics,
             ring1["risk"],
-            discriminator=(
-                f"ring1:{event.get('tool_intent', '')}:"
-                f"{','.join(ring1.get('control_arguments', []))}"
-            ),
+            discriminator=(f"ring1:{event.get('tool_intent', '')}:{','.join(ring1.get('control_arguments', []))}"),
         )
 
     ring2 = check_task_scope(event, options=options)
@@ -314,17 +275,16 @@ def process_before_execution(
             event,
             diagnostics,
             ring2["risk"],
-            discriminator=(
-                f"ring2:{event.get('tool_intent', '')}:"
-                f"{ring2.get('reason', '')}"
-            ),
+            discriminator=(f"ring2:{event.get('tool_intent', '')}:{ring2.get('reason', '')}"),
         )
     if not ring2.get("passed", True):
-        event["block_reason"] = (
-            (ring2.get("risk") or {}).get("reason")
-            or f"Ring 2 blocked {event.get('tool_intent', 'tool')}: "
-            f"{ring2.get('reason', 'policy check failed')}."
+        event["block_category"] = ring2.get(
+            "block_category",
+            BLOCK_CATEGORY_SYSTEM_UNAVAILABLE,
         )
+        event["block_reason"] = (ring2.get("risk") or {}).get(
+            "reason"
+        ) or f"Ring 2 blocked {event.get('tool_intent', 'tool')}: {ring2.get('reason', 'policy check failed')}."
         return False, kwargs, diagnostics, set()
 
     ring3 = check_sensitive_egress(event, options=options)
@@ -334,24 +294,23 @@ def process_before_execution(
             event,
             diagnostics,
             ring3["risk"],
-            discriminator=(
-                f"ring3:{event.get('tool_intent', '')}:"
-                f"{ring3.get('reason', '')}"
-            ),
+            discriminator=(f"ring3:{event.get('tool_intent', '')}:{ring3.get('reason', '')}"),
         )
     if not ring3.get("passed", True):
-        event["block_reason"] = (
-            (ring3.get("risk") or {}).get("reason")
-            or f"Ring 3 blocked {event.get('tool_intent', 'tool')}: "
-            f"{ring3.get('reason', 'flow check failed')}."
+        event["block_category"] = ring3.get(
+            "block_category",
+            BLOCK_CATEGORY_SYSTEM_UNAVAILABLE,
         )
+        event["block_reason"] = (ring3.get("risk") or {}).get(
+            "reason"
+        ) or f"Ring 3 blocked {event.get('tool_intent', 'tool')}: {ring3.get('reason', 'flow check failed')}."
         return False, kwargs, diagnostics, set()
 
     return True, kwargs, diagnostics, set()
 
 
 def process_after_execution(
-    event_complete: Dict[str, Any],
+    event_complete: dict[str, Any],
     result: Any,
     nec_data: set | None = None,
     intent_data: set | None = None,
@@ -371,24 +330,20 @@ def process_after_execution(
 
 
 def process_after_execution_with_details(
-    event_complete: Dict[str, Any],
+    event_complete: dict[str, Any],
     result: Any,
     nec_data: set | None = None,
     intent_data: set | None = None,
     options: dict | None = None,
     isolated_reader=None,
-) -> Tuple[Any, Dict[str, Any]]:
+) -> tuple[Any, dict[str, Any]]:
     """Scan tool output, quarantine suspicious chunks, and retain audit raw data."""
     diagnostics = {
         "ring_1": {
             "passed": True,
             "executed": False,
             "mode": "label_only",
-            "output_integrity": (
-                ((event_complete.get("output_flow_label") or {}).get(
-                    "integrity"
-                ) or {})
-            ),
+            "output_integrity": ((event_complete.get("output_flow_label") or {}).get("integrity") or {}),
         },
         "ring_3": {
             "passed": True,
@@ -415,29 +370,41 @@ def process_after_execution_with_details(
         tool_name,
         str(event_complete.get("plan_step_id", "")),
     )
-    output_app = (
-        str(access_contract.get("app", ""))
-        if isinstance(access_contract, dict)
-        else ""
-    ) or str(
-        event_complete.get("target_app")
-        or event_complete.get("app_domain")
-        or ""
+    output_app = (str(access_contract.get("app", "")) if isinstance(access_contract, dict) else "") or str(
+        event_complete.get("target_app") or event_complete.get("app_domain") or ""
     )
     output_entity = (
-        str(access_contract.get("entity", ""))
-        if isinstance(access_contract, dict)
-        else ""
+        str(access_contract.get("entity", "")) if isinstance(access_contract, dict) else ""
     ) or tool_output_entity(tool_name)
+    # Tool policy is authoritative: a planner must not re-enable content
+    # scanning for a structured-data tool that explicitly disabled it.
+    content_detection = tool_effect(tool_name).content_detection
+    if content_detection is False:
+        skipped_scan = {
+            "available": True,
+            "source_flagged": False,
+            "suspected": False,
+            "incomplete": False,
+            "coverage_complete": True,
+            "flagged_fields": [],
+            "risky_entities": [],
+            "unscanned_fields": [],
+            "skipped": True,
+            "skipped_reason": "tool_content_detection_disabled",
+        }
+        diagnostics["ring_1"] = {
+            **skipped_scan,
+            "passed": True,
+            "executed": False,
+            "mode": "disabled_by_tool_policy",
+        }
+        event_complete["injection_scan"] = skipped_scan
+        return result, diagnostics
     scan = scan_tool_output(
         result,
         scanner=get_injection_scanner(),
         tool_name=tool_name,
-        schema=(
-            event_complete.get("output_schema")
-            if isinstance(event_complete.get("output_schema"), dict)
-            else None
-        ),
+        schema=(event_complete.get("output_schema") if isinstance(event_complete.get("output_schema"), dict) else None),
         app=output_app,
         entity=output_entity,
     )
@@ -459,11 +426,7 @@ def process_after_execution_with_details(
 
     if scan.source_flagged:
         scan_failed = not scan.available or scan.incomplete
-        decision = (
-            DECISION_QUARANTINE
-            if scan_failed
-            else DECISION_MITIGATE
-        )
+        decision = DECISION_QUARANTINE if scan_failed else DECISION_MITIGATE
         risk = make_risk(
             1,
             decision,
@@ -478,15 +441,8 @@ def process_after_execution_with_details(
                     "quarantined before the next Agent reasoning step. "
                 )
             )
-            + (
-                "Affected fields: "
-                f"{', '.join(scan.flagged_fields)}."
-            ),
-            severity=(
-                "high"
-                if scan_failed or scan.max_score >= 0.8
-                else "medium"
-            ),
+            + (f"Affected fields: {', '.join(scan.flagged_fields)}."),
+            severity=("high" if scan_failed or scan.max_score >= 0.8 else "medium"),
             event_kind="security",
             policy_id="ring1.indirect_prompt_injection",
             activity_id=event_complete.get("activity_id"),
@@ -494,21 +450,14 @@ def process_after_execution_with_details(
             taint_roots=scan.evidence_refs,
             sink_ids=[str(event_complete.get("tool_intent", ""))],
             fsm_before="OUTPUT_OBSERVED",
-            fsm_after=(
-                "QUARANTINED"
-                if decision == DECISION_QUARANTINE
-                else "SANITIZED"
-            ),
+            fsm_after=("QUARANTINED" if decision == DECISION_QUARANTINE else "SANITIZED"),
             confidence=scan.max_score,
         )
         _append_risk(
             event_complete,
             diagnostics,
             risk,
-            discriminator=(
-                f"ring1-scan:{event_complete.get('tool_intent', '')}:"
-                f"{','.join(scan.flagged_fields)}"
-            ),
+            discriminator=(f"ring1-scan:{event_complete.get('tool_intent', '')}:{','.join(scan.flagged_fields)}"),
         )
     return (
         scan.sanitized_value if scan.changed else result,

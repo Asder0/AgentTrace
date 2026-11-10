@@ -168,10 +168,7 @@ def elevate_policy_for_content(
     value: Any,
 ) -> dict[str, Any]:
     """Raise, never lower, a field policy using local GLiNER categories."""
-    if (
-        policy.get("content_detection") is False
-        or str(policy.get("level", "secret")).lower() == "public"
-    ):
+    if policy.get("content_detection") is False or str(policy.get("level", "secret")).lower() == "public":
         return {
             **policy,
             "source": f"{policy.get('source', 'field_policy')}+content_policy_exempt",

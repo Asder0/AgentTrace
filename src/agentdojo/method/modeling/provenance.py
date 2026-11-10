@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Any, Iterable, Mapping
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 import networkx as nx
 
 from .labels import is_tainted
 
 
-def node_label(graph: nx.Graph, node_id: str) -> dict[str, Any] | None:
+def node_label(
+    graph: nx.DiGraph,
+    node_id: str,
+) -> dict[str, Any] | None:
     if node_id not in graph:
         return None
     data = graph.nodes[node_id]
@@ -31,7 +35,7 @@ def node_label(graph: nx.Graph, node_id: str) -> dict[str, Any] | None:
 
 
 def backward_ancestors(
-    graph: nx.Graph,
+    graph: nx.DiGraph,
     start_id: str,
     *,
     max_depth: int = 32,
@@ -59,17 +63,11 @@ def backward_ancestors(
             if graph.is_multigraph():
                 relations = [
                     str(edge_data.get("relation", ""))
-                    for edge_data in graph.get_edge_data(
-                        predecessor, node, default={}
-                    ).values()
+                    for edge_data in graph.get_edge_data(predecessor, node, default={}).values()
                 ]
                 relation = "|".join(sorted(set(filter(None, relations))))
             else:
-                relation = str(
-                    graph.get_edge_data(predecessor, node, default={}).get(
-                        "relation", ""
-                    )
-                )
+                relation = str(graph.get_edge_data(predecessor, node, default={}).get("relation", ""))
             edge = (predecessor, node, relation)
             if edge not in traversed:
                 traversed.append(edge)
@@ -77,7 +75,7 @@ def backward_ancestors(
 
 
 def taint_ancestors(
-    graph: nx.Graph,
+    graph: nx.DiGraph,
     start_id: str,
     *,
     max_depth: int = 32,
@@ -86,17 +84,12 @@ def taint_ancestors(
     tainted_nodes = [
         node_id
         for node_id in distances
-        if is_tainted(node_label(graph, node_id))
-        or bool(graph.nodes[node_id].get("blocked"))
+        if is_tainted(node_label(graph, node_id)) or bool(graph.nodes[node_id].get("blocked"))
     ]
     roots: list[str] = []
     for node_id in tainted_nodes:
         label = node_label(graph, node_id) or {}
-        roots.extend(
-            str(item)
-            for item in (label.get("integrity") or {}).get("taint_roots", [])
-            if item
-        )
+        roots.extend(str(item) for item in (label.get("integrity") or {}).get("taint_roots", []) if item)
     return {
         "start_id": start_id,
         "distances": distances,
@@ -108,7 +101,7 @@ def taint_ancestors(
 
 
 def shortest_risk_path(
-    graph: nx.Graph,
+    graph: nx.DiGraph,
     start_id: str,
     tainted_node_id: str,
 ) -> list[str]:
@@ -121,7 +114,7 @@ def shortest_risk_path(
 
 
 def collect_source_ids(
-    graph: nx.Graph,
+    graph: nx.DiGraph,
     node_ids: Iterable[str],
 ) -> list[str]:
     result: set[str] = set()

@@ -8,35 +8,45 @@ Based on ARGUS user-space semantic extraction concepts.
 
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 @dataclass
 class DomainData:
     """Represents a semantic data entity extracted from environment state."""
+
     entity_id: str
     entity_type: str  # e.g., "email", "file", "contact", "transaction"
-    attributes: Dict[str, Any] = field(default_factory=dict)
-    data_payload: Optional[str] = None
+    attributes: dict[str, Any] = field(default_factory=dict)
+    data_payload: str | None = None
     source_app: str = "unknown"
     operation: str = "unknown"  # "created", "updated", "deleted", "read"
-    flow_label: Optional[Dict[str, Any]] = None
+    flow_label: dict[str, Any] | None = None
 
 
 @dataclass
 class EnvironmentDelta:
     """Represents the semantic diff between two environment states."""
-    created: List[DomainData] = field(default_factory=list)
-    updated: List[DomainData] = field(default_factory=list)
-    deleted: List[DomainData] = field(default_factory=list)
-    accessed: List[DomainData] = field(default_factory=list)
+
+    created: list[DomainData] = field(default_factory=list)
+    updated: list[DomainData] = field(default_factory=list)
+    deleted: list[DomainData] = field(default_factory=list)
+    accessed: list[DomainData] = field(default_factory=list)
 
 
 # UI-only attributes that should be filtered during semantic parsing. Provenance
 # fields such as id, timestamp, version and metadata are intentionally retained.
 _NOISE_ATTRIBUTES = {
-    "render_key", "ui_state", "scroll_position", "cursor_position", "animation_state",
-    "loading", "visible", "selected", "focused", "hovered",
+    "render_key",
+    "ui_state",
+    "scroll_position",
+    "cursor_position",
+    "animation_state",
+    "loading",
+    "visible",
+    "selected",
+    "focused",
+    "hovered",
 }
 
 
@@ -61,7 +71,7 @@ class EnvironmentSnapshotParser:
             return "unknown"
         return value.split("[", 1)[0] or "unknown"
 
-    def _semantic_filter(self, data: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    def _semantic_filter(self, data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         """
         Recursively filter out noise attributes from a data dictionary.
         Only keeps interaction attributes and data payloads.
@@ -90,7 +100,7 @@ class EnvironmentSnapshotParser:
                 filtered[key] = value
         return filtered
 
-    def _extract_domain_entities(self, state: Any, operation: str = "read") -> List[DomainData]:
+    def _extract_domain_entities(self, state: Any, operation: str = "read") -> list[DomainData]:
         """
         Extract DomainData entities from a raw environment state.
         Attempts to identify structured data (emails, files, contacts, etc.).
@@ -105,40 +115,46 @@ class EnvironmentSnapshotParser:
                 entity_type = self._entity_type_for_key(key)
                 if entity_type and not isinstance(value, list):
                     attrs = self._semantic_filter(value) if isinstance(value, dict) else {"value": str(value)}
-                    data_payload = str(value) if isinstance(value, (str, int, float, bool)) else None
-                    entities.append(DomainData(
-                        entity_id=f"{self.source_app}:{key}",
-                        entity_type=entity_type,
-                        attributes=attrs,
-                        data_payload=data_payload,
-                        source_app=self.source_app,
-                        operation=operation,
-                    ))
+                    data_payload = str(value) if isinstance(value, str | int | float | bool) else None
+                    entities.append(
+                        DomainData(
+                            entity_id=f"{self.source_app}:{key}",
+                            entity_type=entity_type,
+                            attributes=attrs,
+                            data_payload=data_payload,
+                            source_app=self.source_app,
+                            operation=operation,
+                        )
+                    )
                 elif isinstance(value, list):
                     for i, item in enumerate(value):
                         if isinstance(item, dict):
                             item_type = self._entity_type_for_key(key)
                             if item_type:
                                 attrs = self._semantic_filter(item)
-                                entities.append(DomainData(
-                                    entity_id=f"{self.source_app}:{key}[{i}]",
-                                    entity_type=item_type,
-                                    attributes=attrs,
-                                    source_app=self.source_app,
-                                    operation=operation,
-                                ))
+                                entities.append(
+                                    DomainData(
+                                        entity_id=f"{self.source_app}:{key}[{i}]",
+                                        entity_type=item_type,
+                                        attributes=attrs,
+                                        source_app=self.source_app,
+                                        operation=operation,
+                                    )
+                                )
                 else:
                     # Fallback: 即使无法推断类型，也保留原始数据内容
                     # 确保环境变更节点有实际数据可展示
                     data_str = str(value)
-                    entities.append(DomainData(
-                        entity_id=f"{self.source_app}:{key}",
-                        entity_type="unknown",
-                        attributes={"value": data_str[:200]},
-                        data_payload=data_str[:500],
-                        source_app=self.source_app,
-                        operation=operation,
-                    ))
+                    entities.append(
+                        DomainData(
+                            entity_id=f"{self.source_app}:{key}",
+                            entity_type="unknown",
+                            attributes={"value": data_str[:200]},
+                            data_payload=data_str[:500],
+                            source_app=self.source_app,
+                            operation=operation,
+                        )
+                    )
 
         # Handle object with __dict__ or model_dump
         elif hasattr(state, "model_dump"):
@@ -155,34 +171,34 @@ class EnvironmentSnapshotParser:
     def compute_delta(self, pre_state: Any, post_state: Any) -> EnvironmentDelta:
         """
         Compute the semantic delta between pre and post execution environment states.
-        
+
         Args:
             pre_state: The environment state before tool execution.
             post_state: The environment state after tool execution.
-            
+
         Returns:
             An EnvironmentDelta containing created, updated, deleted, and accessed entities.
         """
         delta = EnvironmentDelta()
-        
+
         pre_entities = self._extract_domain_entities(pre_state, "read")
         post_entities = self._extract_domain_entities(post_state, "read")
-        
+
         pre_map = {e.entity_id: e for e in pre_entities}
         post_map = {e.entity_id: e for e in post_entities}
-        
+
         # Find created entities (in post but not in pre)
         for entity_id, entity in post_map.items():
             if entity_id not in pre_map:
                 entity.operation = "created"
                 delta.created.append(entity)
-        
+
         # Find deleted entities (in pre but not in post)
         for entity_id, entity in pre_map.items():
             if entity_id not in post_map:
                 entity.operation = "deleted"
                 delta.deleted.append(entity)
-        
+
         # Find updated entities (in both but different)
         for entity_id, entity in post_map.items():
             if entity_id in pre_map:
@@ -193,23 +209,21 @@ class EnvironmentSnapshotParser:
                 else:
                     entity.operation = "accessed"
                     delta.accessed.append(entity)
-        
+
         return delta
 
 
 def parse_environment_delta(
-    pre_environment: Any,
-    post_environment: Any,
-    source_app: str = "unknown"
+    pre_environment: Any, post_environment: Any, source_app: str = "unknown"
 ) -> EnvironmentDelta:
     """
     Convenience function to parse environment delta between two states.
-    
+
     Args:
         pre_environment: The environment state before execution.
         post_environment: The environment state after execution.
         source_app: The source application identifier.
-        
+
     Returns:
         An EnvironmentDelta with semantic entity changes.
     """
