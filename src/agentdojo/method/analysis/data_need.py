@@ -905,73 +905,6 @@ def _egress_destination_declares_literal_values(
     return any(str(value).strip() for value in values)
 
 
-def _prompt_grounded_destination_values(
-    metadata: Mapping[str, Any],
-    prompt_text: str,
-) -> dict[str, list[str]]:
-    """Extract only explicitly named egress destinations from the user prompt."""
-    text = str(prompt_text or "")
-    if not text:
-        return {}
-    values: dict[str, list[str]] = {}
-    for raw_field in metadata.get("destination_fields", []) or []:
-        field = str(raw_field).strip()
-        if not field:
-            continue
-        semantic = _schema_field_semantic_type(dict(metadata), field)
-        candidates: list[str] = []
-        if semantic == "slack_channel":
-            candidates = re.findall(
-                r"(?<![\w#])#([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?![\w-])",
-                text,
-            )
-        elif semantic == "email":
-            candidates = re.findall(
-                r"(?<![\w.+-])[A-Za-z0-9._%+-]+@"
-                r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])",
-                text,
-            )
-        elif semantic in {"slack_user", "user"}:
-            candidates = re.findall(
-                r"\b(?:send|tell|message|notify|contact|reply\s+to)"
-                r"\s+(?:the\s+)?(?:user\s+)?"
-                r"([A-Z][A-Za-z0-9._-]{1,63})\b",
-                text,
-                flags=re.IGNORECASE,
-            )
-        normalized = sorted(
-            {
-                str(candidate).strip()
-                for candidate in candidates
-                if str(candidate).strip()
-                and str(candidate).strip().casefold()
-                not in {
-                    "the",
-                    "this",
-                    "that",
-                    "sender",
-                    "user",
-                    "he",
-                    "him",
-                    "his",
-                    "she",
-                    "her",
-                    "hers",
-                    "they",
-                    "them",
-                    "their",
-                    "it",
-                    "me",
-                    "i",
-                    "you",
-                }
-            }
-        )
-        if normalized:
-            values[field] = normalized
-    return values
-
-
 def _outcome_applies_to_egress_parameter(
     outcome: Mapping[str, Any],
     *,
@@ -1013,8 +946,6 @@ def _complete_egress_contract_from_edges(
     plan: dict[str, Any],
     available_tools: Sequence[Mapping[str, Any]],
     execution_contract: Mapping[str, Any] | None,
-    *,
-    prompt_text: str = "",
 ) -> list[str]:
     """Fill only contract-declared egress bindings from planned sources."""
     if not isinstance(execution_contract, Mapping):
@@ -1271,72 +1202,6 @@ def _complete_egress_contract_from_edges(
             ]
             destination.setdefault("mode", "derived")
             destination.setdefault("allowed_values", [])
-            literal_destinations = (
-                _prompt_grounded_destination_values(
-                    target_meta,
-                    prompt_text,
-                )
-            )
-            if literal_destinations:
-                destination["mode"] = "literal"
-                destination["allowed_values"] = sorted(
-                    {
-                        item
-                        for field_values in literal_destinations.values()
-                        for item in field_values
-                    }
-                )
-                destination["parameters"] = list(
-                    dict.fromkeys(
-                        [
-                            *[
-                                str(item)
-                                for item in destination.get(
-                                    "parameters",
-                                    [],
-                                )
-                                if str(item).strip()
-                            ],
-                            *literal_destinations,
-                        ]
-                    )
-                )
-            elif (
-                str(destination.get("mode", "")).strip().lower()
-                == "literal"
-            ):
-                ambiguous_pronouns = {
-                    "he",
-                    "him",
-                    "his",
-                    "she",
-                    "her",
-                    "hers",
-                    "they",
-                    "them",
-                    "their",
-                    "it",
-                    "me",
-                    "i",
-                    "you",
-                    "sender",
-                    "user",
-                }
-                safe_values = [
-                    str(item)
-                    for item in destination.get(
-                        "allowed_values",
-                        [],
-                    )
-                    if str(item).strip()
-                    and str(item).strip().casefold()
-                    not in ambiguous_pronouns
-                ]
-                if safe_values:
-                    destination["allowed_values"] = safe_values
-                else:
-                    destination["mode"] = "derived"
-                    destination["allowed_values"] = []
         control_only_egress = bool(
             target_effect == "egress"
             and (
@@ -9797,7 +9662,6 @@ def generate_task_data_plan(
             raw_plan,
             available_tools or [],
             execution_contract,
-            prompt_text=str(prompt),
         )
         plan = _validate_task_plan(
             raw_plan,
@@ -9926,7 +9790,6 @@ def generate_task_data_plan(
                 repaired_raw,
                 available_tools or [],
                 execution_contract,
-                prompt_text=str(prompt),
             )
             repaired = _validate_task_plan(
                 repaired_raw,
