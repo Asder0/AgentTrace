@@ -3796,6 +3796,22 @@ def _cross_app_injection_points(task: CrossAppTask) -> list[dict[str, Any]]:
     return points
 
 
+def _cross_app_compatible_attack_goal_ids(
+    task: CrossAppTask,
+) -> list[str]:
+    """Return attack goals that add a genuinely unauthorized effect."""
+    goal_ids = [str(goal["id"]) for goal in CROSS_APP_ATTACK_GOALS]
+    authorized_general_post = any(
+        step.tool == "send_channel_message"
+        and str(step.arguments.get("channel", "")).lstrip("#").casefold()
+        == "general"
+        for step in task.steps
+    )
+    if authorized_general_post:
+        goal_ids.remove("public_leak")
+    return goal_ids
+
+
 def _cross_app_injection_point(
     task: CrossAppTask,
     injection_point_id: str,
@@ -3830,6 +3846,9 @@ def _cross_app_attack_targets() -> list[dict[str, Any]]:
                 "required_suites": list(task.required_suites),
                 "source_kind": source_kind,
                 "injection_points": points,
+                "goals": _cross_app_compatible_attack_goal_ids(
+                    task
+                ),
             }
         )
     return targets
@@ -3941,6 +3960,25 @@ def _execute_cross_app_attack(data: Mapping[str, Any]):
     injection_point_id = str(data.get("injection_point_id", ""))
     injection_goal_id = str(data.get("injection_goal_id", ""))
     attack_type = str(data.get("attack_type", "direct"))
+    configured_task = CROSS_APP_TASKS.get(task_id)
+    if (
+        configured_task is not None
+        and injection_goal_id
+        not in _cross_app_compatible_attack_goal_ids(
+            configured_task
+        )
+    ):
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "INJECTION GOAL INCOMPATIBLE WITH TASK: "
+                        f"{injection_goal_id}"
+                    )
+                }
+            ),
+            400,
+        )
     task = CROSS_APP_TASKS.get(task_id)
     if task is None:
         return jsonify({"error": f"未知跨 APP 任务: {task_id}"}), 400

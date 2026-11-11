@@ -5962,7 +5962,13 @@ def _validate_task_plan(
                 warnings.append(
                     f"invalid_outcome_applies_to:{outcome['id']}:{target}"
                 )
-                plan_structure_valid = False
+                if str(outcome.get("kind", "")).lower() == "constraint":
+                    warnings.append(
+                        "constraint_applies_to_unplanned_action_ignored:"
+                        f"{outcome['id']}:{target}"
+                    )
+                else:
+                    plan_structure_valid = False
         outcome["applies_to"] = valid_applies_to
         valid_required_sources: list[dict[str, str]] = []
         for source_ref in outcome.get("required_source_refs", []):

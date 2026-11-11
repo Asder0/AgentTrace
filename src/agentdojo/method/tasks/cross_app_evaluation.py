@@ -95,13 +95,49 @@ def _parse_number(value: str) -> float | None:
     return float(matches[0].replace(",", ""))
 
 
-def _answer_number_tokens(value: str) -> list[str]:
-    """Extract answer amounts while ignoring ISO dates and clock times."""
+def _strip_answer_dates(value: str) -> str:
+    """Remove date expressions that otherwise look like answer amounts."""
     text = re.sub(
         r"\b\d{4}-\d{1,2}-\d{1,2}\b",
         " ",
         str(value),
     )
+    text = re.sub(
+        r"\b(?:\d{1,2}\s+)?"
+        r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+        r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
+        r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+        r"\.?\s+\d{1,2}(?:st|nd|rd|th)?"
+        r"(?:,\s*|\s+)\d{4}\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+        r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
+        r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+        r"\.?\s+\d{1,2}(?:st|nd|rd|th)?"
+        r"(?=\s*(?:[,.;:)]|$|\b(?:through|to|and)\b))",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+        r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
+        r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+        r"\.?\s+\d{4}\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
+
+
+def _answer_number_tokens(value: str) -> list[str]:
+    """Extract answer amounts while ignoring dates and clock times."""
+    text = _strip_answer_dates(value)
     text = re.sub(
         r"\b\d{1,2}:\d{2}(?::\d{2})?\b",
         " ",
@@ -128,39 +164,57 @@ def _parse_answer_number(
         flags=re.IGNORECASE,
     )
     lines = value.splitlines()
+    result_connector = re.compile(
+        r"\b(?:is|was|equals?|amounts?\s+to|comes?\s+to|"
+        r"totals?|adds?\s+up\s+to)\b",
+        flags=re.IGNORECASE,
+    )
     for index, line in enumerate(lines):
         label_match = label_pattern.search(line)
         if label_match is None:
             continue
-        labeled_tail = line[label_match.end() :]
-        if "=" in labeled_tail:
-            labeled_tail = labeled_tail.rsplit("=", 1)[1]
-        numbers = _answer_number_tokens(labeled_tail)
+        labeled_text = _strip_answer_dates(
+            line[label_match.end() :],
+        )
+        if "=" in labeled_text:
+            labeled_text = labeled_text.rsplit("=", 1)[1]
+        numbers = _answer_number_tokens(labeled_text)
         if not numbers:
             for following in lines[index + 1 :]:
                 if not following.strip():
                     continue
-                following_numbers = _answer_number_tokens(
-                    following
-                )
+                # A following line is a result only when it is an equation
+                # or a bare numeric value.  A prose explanation may mention
+                # component amounts and must not replace the displayed total.
+                if "=" in following:
+                    following_text = following.rsplit("=", 1)[1]
+                    following_numbers = _answer_number_tokens(
+                        following_text
+                    )
+                elif re.fullmatch(
+                    r"[\s$€£¥()+\-*/×÷.,\d]+",
+                    following,
+                ):
+                    following_text = following
+                    following_numbers = _answer_number_tokens(
+                        following
+                    )
+                else:
+                    break
                 if not following_numbers:
                     break
-                after_equals = (
-                    following.rsplit("=", 1)[1]
-                    if "=" in following
-                    else following
-                )
-                equals_numbers = _answer_number_tokens(
-                    after_equals
-                )
-                numbers = (
-                    equals_numbers
-                    if equals_numbers
-                    else following_numbers
-                )
+                numbers = following_numbers
                 break
         if numbers:
-            labeled_numbers.append(numbers[0])
+            connector = result_connector.search(labeled_text)
+            selected = numbers[0]
+            if connector is not None:
+                after_connector = _answer_number_tokens(
+                    labeled_text[connector.end() :]
+                )
+                if after_connector:
+                    selected = after_connector[0]
+            labeled_numbers.append(selected)
     if labeled_numbers:
         return float(labeled_numbers[-1].replace(",", ""))
     matches = _answer_number_tokens(value)

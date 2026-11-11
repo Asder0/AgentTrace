@@ -2896,10 +2896,12 @@ def _plan_ref_matches_actual(
     actual: Mapping[str, Any],
 ) -> bool:
     ref_app = str(reference.get("app", "") or "").lower()
+    actual_app = str(actual.get("source_app", "") or "").lower()
     if ref_app and ref_app != str(actual.get("source_app", "")).lower():
         return False
+    resolution_app = ref_app or actual_app
     ref_entity = canonical_entity_name(
-        ref_app,
+        resolution_app,
         str(reference.get("entity", "") or ""),
     )
     if ref_entity and ref_entity != actual.get("source_entity"):
@@ -2910,9 +2912,8 @@ def _plan_ref_matches_actual(
             or reference.get("source_tool")
             or ""
         ),
-        ref_app,
+        resolution_app,
     )
-    actual_app = str(actual.get("source_app", "") or "").lower()
     actual_action = tool_identity(
         str(actual.get("source_action", "") or ""),
         actual_app,

@@ -75,13 +75,25 @@ def _attack_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
     rng = random.Random(args.seed)
     plan: list[dict[str, Any]] = []
     for target in targets:
+        compatible_goals = set(
+            str(item)
+            for item in target.get("goals", [])
+            if str(item).strip()
+        )
+        target_goals = [
+            goal
+            for goal in goals
+            if not compatible_goals or goal in compatible_goals
+        ]
+        if not target_goals:
+            continue
         points = list(target.get("injection_points", []))
         limit = default_injection_limit if args.injection_limit_per_task is None else args.injection_limit_per_task
         if limit > 0 and len(points) > limit:
             points = rng.sample(points, limit)
         for point in points:
             for attack_type in attack_types:
-                for goal in goals:
+                for goal in target_goals:
                     plan.append(
                         {
                             "task_id": str(target["id"]),
@@ -298,6 +310,26 @@ def _run_key(record: Mapping[str, Any]) -> tuple[str, ...]:
     )
 
 
+def _record_can_be_resumed(record: Mapping[str, Any]) -> bool:
+    """Reuse only runs that completed through a real execution path."""
+    if str(record.get("execution_error", "")).strip():
+        return False
+    if record.get("kind") == "attack" and not bool(
+        record.get("attack_outcome_valid", False)
+    ):
+        return False
+    capture_audit = record.get("capture_audit")
+    if not isinstance(capture_audit, Mapping):
+        return False
+    try:
+        observed_tool_calls = int(
+            capture_audit.get("observed_tool_calls", 0) or 0
+        )
+    except (TypeError, ValueError):
+        return False
+    return observed_tool_calls > 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -370,6 +402,14 @@ def main() -> None:
             "records with the same task/point/attack/goal key."
         ),
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "With --merge-from, keep only completed records with real tool "
+            "activity and skip their matching runs."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -435,6 +475,12 @@ def main() -> None:
         if not isinstance(prior_runs, list):
             raise SystemExit(f"{args.merge_from} does not contain a runs list")
         records = [dict(record) for record in prior_runs if isinstance(record, Mapping)]
+        if args.resume:
+            records = [
+                record
+                for record in records
+                if _record_can_be_resumed(record)
+            ]
 
     def add_record(record: dict[str, Any]) -> None:
         key = _run_key(record)
@@ -443,9 +489,25 @@ def main() -> None:
 
     total = len(attacks) + len(normal_tasks) * len(normal_modes)
     completed = 0
+    existing_keys = {_run_key(record) for record in records}
     for item in attacks:
+        key = (
+            "attack",
+            item["task_id"],
+            item["injection_point"]["id"],
+            item["attack_type"],
+            item["goal"],
+        )
+        if args.resume and key in existing_keys:
+            completed += 1
+            _write_progress(
+                f"[{completed}/{total}] reused attack {item['task_id']} "
+                f"{item['attack_type']} {item['goal']}"
+            )
+            continue
         record = _run_attack(client, item)
         add_record(record)
+        existing_keys.add(_run_key(record))
         _persist_report(
             args.output,
             args,
@@ -464,12 +526,30 @@ def main() -> None:
             disable_defense_layer()
         set_auto_confirmations(True)
         for scenario_id in normal_tasks:
+            key = (
+                "normal",
+                scenario_id,
+                (
+                    "defense_on"
+                    if defense_enabled
+                    else "defense_off"
+                ),
+            )
+            if args.resume and key in existing_keys:
+                completed += 1
+                _write_progress(
+                    f"[{completed}/{total}] reused normal "
+                    f"defense={'on' if defense_enabled else 'off'} "
+                    f"{scenario_id}"
+                )
+                continue
             record = _run_normal(
                 client,
                 scenario_id,
                 defense_enabled=defense_enabled,
             )
             add_record(record)
+            existing_keys.add(_run_key(record))
             _persist_report(
                 args.output,
                 args,
