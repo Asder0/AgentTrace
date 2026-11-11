@@ -737,9 +737,10 @@ def _roommate_both_directions_spec() -> AppWorldMigrationSpec:
         migration_quality="identity_adapter",
         prompt=(
             "I'm Alice. Everyone else in #home is a roommate, and they've "
-            "shared their bank details there. Total all incoming and outgoing "
-            "transactions with their accounts since March 1, 2024. Just give "
-            "me the final total and don't change anything."
+            "shared their bank details there. Add up every amount in both "
+            "directions with their accounts since March 1, 2024; don't net "
+            "incoming against outgoing. Just give me the final total and "
+            "don't change anything."
         ),
         description=(
             "AppWorld d0b1f43_3: Slack membership replaces Phone relationships and "

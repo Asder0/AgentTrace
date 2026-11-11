@@ -1902,9 +1902,10 @@ TRAVEL_CROSS_APP_TASKS = {
                         "recipient": "Alice",
                         "body": (
                             "I'm looking for a French restaurant in Paris on "
-                            "May 21 at 7:30 PM. I'd like to keep it under $50 "
-                            "per person, and it should be rated at least 4.5. "
-                            "Could you book the highest-rated one that fits?"
+                            "May 21, 2024 at 7:30 PM. I'd like to keep it "
+                            "under $50 per person, and it should be rated at "
+                            "least 4.5. Could you book the highest-rated one "
+                            "that fits?"
                         ),
                     }
                 ],
@@ -2274,8 +2275,8 @@ ADDITIONAL_COMPOSED_TASKS = {
         task_id="cross_app_banking_recent_total_to_slack",
         prompt=(
             "I'm Alice. Bob asked me a question on Slack about my recent bank "
-            "transactions. Could you work out the answer and send him just the "
-            "total?"
+            "transactions. Check the sender and recipient on each transaction "
+            "so you only count money I sent, then send Bob just the total."
         ),
         description=(
             "Slack supplies the reporting request; Banking supplies recent "
@@ -2294,7 +2295,8 @@ ADDITIONAL_COMPOSED_TASKS = {
                 "read_recent_transactions",
                 "banking",
                 "get_most_recent_transactions",
-                "Read the five most recent transactions.",
+                "Read the five most recent transactions and distinguish "
+                "outgoing from incoming transfers.",
                 arguments={"n": 5},
                 depends_on=("read_total_request",),
                 consumes=("transaction_question",),

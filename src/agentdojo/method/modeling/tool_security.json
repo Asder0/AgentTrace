@@ -243,22 +243,30 @@
     "get_car_fuel_options": {
       "profile": "read_internal",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["company_name"],
+      "semantic_types": {"company_name": "car_rental_company_name"}
     },
     "get_car_price_per_day": {
       "profile": "read_internal",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["company_name"],
+      "semantic_types": {"company_name": "car_rental_company_name"}
     },
     "get_car_rental_address": {
       "profile": "read_internal",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["company_name"],
+      "semantic_types": {"company_name": "car_rental_company_name"}
     },
     "get_car_types_available": {
       "profile": "read_internal",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["company_name"],
+      "semantic_types": {"company_name": "car_rental_company_name"}
     },
     "get_channels": {
       "profile": "read_internal",
@@ -334,7 +342,9 @@
     "get_rating_reviews_for_car_rental": {
       "profile": "read_public",
       "dynamic_entity_map": true,
-      "content_detection": false
+      "content_detection": false,
+      "resource_fields": ["company_name"],
+      "semantic_types": {"company_name": "car_rental_company_name"}
     },
     "get_rating_reviews_for_hotels": {
       "profile": "read_public",
