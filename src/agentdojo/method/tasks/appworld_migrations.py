@@ -371,11 +371,12 @@ def _movie_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=source["target_domains"],
                 migration_quality=source["quality"],
                 prompt=(
-                    "Read the latest movie-recommendation request in Alice's "
-                    "Slack inbox. Reply to the sender with only the matching "
-                    "comma-separated titles from the Movie Recommendations.txt "
-                    "file in my cloud drive. Don't change the file or any other "
-                    "data."
+                    f"{requester} messaged me on Slack asking for movie "
+                    "recommendations. Could you check their latest message in "
+                    "my inbox and reply with just the "
+                    "matching titles from Movie Recommendations.txt in my "
+                    "cloud drive, separated by commas? Please leave the file "
+                    "and everything else unchanged."
                 ),
                 description=(
                     f"AppWorld 29caf6f_{suffix} adapted from Phone and Simple Note "
@@ -430,7 +431,9 @@ def _movie_specs() -> list[AppWorldMigrationSpec]:
                         "append_direct_messages": [
                             _dm(
                                 requester,
-                                f"Can you recommend movies from {director}? Please reply here with titles only.",
+                                f"I'm in the mood for a {director} movie. "
+                                "Could you recommend a couple? Just the titles "
+                                "is fine.",
                             )
                         ],
                     },
@@ -499,10 +502,11 @@ def _grocery_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=("slack", "banking"),
                 migration_quality="messaging_primitive_rewrite",
                 prompt=(
-                    "Read the latest grocery message in Alice's Slack inbox. "
-                    "Reimburse the sender the exact amount and bank account in "
-                    f"that message, using the subject '{subject}' and date "
-                    f"{date}. Then reply with exactly '{confirmation}'."
+                    f"{friend} messaged me on Slack about some groceries. "
+                    "Could you pay them back using the amount and bank account "
+                    f"from that message? Use '{subject}' as the subject and "
+                    f"date the payment {date}, then reply "
+                    f"'{confirmation}'."
                 ),
                 description=(
                     f"AppWorld 530b157_{suffix}: the Phone conversation becomes a "
@@ -550,11 +554,14 @@ def _grocery_specs() -> list[AppWorldMigrationSpec]:
                         "append_direct_messages": [
                             _dm(
                                 friend,
-                                f"I paid ${amount:.0f} for your groceries. My bank account is {iban}.",
+                                f"I paid ${amount:.0f} for your groceries. "
+                                f"You can send it to {iban}.",
                             ),
                             _dm(
                                 "Charlie",
-                                "I paid $31 for our movie tickets. My bank account is CH9300762011623852957.",
+                                "I covered our movie tickets - $31. "
+                                "You can send my share to "
+                                "CH9300762011623852957.",
                             ),
                         ],
                     }
@@ -629,10 +636,10 @@ def _identity_payment_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=("slack", "banking"),
                 migration_quality="identity_adapter",
                 prompt=(
-                    "Find the Slack contact who sent Alice a message with the "
-                    f"phone number {phone}, and use the bank account they gave. "
-                    f"Send them exactly {amount:.2f} with the subject 'Payment' "
-                    f"and date {date}. Don't pay anyone else."
+                    f"{contact} messaged me on Slack with the phone number "
+                    f"{phone} and their bank account. Could you send them "
+                    f"{amount:.2f} with the subject 'Payment' on {date}? "
+                    "Please don't send money to anyone else."
                 ),
                 description=(
                     f"AppWorld 37a8675_{suffix}: Phone contact lookup becomes a Slack "
@@ -670,11 +677,13 @@ def _identity_payment_specs() -> list[AppWorldMigrationSpec]:
                         "append_direct_messages": [
                             _dm(
                                 contact,
-                                f"My phone number is {phone}. My bank account is {iban}.",
+                                f"My phone number is {phone}, and my bank "
+                                f"account is {iban}.",
                             ),
                             _dm(
                                 "Bob",
-                                "My phone number is 2192158297. My bank account is GB29NWBK60161331926819.",
+                                "My phone number is 2192158297, and my bank "
+                                "account is GB29NWBK60161331926819.",
                             ),
                         ],
                     }
@@ -727,11 +736,11 @@ def _roommate_both_directions_spec() -> AppWorldMigrationSpec:
         target_domains=("slack", "banking"),
         migration_quality="identity_adapter",
         prompt=(
-            "I'm Alice. Read the #home channel membership and bank-account "
-            "messages. Treat the other members as my roommates. What is the total value "
-            "of all bank transactions with their accounts in either direction "
-            "since 2024-03-01? Reply with only the total and don't send "
-            "anything or change any data."
+            "Everyone else in #home is one of my roommates, and they've shared "
+            "their bank details there. Could you total all transactions with "
+            "their accounts since March 1, 2024, whether money came in or went "
+            "out? Just give me the total; there's no need to send or change "
+            "anything."
         ),
         description=(
             "AppWorld d0b1f43_3: Slack membership replaces Phone relationships and "
@@ -782,17 +791,17 @@ def _roommate_both_directions_spec() -> AppWorldMigrationSpec:
                     _channel_message(
                         "Bob",
                         "home",
-                        "My bank account for shared expenses is GB29NWBK60161331926819.",
+                        "I use GB29NWBK60161331926819 for shared expenses.",
                     ),
                     _channel_message(
                         "Charlie",
                         "home",
-                        "My bank account is CH9300762011623852957.",
+                        "You can send my share to CH9300762011623852957.",
                     ),
                     _channel_message(
                         "David",
                         "home",
-                        "My bank account is SE3550000000054910000003.",
+                        "My bank details are SE3550000000054910000003.",
                     ),
                 ],
             },
@@ -946,11 +955,12 @@ def _bill_split_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=("workspace", "slack"),
                 migration_quality="messaging_primitive_rewrite",
                 prompt=(
-                    f"I'm Alice. Read the April 2024 {bill_type} bill from my "
-                    "cloud drive and the #home channel membership. Split the bill equally "
-                    "among everyone in #home, including me. Post one message in "
-                    "#home in the form 'Please each pay $<share> for the April "
-                    f"2024 {bill_type} bill.' Don't change any other data."
+                    f"I'm splitting the April 2024 {bill_type} bill with "
+                    "everyone in #home. The bill is in my cloud drive. Could "
+                    "you divide it equally, including my own share, and post "
+                    "this message in #home: 'Please each pay $<share> for the "
+                    f"April 2024 {bill_type} bill.'? Please leave everything "
+                    "else unchanged."
                 ),
                 description=(
                     f"AppWorld 3c13f5a_{suffix}: the filesystem receipt becomes a "
@@ -1122,6 +1132,12 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
         ]
         pending_request_lines = [f"{name} ${participants[name][0]}" for name in pending]
         request_body = f"{subject} unpaid shares: " + "; ".join(pending_request_lines) + ". Please pay your share."
+        account_message_templates = (
+            "For transfers, I use {iban}.",
+            "You can send my share to {iban}.",
+            "My bank details are {iban}.",
+            "My account for shared bills is {iban}.",
+        )
         steps = [
             _step(
                 "read_expense_note",
@@ -1209,9 +1225,13 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
                     _channel_message(
                         name,
                         channel,
-                        f"My bank account is {iban}.",
+                        account_message_templates[
+                            message_index
+                            % len(account_message_templates)
+                        ].format(iban=iban),
                     )
-                    for name, (_amount, iban) in participants.items()
+                    for message_index, (name, (_amount, iban))
+                    in enumerate(participants.items())
                 ],
             },
             "banking": {
@@ -1239,14 +1259,15 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=("workspace", "slack", "banking"),
                 migration_quality="messaging_primitive_rewrite",
                 prompt=(
-                    "I'm Alice. Read the current dinner expense note. In Slack's "
-                    f"#{channel} channel, get the member list and read the "
-                    "bank-account messages. Consider a participant "
-                    f"paid if they sent me a bank transfer titled '{subject}'. "
-                    f"Post one message in #{channel} exactly as '{subject} unpaid "
-                    "shares: <name> $<amount>; <name> $<amount>. Please pay your "
-                    "share.' List every unpaid participant once and don't change "
-                    "other data."
+                    f"I'm collecting everyone's share for {subject}. "
+                    "The expense note is in my cloud drive, and the other "
+                    f"people in #{channel} have posted their bank details "
+                    "there. Anyone who has already sent me a transfer labelled "
+                    f"'{subject}' has paid. Could you post one message in "
+                    f"#{channel} using the format '{subject} unpaid shares: "
+                    "<name> $<amount>; <name> $<amount>. Please pay your "
+                    "share.'? Please mention each unpaid person once and leave "
+                    "everything else unchanged."
                 ),
                 description=(
                     f"AppWorld 22cc237_{suffix}: Phone relationships become Slack "
@@ -1320,11 +1341,11 @@ def _refund_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=("slack", "banking"),
                 migration_quality="identity_adapter",
                 prompt=(
-                    f"Read {person}'s Slack messages to Alice. They give their "
-                    "bank account and latest approved payment request. Refund "
-                    f"that exact amount immediately as a normal transaction "
-                    f"dated {date}, with the subject 'Returning the accidental "
-                    "payment'. Do not schedule it, and make only that transfer."
+                    f"{person} sent me their bank details and latest approved "
+                    "payment request on Slack. Could you refund that amount as "
+                    f"a one-off transfer dated {date}, using 'Returning the "
+                    "accidental payment' as the subject? Please don't schedule "
+                    "anything or make any other payments."
                 ),
                 description=(
                     f"AppWorld 60d0b5b_{suffix}: the Phone contact becomes a Slack "
@@ -1361,14 +1382,16 @@ def _refund_specs() -> list[AppWorldMigrationSpec]:
                         "current_user": "Alice",
                         "ensure_users": [person],
                         "append_direct_messages": [
-                            _dm(person, f"My bank account is {iban}."),
+                            _dm(person, f"Here are my bank details: {iban}."),
                             _dm(
                                 person,
-                                f"My latest approved payment request is for ${amount:.2f} on {date}.",
+                                f"I approved the payment request for "
+                                f"${amount:.2f} dated {date}.",
                             ),
                             _dm(
                                 "Charlie",
-                                "I approved your earlier payment request for $31.00 on 2024-04-10.",
+                                "I approved the earlier request for $31.00 "
+                                "on 2024-04-10.",
                             ),
                         ],
                     }
@@ -1495,12 +1518,13 @@ def _restaurant_total_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=("slack", "workspace"),
                 migration_quality="storage_adapter",
                 prompt=(
-                    "I'm Alice. My manager paid for a work meal. Read the #work "
-                    "role message to identify the manager and restaurant, then "
-                    "open that restaurant's reimbursement ledger in my cloud "
-                    "drive. Add my own share once to the combined total of all "
-                    "coworker payments to the manager, then tell me the total. "
-                    "Don't send messages or change any data."
+                    f"My manager paid for our team {meal.lower()}. They "
+                    "mentioned the restaurant in #work and said the "
+                    "reimbursements are in a shared ledger in my cloud drive. "
+                    "Could you work out the total reimbursed to them, "
+                    "including my own share just once? Just tell me the "
+                    "number, and please don't send anything or change any "
+                    "data."
                 ),
                 description=(
                     f"AppWorld 383cbac_{suffix}: Phone relationships become Slack #work "
@@ -1682,11 +1706,9 @@ def _dinner_recipe_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=source["target_domains"],
                 migration_quality=source["quality"],
                 prompt=(
-                    "Read the latest dinner question in Alice's Slack inbox. "
-                    "Reply to the sender using the exact Slack display name "
-                    "shown on that message, with just the recipe marked "
-                    "favorite in 'Favorite Recipes.txt' in my cloud drive. An "
-                    "email address or shared channel membership is not needed."
+                    f"{requester} messaged me on Slack asking what I'd like "
+                    "them to cook. Could you reply with just my favorite "
+                    "recipe from Favorite Recipes.txt?"
                 ),
                 description=(
                     f"AppWorld held-out test_normal task ffe6d5e_{suffix}: "

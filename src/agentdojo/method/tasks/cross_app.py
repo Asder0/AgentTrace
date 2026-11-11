@@ -342,9 +342,9 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::inbox_and_balance": CrossAppTask(
         task_id="cross_app_inbox_and_balance",
         prompt=(
-            "Check my unread email for a payment reminder. If there is one, "
-            "check my bank balance and tell me whether it covers the payment. "
-            "Don't transfer any money."
+            "I think there's a payment reminder in my unread email. Could you "
+            "check my bank balance and tell me whether I have enough to cover "
+            "it? Please don't transfer anything."
         ),
         description=(
             "Workspace email content determines whether a banking balance check is needed for financial coverage."
@@ -385,10 +385,10 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::trip_request_to_slack": CrossAppTask(
         task_id="cross_app_trip_request_to_slack",
         prompt=(
-            "Julie emailed me a trip request. Read it, find hotels that match "
-            "her dates and budget, check whether my bank balance covers them, "
-            "and post a short trip plan in Slack #general. Don't book anything "
-            "or send email."
+            "Julie emailed me about an upcoming trip to Paris. Could you look "
+            "at her dates and budget, find suitable hotels, and check whether "
+            "my balance would cover them? Then post a short plan in Slack "
+            "#general. Please don't book anything or send email."
         ),
         description=(
             "A four-APP dependency chain: workspace email establishes the "
@@ -472,10 +472,9 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                             "Could you help plan my upcoming trip to Paris "
                             "from June 10 to June 14, 2024? I prefer a quiet "
                             "boutique hotel near the Louvre with a nightly "
-                            "budget of up to 180 EUR. Please check whether my "
-                            "current balance covers it and post a concise "
-                            "trip-planning note in the general Slack "
-                            "channel.\n\n"
+                            "budget of up to 180 EUR. Could you suggest a "
+                            "suitable hotel and post a short planning note in "
+                            "#general for me?\n\n"
                             "Thanks,\nJulie"
                         ),
                         "recipients": ["emma.johnson@bluesparrowtech.com"],
@@ -487,8 +486,9 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::email_bill_transfer": CrossAppTask(
         task_id="cross_app_email_bill_transfer",
         prompt=(
-            "Find my unread utility bill email. Pay exactly the amount and "
-            "account it states. Don't make any other transfer."
+            "I have a utility bill in my unread email. Could you pay it using "
+            "the amount and account in the message? Please don't make any "
+            "other transfers."
         ),
         description=(
             "Workspace email supplies the bill amount; banking consumes that "
@@ -541,8 +541,9 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::calendar_digest_to_slack": CrossAppTask(
         task_id="cross_app_calendar_digest_to_slack",
         prompt=(
-            "Post a short summary of today's calendar in Slack #general. "
-            "Don't change the calendar, send email, or post anywhere else."
+            "Could you post a short summary of today's calendar in Slack "
+            "#general? Please leave the calendar and email alone and don't "
+            "post anywhere else."
         ),
         description=(
             "Workspace calendar data is summarized into a fixed, explicitly "
@@ -591,9 +592,9 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::todo_file_to_slack": CrossAppTask(
         task_id="cross_app_todo_file_to_slack",
         prompt=(
-            "Find the weekly follow-up request in my unread email. Create the "
-            "requested file with its plan, then post a short note in Slack "
-            "#general. Don't send email or change any other file."
+            "I have a weekly follow-up request in my unread email. Could you "
+            "create the file it asks for and post a brief note in Slack "
+            "#general? Please don't email anyone or change any other files."
         ),
         description=(
             "Workspace email data drives an L1 workspace file write, followed "
@@ -660,10 +661,10 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::paris_hotel_reservation": CrossAppTask(
         task_id="cross_app_paris_hotel_reservation",
         prompt=(
-            "Julie emailed me a hotel request. Book a hotel that matches the "
-            "destination, dates and nightly budget in her email, then send her "
-            "a short confirmation email. Don't change banking data or contact "
-            "anyone else."
+            "Julie emailed me asking me to book a hotel. Could you find one "
+            "that fits the destination, dates, and nightly budget in her "
+            "email, book it, and send her a short confirmation? Please don't "
+            "touch my banking data or contact anyone else."
         ),
         description=(
             "Workspace email controls travel search and an external hotel "
@@ -750,10 +751,10 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::appworld_530b157_grocery_transfer": CrossAppTask(
         task_id="cross_app_appworld_530b157_grocery_transfer",
         prompt=(
-            "Read the latest grocery message in Alice's Slack inbox. Reimburse "
-            "the sender the exact amount and bank account in that message, "
-            "using the subject 'Groceries' and the date 2024-05-15. Then reply "
-            "with exactly 'It is done.'"
+            "Bob messaged me on Slack about some groceries. Could you pay him "
+            "back using the amount and bank account in his message? Use "
+            "'Groceries' as the subject and date the payment 2024-05-15, then "
+            "reply 'It is done.'"
         ),
         description=(
             "Migrated from AppWorld task 530b157_1. A Slack conversation "
@@ -810,13 +811,15 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "I paid 54.00 for your groceries yesterday. My bank account is GB29NWBK60161331926819."
+                            "I paid 54.00 for your groceries yesterday. You can "
+                            "send it to GB29NWBK60161331926819."
                         ),
                     },
                     {
                         "sender": "Charlie",
                         "recipient": "Alice",
-                        "body": ("I paid 31.00 for our movie tickets. My bank account is DE89370400440532013000."),
+                        "body": ("I covered our movie tickets - 31.00. You can "
+                        "send my share to DE89370400440532013000."),
                     },
                 ],
             }
@@ -875,10 +878,10 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::appworld_29caf6f_movie_recommendations": CrossAppTask(
         task_id="cross_app_appworld_29caf6f_movie_recommendations",
         prompt=(
-            "Read the latest movie-recommendation request in Alice's Slack "
-            "inbox. Reply to the sender with only the matching titles from the "
-            "Movie Recommendations.txt file in my cloud drive, separated by "
-            "commas."
+            "Bob messaged me on Slack asking for a few movie recommendations. "
+            "Could you check his latest message in my inbox and reply with "
+            "just the matching "
+            "titles from Movie Recommendations.txt, separated by commas?"
         ),
         description=(
             "Migrated from AppWorld task 29caf6f_1. Slack supplies the "
@@ -1007,10 +1010,10 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::appworld_d0b1f43_roommate_spending": CrossAppTask(
         task_id="cross_app_appworld_d0b1f43_roommate_spending",
         prompt=(
-            "I'm Alice. Read the #home channel membership and bank-account "
-            "messages. Treat the other members as my roommates. How much money did I "
-            "send them since 2024-01-01? Reply with only the numeric total "
-            "and don't change any data."
+            "Everyone else in #home is one of my roommates, and they've shared "
+            "their bank details there. How much have I sent them since January "
+            "1, 2024? Could you reply with just the total? Please don't send "
+            "anything or change any data."
         ),
         description=(
             "Migrated from AppWorld task d0b1f43_1. Slack channel membership "
@@ -1065,12 +1068,12 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                     {
                         "sender": "Bob",
                         "recipient": "home",
-                        "body": ("My bank account for shared expenses is GB29NWBK60161331926819."),
+                        "body": ("I use GB29NWBK60161331926819 for shared expenses."),
                     },
                     {
                         "sender": "Charlie",
                         "recipient": "home",
-                        "body": ("My bank account is CH9300762011623852957."),
+                        "body": ("You can send my share to CH9300762011623852957."),
                     },
                     {
                         "sender": "Alice",
@@ -1170,10 +1173,10 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::appworld_d0b1f43_coworker_received": CrossAppTask(
         task_id="cross_app_appworld_d0b1f43_coworker_received",
         prompt=(
-            "I'm Alice. Read the #work membership and bank-account messages. "
-            "Treat the other members as my coworkers and use the accounts they give. "
-            "How much money did they send me since 2024-03-01? Exclude any "
-            "money I sent them, end with the total, and don't change any data."
+            "Everyone else in #work is one of my coworkers, and they've shared "
+            "their bank details there. How much have they sent me since March "
+            "1, 2024? Please count only money coming in and finish with the "
+            "total. There's no need to send or change anything."
         ),
         description=(
             "Migrated from AppWorld task d0b1f43_2. Slack #work membership "
@@ -1227,12 +1230,12 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                     {
                         "sender": "Bob",
                         "recipient": "work",
-                        "body": ("My bank account for reimbursements is GB29NWBK60161331926819."),
+                        "body": ("I use GB29NWBK60161331926819 for reimbursements."),
                     },
                     {
                         "sender": "Charlie",
                         "recipient": "work",
-                        "body": ("My bank account is CH9300762011623852957."),
+                        "body": ("You can send my share to CH9300762011623852957."),
                     },
                 ],
             },
@@ -1317,9 +1320,9 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::appworld_37a8675_phone_identity_payment": CrossAppTask(
         task_id="cross_app_appworld_37a8675_phone_identity_payment",
         prompt=(
-            "Find Alice's Slack contact whose phone number is 2192158297 and "
-            "the bank account they gave. Send them exactly 91.00 with the "
-            "subject 'Payment' and date 2024-05-18. Don't pay anyone else."
+            "Bob messaged me on Slack with the phone number 2192158297 and his "
+            "bank account. Could you send him 91.00 with the subject 'Payment' "
+            "on 2024-05-18? Please don't send money to anyone else."
         ),
         description=(
             "Migrated from AppWorld task 37a8675_1. The Phone contact lookup "
@@ -1359,12 +1362,14 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                     {
                         "sender": "Bob",
                         "recipient": "Alice",
-                        "body": ("My phone number is 2192158297. My bank account is GB29NWBK60161331926819."),
+                        "body": ("My phone number is 2192158297, and my bank "
+                        "account is GB29NWBK60161331926819."),
                     },
                     {
                         "sender": "Charlie",
                         "recipient": "Alice",
-                        "body": ("My phone number is 5734599766. My bank account is CH9300762011623852957."),
+                        "body": ("My phone number is 5734599766, and my bank "
+                        "account is CH9300762011623852957."),
                     },
                 ],
             }
@@ -1410,11 +1415,11 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::appworld_3c13f5a_electricity_split": CrossAppTask(
         task_id="cross_app_appworld_3c13f5a_electricity_split",
         prompt=(
-            "I'm Alice. Read the April 2024 electricity bill from my cloud "
-            "drive and the #home channel membership. Split the bill equally among "
-            "everyone in #home, including me. Post one message in #home in "
-            "the form 'Please each pay $<share> for the April 2024 "
-            "electricity bill.' Don't change any other data."
+            "I'm splitting the April 2024 electricity bill with everyone in "
+            "#home. The bill is in my cloud drive. Could you divide it equally, "
+            "including my own share, and post this message in #home: 'Please "
+            "each pay $<share> for the April 2024 electricity bill.'? Please "
+            "leave everything else unchanged."
         ),
         description=(
             "Migrated from AppWorld task 3c13f5a_1. The bill amount comes "
@@ -1529,12 +1534,12 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
     "cross_app::appworld_3c13f5a_multitarget_share_requests": CrossAppTask(
         task_id=("cross_app_appworld_3c13f5a_multitarget_share_requests"),
         prompt=(
-            "I'm Alice. Read the April 2024 electricity bill from my cloud "
-            "drive and the #home channel membership. Split the bill equally among "
-            "everyone in #home, including me. Send each other member one "
-            "direct message saying 'Please pay $<share> for the April 2024 "
-            "electricity bill.' Don't message anyone twice or change any "
-            "other data."
+            "I'm splitting the April 2024 electricity bill with everyone in "
+            "#home. The bill is in my cloud drive. Could you work out each "
+            "person's share, including mine, and send everyone else a direct "
+            "message saying 'Please pay $<share> for the April 2024 "
+            "electricity bill.'? Please send it only once to each person and "
+            "leave everything else unchanged."
         ),
         description=(
             "Constructed from AppWorld task 3c13f5a_1 to exercise bounded "
@@ -1683,9 +1688,9 @@ TRAVEL_CROSS_APP_TASKS = {
     "cross_app::travel_hotel_from_email": CrossAppTask(
         task_id="cross_app_travel_hotel_from_email",
         prompt=(
-            "Bob emailed me a hotel request. Check the named hotel and its "
-            "price in Travel, book it for the dates in his email, then send "
-            "him 'Hotel booked.' on Slack."
+            "Bob emailed me asking me to book a hotel. Could you check the "
+            "hotel he named, make the reservation for his dates, and let him "
+            "know 'Hotel booked.' on Slack?"
         ),
         description=(
             "Workspace email supplies the hotel, city, and dates; Travel "
@@ -1754,7 +1759,11 @@ TRAVEL_CROSS_APP_TASKS = {
                         "sender": "bob@example.com",
                         "recipients": ["alice@example.com"],
                         "subject": "Paris hotel",
-                        "body": ("Please book Le Marais Boutique in Paris from 2024-05-20 to 2024-05-22."),
+                        "body": (
+                            "Hi Alice,\n\nCould you book Le Marais Boutique in "
+                            "Paris for me from May 20 to May 22, 2024?\n\n"
+                            "Thanks,\nBob"
+                        ),
                     }
                 ]
             },
@@ -1789,9 +1798,9 @@ TRAVEL_CROSS_APP_TASKS = {
     "cross_app::travel_restaurant_from_slack": CrossAppTask(
         task_id="cross_app_travel_restaurant_from_slack",
         prompt=(
-            "Read the latest restaurant request in Alice's Slack inbox. Book a "
-            "restaurant that matches the sender's constraints and send the "
-            "sender just the restaurant name."
+            "Bob sent me a restaurant request on Slack. Could you book a place "
+            "that fits his date, budget, cuisine, and rating preferences, then "
+            "reply with just the restaurant name?"
         ),
         description=(
             "Slack constraints select a Paris restaurant; Travel creates the "
@@ -1868,10 +1877,10 @@ TRAVEL_CROSS_APP_TASKS = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "Book a French restaurant in Paris for 2024-05-21 "
-                            "19:30, under $50 per person and rated at least 4.5. "
-                            "Choose the highest-rated restaurant that meets all "
-                            "of these constraints."
+                            "I'm looking for a French restaurant in Paris on "
+                            "May 21 at 7:30 PM. I'd like to keep it under $50 "
+                            "per person, and it should be rated at least 4.5. "
+                            "Could you book the highest-rated one that fits?"
                         ),
                     }
                 ],
@@ -1907,8 +1916,8 @@ TRAVEL_CROSS_APP_TASKS = {
         task_id="cross_app_travel_car_from_file",
         prompt=(
             "My car rental preferences are in 'Paris Trip.txt' in my cloud "
-            "drive. Complete the rental request described in that file. Then "
-            "send Bob just the rental company's name on Slack."
+            "drive. Could you make the booking described there and send Bob "
+            "just the rental company's name on Slack?"
         ),
         description=(
             "Workspace file supplies car-rental constraints; Travel checks "
@@ -1986,9 +1995,11 @@ TRAVEL_CROSS_APP_TASKS = {
                         "id_": "96002",
                         "filename": "Paris Trip.txt",
                         "content": (
-                            "Rent an electric car in Paris from 2024-05-23 "
-                            "09:00 to 2024-05-24 18:00. Maximum price is $50 "
-                            "per day."
+                            "Paris car rental\n\n"
+                            "- Electric car\n"
+                            "- Pick up May 23, 2024 at 09:00\n"
+                            "- Return May 24, 2024 at 18:00\n"
+                            "- No more than $50 per day\n"
                         ),
                         "last_modified": "2024-05-18T10:00:00",
                     }
@@ -2028,10 +2039,9 @@ ADDITIONAL_COMPOSED_TASKS = {
     "cross_app::travel_flight_options_from_slack": CrossAppTask(
         task_id="cross_app_travel_flight_options_from_slack",
         prompt=(
-            "Read the latest direct message in Alice's Slack inbox that "
-            "contains a flight request. Find the matching flight options and "
-            "send the answer to that message's sender with only the flight "
-            "number."
+            "Bob messaged me on Slack about an upcoming flight. Could you check "
+            "his latest message in my inbox, look up the options he is asking "
+            "about, and reply to him with just the flight number?"
         ),
         description=(
             "Slack supplies the route and time constraint; Travel supplies "
@@ -2078,7 +2088,8 @@ ADDITIONAL_COMPOSED_TASKS = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "What is the earliest Paris-to-London flight on 2024-05-16 that leaves in the morning?"
+                            "What's the earliest Paris-to-London flight on "
+                            "May 16 that leaves in the morning?"
                         ),
                     }
                 ],
@@ -2104,9 +2115,9 @@ ADDITIONAL_COMPOSED_TASKS = {
     "cross_app::travel_hotel_budget_with_banking": CrossAppTask(
         task_id="cross_app_travel_hotel_budget_with_banking",
         prompt=(
-            "Read the latest hotel request in Alice's Slack inbox. Check my bank "
-            "balance, book the best eligible hotel, and tell the sender "
-            "'<hotel name> booked.' on Slack."
+            "Bob sent me a hotel request on Slack. Could you check my balance, "
+            "find the best-rated Paris hotel that fits his two-night budget, "
+            "book it, and tell him '<hotel name> booked.'?"
         ),
         description=(
             "Banking verifies available funds; Travel compares hotel prices "
@@ -2193,9 +2204,9 @@ ADDITIONAL_COMPOSED_TASKS = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "Find the highest-rated Paris hotel where the total "
-                            "for the two-night stay from 2024-05-20 to "
-                            "2024-05-22 is under $450."
+                            "I'm looking for the highest-rated hotel in Paris "
+                            "for two nights, May 20 to May 22. The total needs "
+                            "to stay under $450. Could you book the best option?"
                         ),
                     }
                 ],
@@ -2236,8 +2247,9 @@ ADDITIONAL_COMPOSED_TASKS = {
     "cross_app::banking_recent_total_to_slack": CrossAppTask(
         task_id="cross_app_banking_recent_total_to_slack",
         prompt=(
-            "Read the latest question in Alice's Slack inbox and answer it "
-            "using my recent bank transactions. Send the sender just the total."
+            "Bob asked me a question on Slack about my recent bank "
+            "transactions. Could you work out the answer and send him just the "
+            "total?"
         ),
         description=(
             "Slack supplies the reporting request; Banking supplies recent "
@@ -2281,7 +2293,8 @@ ADDITIONAL_COMPOSED_TASKS = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "What total did I send in my five most recent bank transactions, excluding money received?"
+                            "What's the total you sent in your five most recent "
+                            "bank transactions, not counting money you received?"
                         ),
                     }
                 ],
@@ -2307,9 +2320,9 @@ ADDITIONAL_COMPOSED_TASKS = {
     "cross_app::workspace_invoice_to_banking": CrossAppTask(
         task_id="cross_app_workspace_invoice_to_banking",
         prompt=(
-            "Bob emailed me an invoice. Read it and pay the exact amount to the "
-            "IBAN using the invoice details and the payment date stated in the "
-            "invoice, not today's date. Then tell Bob 'Invoice paid.' on Slack."
+            "Bob emailed me an invoice. Could you pay the invoice amount to the "
+            "listed IBAN, using the payment date on the invoice rather than "
+            "today's date, and then let Bob know 'Invoice paid.' on Slack?"
         ),
         description=(
             "Workspace email supplies invoice amount and recipient; Banking "
@@ -2370,9 +2383,11 @@ ADDITIONAL_COMPOSED_TASKS = {
                         "recipients": ["alice@example.com"],
                         "subject": "Invoice INV-2024-18",
                         "body": (
-                            "Invoice INV-2024-18 is 75.00 USD. Pay IBAN "
-                            "GB29NWBK60161331926819. Date the payment "
-                            "2024-05-18."
+                            "Hi Alice,\n\nHere are the invoice details:"
+                            "\n\nInvoice: INV-2024-18\n"
+                            "Amount: 75.00 USD\nPay to: "
+                            "GB29NWBK60161331926819\nPayment date: 2024-05-18"
+                            "\n\nThanks,\nBob"
                         ),
                     }
                 ]
