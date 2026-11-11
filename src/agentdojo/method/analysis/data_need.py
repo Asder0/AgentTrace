@@ -571,6 +571,10 @@ Rules:
 - Use mode=copy only for an exact value copy from one source field.
 - For mode=copy, bind source_ref to a SourceRef ID. The controller resolves
   that ID to the unique earlier source_action and producer_step.
+- copy selectors accept only unique, first and last. For latest, newest or
+  most_recent records, use mode=derived_sources with
+  generation_kind=selection and state the selection criterion in constraints.
+  Do not encode a filtered record selection as a positional copy selector.
 - Use mode=derived_sources for semantic extraction, normalization, selection,
   calculation, summary or presentation. Each derived parameter must list its own
   allowed_source_refs using app, entity, source_action and the exact
@@ -2574,6 +2578,195 @@ def _contract_max_confidentiality(
     return source_max
 
 
+_SEMANTIC_COPY_SELECTORS = frozenset(
+    {
+        "latest",
+        "most_recent",
+        "newest",
+    }
+)
+
+
+def _normalize_semantic_copy_bindings(
+    raw_flow_contract: Any,
+    *,
+    source_registry: Mapping[str, Mapping[str, Any]],
+    action_name: str,
+) -> list[str]:
+    """Convert semantic latest selectors into auditable source selection."""
+    if not isinstance(raw_flow_contract, dict):
+        return []
+    raw_bindings = raw_flow_contract.get("parameter_bindings")
+    if not isinstance(raw_bindings, dict):
+        return []
+    warnings: list[str] = []
+    for raw_parameter, raw_binding in raw_bindings.items():
+        if not isinstance(raw_binding, dict):
+            continue
+        if str(raw_binding.get("mode", "copy")).lower() != "copy":
+            continue
+        selector = str(raw_binding.get("selector", "unique")).lower()
+        if selector not in _SEMANTIC_COPY_SELECTORS:
+            continue
+        parameter = str(raw_parameter)
+        raw_source = raw_binding.get("source_ref")
+        source_id = str(
+            raw_binding.get("source_id")
+            or (
+                raw_source.get("source_id")
+                or raw_source.get("id")
+                if isinstance(raw_source, Mapping)
+                else raw_source
+            )
+            or ""
+        ).strip()
+        source_ref = source_registry.get(source_id)
+        if not isinstance(source_ref, Mapping):
+            warnings.append(
+                "binding_selector_requires_known_source:"
+                f"{action_name}:{parameter}:{selector}"
+            )
+            continue
+        source_path = normalize_source_path(
+            str(raw_binding.get("source_path", ""))
+        )
+        if not source_path:
+            warnings.append(
+                "binding_selector_requires_source_path:"
+                f"{action_name}:{parameter}:{selector}"
+            )
+            continue
+        allowed_ref = {
+            "source_id": source_id,
+            "app": str(source_ref.get("app", "")),
+            "entity": str(source_ref.get("entity", "")),
+            "source_action": str(
+                source_ref.get("source_action", "")
+            ),
+            "source_path": source_path,
+        }
+        required_ref = {
+            **allowed_ref,
+            "producer_step": str(
+                source_ref.get("producer_step", "")
+            ),
+        }
+        constraints = raw_binding.get("constraints")
+        constraints = (
+            copy.deepcopy(constraints)
+            if isinstance(constraints, Mapping)
+            else {}
+        )
+        constraints.setdefault("must_not_introduce_facts", True)
+        constraints["selection_criterion"] = selector
+        raw_binding.clear()
+        raw_binding.update(
+            {
+                "mode": "derived_sources",
+                "generation_kind": "selection",
+                "required_sources": [source_id],
+                "allowed_source_refs": [allowed_ref],
+                "required_source_refs": [required_ref],
+                "allowed_source_paths": [source_path],
+                "required_source_groups": [],
+                "constraints": constraints,
+            }
+        )
+        warnings.append(
+            "semantic_copy_selector_normalized:"
+            f"{action_name}:{parameter}:{selector}"
+        )
+    return warnings
+
+
+def _resolve_copy_binding_source_refs(
+    raw_flow_contract: Any,
+    *,
+    source_registry: Mapping[str, Mapping[str, Any]],
+    action_name: str,
+) -> list[str]:
+    """Resolve documented SourceRef IDs in copy bindings before compiling."""
+    if not isinstance(raw_flow_contract, dict):
+        return []
+    raw_bindings = raw_flow_contract.get("parameter_bindings")
+    if not isinstance(raw_bindings, dict):
+        return []
+    warnings: list[str] = []
+    for raw_parameter, raw_binding in raw_bindings.items():
+        if not isinstance(raw_binding, dict):
+            continue
+        if str(raw_binding.get("mode", "copy")).lower() != "copy":
+            continue
+        raw_source = raw_binding.get("source_ref")
+        source_id = str(
+            raw_binding.get("source_id")
+            or (
+                raw_source.get("source_id")
+                or raw_source.get("id")
+                if isinstance(raw_source, Mapping)
+                else raw_source
+            )
+            or ""
+        ).strip()
+        if not source_id:
+            continue
+        parameter = str(raw_parameter)
+        source_ref = source_registry.get(source_id)
+        if not isinstance(source_ref, Mapping):
+            warnings.append(
+                "unknown_binding_source_ref:"
+                f"{action_name}:{parameter}:{source_id}"
+            )
+            continue
+        source_action = str(
+            source_ref.get("source_action", "")
+        ).strip()
+        declared_action = str(
+            raw_binding.get("source_action", "")
+        ).strip()
+        if (
+            declared_action
+            and base_tool_name(declared_action)
+            != base_tool_name(source_action)
+        ):
+            warnings.append(
+                "binding_source_ref_action_conflict:"
+                f"{action_name}:{parameter}:"
+                f"{source_id}:{declared_action}:{source_action}"
+            )
+            continue
+        raw_binding["source_id"] = source_id
+        raw_binding["source_action"] = source_action
+        if source_ref.get("producer_step"):
+            raw_binding.setdefault(
+                "producer_step",
+                str(source_ref.get("producer_step", "")),
+            )
+    return warnings
+
+
+def _normalize_flow_binding_references(
+    raw_flow_contract: Any,
+    *,
+    source_registry: Mapping[str, Mapping[str, Any]],
+    action_name: str,
+) -> list[str]:
+    """Apply deterministic binding normalizations before compilation."""
+    warnings = _normalize_semantic_copy_bindings(
+        raw_flow_contract,
+        source_registry=source_registry,
+        action_name=action_name,
+    )
+    warnings.extend(
+        _resolve_copy_binding_source_refs(
+            raw_flow_contract,
+            source_registry=source_registry,
+            action_name=action_name,
+        )
+    )
+    return warnings
+
+
 def _compile_action_flow_contract(
     raw: Any,
     *,
@@ -3066,7 +3259,9 @@ def _compile_action_flow_contract(
             contract_valid = False
             continue
         if selector not in {"unique", "first", "last"}:
-            warnings.append(f"invalid_binding_selector:{action_name}:{parameter}")
+            warnings.append(
+                f"invalid_binding_selector:{action_name}:{parameter}:{selector}"
+            )
             contract_valid = False
             continue
         source_metadata = tool_catalog.get(source_action, {})
@@ -3183,7 +3378,16 @@ def _compile_action_flow_contract(
         contract_valid = False
 
     if mode == "derived" and any(parameter not in bindings for parameter in parameters):
-        return None, [f"derived_destination_without_binding:{action_name}"]
+        missing = [
+            parameter
+            for parameter in parameters
+            if parameter not in bindings
+        ]
+        warnings.append(
+            "derived_destination_without_binding:"
+            f"{action_name}:{missing}"
+        )
+        return None, warnings
 
     data_sources: list[str] = []
     for raw_source in raw.get("data_sources", []):
@@ -4476,6 +4680,31 @@ def _validate_task_plan(
                 action.pop("flow_contract", None)
                 continue
             raw_flow_contract = copy.deepcopy(action.get("flow_contract"))
+            binding_normalization_warnings = (
+                _normalize_flow_binding_references(
+                    raw_flow_contract,
+                    source_registry=source_registry,
+                    action_name=str(action.get("name", "")),
+                )
+            )
+            warnings.extend(binding_normalization_warnings)
+            binding_reference_errors = [
+                message
+                for message in binding_normalization_warnings
+                if message.startswith(
+                    (
+                        "unknown_binding_source_ref:",
+                        "binding_source_ref_action_conflict:",
+                        "binding_selector_requires_known_source:",
+                        "binding_selector_requires_source_path:",
+                    )
+                )
+            ]
+            mark_action_invalid(
+                action,
+                step_id=str(step.get("id", "")),
+                reasons=binding_reference_errors,
+            )
             destination_grounding_errors = _destination_authorization_errors(
                 raw_flow_contract,
                 prompt_text=prompt_text,
