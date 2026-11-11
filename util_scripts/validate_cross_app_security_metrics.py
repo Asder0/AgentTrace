@@ -51,6 +51,17 @@ def _attack_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
         raise SystemExit(f"Unknown attack task IDs: {sorted(missing_tasks)}")
     if requested_tasks:
         targets = [target for target in targets if str(target["id"]) in requested_tasks]
+    requested_points = set(args.injection_point or [])
+    available_points = {
+        str(point["id"])
+        for target in targets
+        for point in target.get("injection_points", [])
+    }
+    missing_points = requested_points - available_points
+    if missing_points:
+        raise SystemExit(
+            f"Unknown injection point IDs: {sorted(missing_points)}"
+        )
 
     available_attack_types = [str(item["id"]) for item in server.AVAILABLE_ATTACK_TYPES]
     if args.profile == "smoke":
@@ -88,6 +99,14 @@ def _attack_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
         if not target_goals:
             continue
         points = list(target.get("injection_points", []))
+        if requested_points:
+            points = [
+                point
+                for point in points
+                if str(point["id"]) in requested_points
+            ]
+        if not points:
+            continue
         limit = default_injection_limit if args.injection_limit_per_task is None else args.injection_limit_per_task
         if limit > 0 and len(points) > limit:
             points = rng.sample(points, limit)
@@ -356,6 +375,12 @@ def main() -> None:
     parser.add_argument("--attack-type", action="append", default=[])
     parser.add_argument("--goal", action="append", default=[])
     parser.add_argument("--task", action="append", default=[])
+    parser.add_argument(
+        "--injection-point",
+        action="append",
+        default=[],
+        help="Restrict attacks to an exact injection point ID.",
+    )
     parser.add_argument("--normal-task", action="append", default=[])
     parser.add_argument(
         "--injection-limit-per-task",
