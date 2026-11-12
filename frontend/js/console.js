@@ -425,6 +425,14 @@ const CONSOLE = {
                         <!-- 动态渲染：每个 Ring 一行，含 Ring 开关 + 方法开关 -->
                     </div>
                 </div>
+                <div class="llm-config-row">
+                    <label class="llm-config-label">自动同意确认</label>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="autoConfirmationsToggle" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                    <span class="llm-config-help">默认自动处理普通审批和任务要求解析；关闭后逐节点人工决策</span>
+                </div>
             </div>
         `;
         
@@ -468,6 +476,15 @@ const CONSOLE = {
         if (defenseToggle) {
             defenseToggle.addEventListener('change', () => {
                 this._toggleDefense();
+            });
+        }
+
+        const autoConfirmationsToggle = document.getElementById(
+            'autoConfirmationsToggle'
+        );
+        if (autoConfirmationsToggle) {
+            autoConfirmationsToggle.addEventListener('change', () => {
+                this._updateAutoConfirmations();
             });
         }
 
@@ -543,6 +560,13 @@ const CONSOLE = {
             const statusText = document.getElementById('defenseStatusText');
             if (toggle) {
                 toggle.checked = config.enabled;
+            }
+            const autoConfirmationsToggle = document.getElementById(
+                'autoConfirmationsToggle'
+            );
+            if (autoConfirmationsToggle) {
+                autoConfirmationsToggle.checked =
+                    config.auto_confirmations !== false;
             }
             if (statusText) {
                 statusText.textContent = config.enabled ? '已启用' : '已关闭';
@@ -654,6 +678,35 @@ const CONSOLE = {
                     config.direct_injection_mode || config.user_anchor_mode || 'quarantine'
                 );
             } catch (e) { /* ignore */ }
+        }
+    },
+
+    async _updateAutoConfirmations() {
+        const toggle = document.getElementById('autoConfirmationsToggle');
+        if (!toggle) return;
+        const enabled = toggle.checked;
+        try {
+            const result = await API.setDefenseConfig(
+                null,
+                null,
+                null,
+                enabled
+            );
+            if (result && result.status === 'ok') {
+                this._showFeedback(
+                    enabled
+                        ? '已开启自动同意，普通审批和要求解析将自动处理'
+                        : '已关闭自动同意，后续确认节点需要人工决策',
+                    'info'
+                );
+            }
+        } catch (err) {
+            toggle.checked = !enabled;
+            console.error('设置自动同意策略失败:', err);
+            this._showFeedback(
+                `设置自动同意策略失败：${err.message}`,
+                'error'
+            );
         }
     },
 

@@ -256,7 +256,12 @@ const API = {
         } catch (err) { return null; }
     },
 
-    async setDefenseConfig(enabled, rings = null, directInjectionMode = null) {
+    async setDefenseConfig(
+        enabled,
+        rings = null,
+        directInjectionMode = null,
+        autoConfirmations = null
+    ) {
         try {
             const body = {};
             if (enabled !== null && enabled !== undefined) {
@@ -267,6 +272,9 @@ const API = {
             }
             if (directInjectionMode) {
                 body.direct_injection_mode = directInjectionMode;
+            }
+            if (autoConfirmations !== null && autoConfirmations !== undefined) {
+                body.auto_confirmations = autoConfirmations;
             }
             const response = await fetch(`${this.BASE_URL}/config/defense`, {
                 method: 'POST',

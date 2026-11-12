@@ -119,7 +119,11 @@ src/agentdojo/method/
 │   ├── data_need.py
 │   ├── data_access.py
 │   ├── access_plan.py
+│   ├── artifact_semantics.py
 │   ├── parameter_binding.py
+│   ├── plan_actions.py
+│   ├── plan_alignment.py
+│   ├── plan_identity.py
 │   ├── l2_chain.py
 │   ├── requirement_audit.py
 │   ├── outcome_audit.py
@@ -127,9 +131,12 @@ src/agentdojo/method/
 │   ├── architecture_metrics.py
 │   ├── security_metrics.py
 │   ├── risk_types.py
+│   ├── source_refs.py
 │   └── defense_config.py
 ├── tasks/
-│   └── cross_app.py
+│   ├── appworld_migrations.py
+│   ├── cross_app.py
+│   └── cross_app_evaluation.py
 └── visualization/
     ├── server.py
     ├── mock_apps.py
@@ -354,13 +361,14 @@ span、替换覆盖率以及未被命中跨度覆盖的原文字符数，并在�
 
 工具输出在进入后续推理前按字段分块扫描：
 
-- 扫描判定只依据 schema 类型：枚举、布尔、数值和日期时间字段记为 `not_applicable`；
-  普通自然语言字符串字段扫描，不根据文本是否“像攻击内容”做关键词判断
-- 工具可通过 `output_semantic_types` 明确把结构化资源标识符（例如 Slack 频道名）声明为
-  `identifier`；只有这种显式 schema 声明才跳过自然语言注入扫描
-- 数据敏感策略中明确标记为邮箱、电话、IBAN、金融金额、证件号、护照号或银行卡号的字段
-  属于结构化业务值，不进入自然语言注入扫描；控制器生成的 `[[SENSITIVE_REF:...]]`
-  和隔离占位符也不会被再次当作可注入文本
+- schema 中的枚举、布尔、数值、日期、标识符等机器字段记为 `not_applicable`；
+  工具也可以通过 `output_semantic_types` 把结构化资源标识符显式声明为 `identifier`
+- 数据敏感策略中标记为邮箱、电话、IBAN、金融金额、证件号、护照号、银行卡号、个人姓名、
+  地址、位置或日历值的字段属于结构化业务值，不进入自然语言注入扫描；控制器生成的
+  `[[SENSITIVE_REF:...]]` 和隔离占位符也不会被再次当作可注入文本
+- 其余字符串还必须通过通用自然语言资格判断：不含自然语言字母的纯符号值不扫描；
+  使用下划线或连字符连接的机器式标识符可以跳过扫描；包含 URL 或显式改写指令标记的
+  字符串会强制进入扫描。上述关键词只决定“是否交给检测器”，不替代模型的风险判定
 - 只替换命中的攻击 span；模型无法给出有效 span 时才隔离整个语义块
 - 原始输出、命中块和隔离字段保留在 trace
 - 数据源标记为可疑，并进入后续信息流标签
@@ -401,9 +409,10 @@ Ring 1 在 Ring 2 字段投影之后运行，因此只扫描即将进入 Agent �
 9. 用户批准后仅执行当前计划版本和当前参数；拒绝或异常只拒绝当前工具，Agent 可重新规划。
 
 测试任务还会生成不可变 `task_execution_contract`，固定任务必需 APP、副作用动作、
-effect、标准数据流边和允许的环境变化。规划器必须覆盖该契约；计划器、防御四环和指标
-统计彼此解耦。关闭 Ring 0～3 不自动关闭规划，因此正常任务的 `S0/S1` 对照可以单独
-控制防御层，而不会误把计划失效算作防御收益。
+effect、标准数据流边和允许的环境变化。规划器必须覆盖该契约。单独关闭某个 Ring 只会
+关闭对应运行时检查，不会修改 `planning_enabled`；全局调用
+`disable_defense_layer()` 时则会同时关闭 Ring 0～3、各环方法和 Planner，用于“完全关闭
+防御栈”的批处理基线。正常任务的 `S0/S1` 对照因此应明确记录是否采用完全关闭模式。
 
 模型最初形成的计划不一定完整。用户要求可能写在邮件或文件中，只有先读取数据才能知道更多
 条件。因此，每个 L2 动作执行前还会检查当前计划和已有证据是否覆盖了这些条件：
@@ -657,10 +666,12 @@ literal 仍会使计划无效。低计划置信度不会覆盖用户原句直接
 L2 人工确认页面按外发参数组织证据。每个参数展示最终值、生成方式、模型解释、
 模型自报置信度、语义支持状态、来源字段、原文片段和溯源引用。模型解释只作为
 人工判断的辅助证据，不构成授权，也不会降低上述确定性校验和人工确认门槛。
-普通动作确认默认自动同意，以便批量测试和正常用户任务不因重复确认中断；
-每次自动同意仍记录 `approval_source=automatic_default`。需要改变任务契约的
-“放宽要求/取消任务”选择不会被自动处理。交互页面可通过
-`POST /api/config/defense` 的 `auto_confirmations` 开关关闭自动同意。
+`auto_confirmations` 默认开启，主要服务于批量测试和交互演示。开启时，普通动作确认和
+任务要求解析节点都会自动处理：普通动作直接批准；要求解析节点若提供可放宽项，则自动
+放宽当前列出的全部可放宽要求，若没有可放宽项则自动取消任务。每次自动决策仍记录
+`approval_source=automatic_default` 和具体 decision。用户可以在前端防御设置中关闭
+“自动同意确认”，之后逐节点批准、拒绝、选择放宽要求或取消任务；也可以通过
+`POST /api/config/defense` 的 `auto_confirmations` 修改该策略。
 
 `provenance_state` 只有在所有必选来源和字段证据都有效时才是 `complete`；
 缺来源为 `incomplete`，参数解析错误为 `invalid`。
@@ -860,6 +871,8 @@ source_paths
 - Ring 3：`sensitive_egress`
 - Ring 0 模式：`advisory`、`quarantine`、`strict`
 - 规划开关：`planning_enabled`，与上述防御环正交控制
+- 自动确认：`auto_confirmations`，默认开启，覆盖普通审批和任务要求解析；前端可关闭并由用户决策
+- 完全关闭：`disable_defense_layer()` 同时关闭四个 Ring、各方法和 Planner
 
 可全局更新，也可通过单次调用 `options` 覆盖。
 
