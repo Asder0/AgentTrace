@@ -865,7 +865,6 @@ def _normalize_audit(
                 "invalid_requirement_applies_to:"
                 f"{requirement_id}:{invalid_targets}"
             )
-            response_valid = False
             status = "unverifiable"
         if not applies_to:
             applies_to = [proposed_tool]

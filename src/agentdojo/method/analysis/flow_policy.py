@@ -36,6 +36,7 @@ from .parameter_binding import (
     contains_placeholder,
     parameter_values_equal,
 )
+from .plan_progress import derive_completed_plan_steps
 from .risk_types import (
     BLOCK_CATEGORY_AUTHORIZATION,
     BLOCK_CATEGORY_CONFIDENTIALITY,
@@ -626,18 +627,17 @@ def check_task_scope(
                 tool_name=tool_name,
                 decision=DECISION_BLOCK,
             )
-        completed_steps = {
-            str(item)
-            for item in (
-                event.get("plan_usage", {}).get(
-                    "completed_steps",
-                    [],
+        completed_steps = derive_completed_plan_steps(
+            plan,
+            (
+                event.get("plan_usage")
+                if isinstance(
+                    event.get("plan_usage"),
+                    Mapping,
                 )
-                if isinstance(event.get("plan_usage"), Mapping)
-                else []
-            )
-            if item
-        }
+                else None
+            ),
+        )
         matched_step_id = str(event.get("plan_step_id", "")) or next(
             (str(step) for action, step in action_steps.items() if same_tool_name(tool_name, str(action))),
             "",

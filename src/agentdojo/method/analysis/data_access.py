@@ -7,6 +7,7 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from datetime import date, datetime
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -762,6 +763,11 @@ def value_occurs_in_origin(
     """Recognize an exact scalar extracted from an authorized text field."""
     if not isinstance(value, str) or not isinstance(origin.value, str):
         return False
+    if str(semantic_type).lower() in {"date", "datetime"}:
+        return _temporal_value_occurs_in_origin(
+            value,
+            origin.value,
+        )
     needle = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
     if len(needle) < 2:
         return False
@@ -783,6 +789,75 @@ def value_occurs_in_origin(
             haystack,
         )
     )
+
+
+def _temporal_value_occurs_in_origin(
+    value: str,
+    origin_text: str,
+) -> bool:
+    """Match an ISO date against ISO or natural-language source dates."""
+    raw_value = str(value).strip()
+    try:
+        target = datetime.fromisoformat(
+            raw_value.replace("Z", "+00:00")
+        )
+    except ValueError:
+        try:
+            target = datetime.combine(
+                date.fromisoformat(raw_value[:10]),
+                datetime.min.time(),
+            )
+        except ValueError:
+            return False
+    source = unicodedata.normalize("NFKC", origin_text)
+    years = {
+        int(match)
+        for match in re.findall(r"\b(?:19|20)\d{2}\b", source)
+    }
+    if years and target.year not in years:
+        return False
+    for match in re.finditer(
+        r"\b(?:19|20)\d{2}-\d{1,2}-\d{1,2}\b",
+        source,
+    ):
+        try:
+            parsed = date.fromisoformat(match.group(0))
+        except ValueError:
+            continue
+        if parsed == target.date():
+            return True
+    month_numbers = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    for match in re.finditer(
+        r"\b("
+        r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+        r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
+        r"Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+        r")\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b",
+        source,
+        flags=re.IGNORECASE,
+    ):
+        month = month_numbers[
+            match.group(1)[:3].casefold()
+        ]
+        if (
+            month == target.month
+            and int(match.group(2)) == target.day
+        ):
+            return True
+    return False
 
 
 def resolve_resource_parameter_resolutions(
@@ -943,6 +1018,8 @@ def resolve_resource_parameter_resolutions(
             )
 
         origins: list[ValueOrigin] = []
+        all_required_source_ids: set[str] = set()
+        matched_required_source_ids: set[str] = set()
         unresolved_value_count = 0
         ambiguous_value_count = 0
         ambiguous_source_instance_count = 0
@@ -1022,6 +1099,9 @@ def resolve_resource_parameter_resolutions(
                 )
                 if str(item).strip()
             }
+            all_required_source_ids.update(
+                required_source_ids
+            )
             required_identities = {
                 (
                     str(source.get("app", "")).lower(),
@@ -1079,6 +1159,13 @@ def resolve_resource_parameter_resolutions(
                 all_value_origins.extend(
                     matched_required_origins
                 )
+                for required_origin in matched_required_origins:
+                    source_ids, _ambiguous = source_ids_for_origin(
+                        required_origin
+                    )
+                    matched_required_source_ids.update(
+                        source_ids
+                    )
             if not value_origins:
                 unresolved_value_count += 1
             origins.extend(value_origins)
@@ -1177,6 +1264,13 @@ def resolve_resource_parameter_resolutions(
                     for origin in origins
                 ],
                 "used_source_ids": matching_source_ids_list,
+                "matched_required_sources": sorted(
+                    matched_required_source_ids
+                ),
+                "unmatched_required_sources": sorted(
+                    all_required_source_ids
+                    - matched_required_source_ids
+                ),
                 "source_paths": sorted({normalize_resource_source_path(origin.source_path) for origin in origins}),
                 "explanation": ("控制器通过数据流索引确认资源参数来自已授权的工具输出字段。"),
                 "confidence": 1.0,
@@ -1500,6 +1594,21 @@ def validate_resource_access(
                     group.get("sources", []),
                 )
             }
+            # During normal execution the plan synchronizer replaces
+            # non-origin planner hints with the observed authorized source.
+            # This fallback keeps direct contract validation from treating
+            # such a hint as a hard requirement; explicit source instances
+            # and groups remain mandatory.
+            unmatched_without_explicit_ref = {
+                str(source_id)
+                for source_id in resolution.get(
+                    "unmatched_required_sources",
+                    [],
+                )
+                if str(source_id)
+                and str(source_id) not in required_source_refs
+            }
+            required = required - unmatched_without_explicit_ref
             missing_required = {
                 source_id
                 for source_id in required

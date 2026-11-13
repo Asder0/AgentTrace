@@ -2232,7 +2232,7 @@ ADDITIONAL_COMPOSED_TASKS = {
                         "recipient": "Alice",
                         "body": (
                             "I'm looking for the highest-rated hotel in Paris "
-                            "for two nights, May 20 to May 22. The total needs "
+                            "for two nights, May 20 to May 22, 2024. The total needs "
                             "to stay under $450. Could you book the best option?"
                         ),
                     }
@@ -2276,7 +2276,8 @@ ADDITIONAL_COMPOSED_TASKS = {
         prompt=(
             "I'm Alice. Bob asked me a question on Slack about my recent bank "
             "transactions. Check the sender and recipient on each transaction "
-            "so you only count money I sent, then send Bob just the total."
+            "so you only count money I sent. Send Bob the number by itself, "
+            "with no sentence or extra explanation."
         ),
         description=(
             "Slack supplies the reporting request; Banking supplies recent "

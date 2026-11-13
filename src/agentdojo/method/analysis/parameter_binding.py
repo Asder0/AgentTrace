@@ -966,12 +966,12 @@ def resolve_parameter_bindings(
         else set()
     )
 
-    def control_binding_succeeded(
+    def successful_control_event(
         source_id: str,
-    ) -> bool:
+    ) -> Mapping[str, Any] | None:
         source = source_bindings.get(source_id)
         if not isinstance(source, Mapping):
-            return False
+            return None
         source_app = str(
             source.get("app", "") or ""
         ).lower()
@@ -1013,8 +1013,13 @@ def resolve_parameter_bindings(
                 and event_step != producer_step
             ):
                 continue
-            return True
-        return False
+            return event
+        return None
+
+    def control_binding_succeeded(
+        source_id: str,
+    ) -> bool:
+        return successful_control_event(source_id) is not None
 
     def required_ref_is_successful_control(
         required: Mapping[str, str],
@@ -1623,8 +1628,31 @@ def resolve_parameter_bindings(
                     ): origin
                     for origin in deterministic_origins
                 }
+                origin = None
                 if len(unique_origins) == 1:
                     origin = next(iter(unique_origins.values()))
+                elif unique_origins:
+                    candidate_values = {
+                        canonicalize_resource_value(
+                            candidate.value,
+                            semantic_type,
+                        )
+                        for candidate in unique_origins.values()
+                    }
+                    if len(candidate_values) == 1:
+                        # Multiple records can repeat the same selector value
+                        # (for example one sender with several messages). The
+                        # concrete identity is unambiguous even though its
+                        # evidence instance is not.
+                        origin = sorted(
+                            unique_origins.values(),
+                            key=lambda candidate: (
+                                candidate.source_activity_id,
+                                candidate.entity_id,
+                                candidate.source_path,
+                            ),
+                        )[0]
+                if origin is not None:
                     model_result = {
                         "value": copy.deepcopy(actual),
                         "derivation_type": (
@@ -1793,7 +1821,42 @@ def resolve_parameter_bindings(
                     invalid.extend(ref_invalid)
                     raw_path = str(raw_item.get("source_path", "")).strip()
                     path = normalize_source_path(raw_path)
-                    candidates = [origin for origin in candidates if _path_matches(origin.source_path, path)]
+                    entity_candidates = list(candidates)
+                    candidates = [
+                        origin
+                        for origin in entity_candidates
+                        if _path_matches(origin.source_path, path)
+                    ]
+                    root_path_fallback = False
+                    preliminary_extracted_text = str(
+                        raw_item.get("extracted_text")
+                        or raw_item.get("quote", "")
+                    )
+                    if not candidates and raw_path:
+                        # Some APP tools return a projected textual view
+                        # rather than structured records.  The root origin
+                        # still represents that authorized projected view;
+                        # retain the declared leaf path as its schema path
+                        # only when the reported evidence is present in the
+                        # value itself.
+                        root_candidates = [
+                            origin
+                            for origin in entity_candidates
+                            if normalize_source_path(
+                                origin.source_path
+                            )
+                            in {"$", "$[*]"}
+                        ]
+                        if preliminary_extracted_text:
+                            root_candidates = [
+                                origin
+                                for origin in root_candidates
+                                if preliminary_extracted_text
+                                in _origin_text(origin)
+                            ]
+                        if len(root_candidates) == 1:
+                            candidates = root_candidates
+                            root_path_fallback = True
                     if raw_path:
                         exact_path_candidates = [origin for origin in candidates if origin.source_path == raw_path]
                         if exact_path_candidates:
@@ -1871,9 +1934,58 @@ def resolve_parameter_bindings(
                     if origin is None and len(candidates) == 1:
                         origin = candidates[0]
                         start = end = None
+                    if origin is not None and root_path_fallback:
+                        origin = replace(
+                            origin,
+                            source_path=path,
+                        )
                     if extracted_text and not quote_located:
                         extracted_text = ""
                         start = end = None
+                    if (
+                        origin is None
+                        and natural_language_validation
+                        and candidates
+                    ):
+                        # Presentation text may summarize several records.
+                        # The generated sentence is not required to be a
+                        # verbatim substring of one record, but every cited
+                        # origin must still match the authorized source,
+                        # entity, action and path.
+                        for candidate in candidates:
+                            if candidate not in matched:
+                                matched.append(candidate)
+                            source_ids = source_ids_for_origin(
+                                candidate
+                            )
+                            evidence.append(
+                                {
+                                    "app": candidate.app,
+                                    "entity": candidate.entity,
+                                    "entity_id": (
+                                        candidate.entity_id
+                                    ),
+                                    "source_action": (
+                                        candidate.source_tool
+                                    ),
+                                    "source_path": (
+                                        candidate.source_path
+                                    ),
+                                    "start": None,
+                                    "end": None,
+                                    "extracted_text": "",
+                                    **(
+                                        {
+                                            "source_id": (
+                                                source_ids[0]
+                                            )
+                                        }
+                                        if source_ids
+                                        else {}
+                                    ),
+                                }
+                            )
+                        continue
                     if origin is None:
                         errors.append(
                             f"derived_source_evidence_ambiguous:{parameter}:{path}"
@@ -2211,6 +2323,239 @@ def resolve_parameter_bindings(
                                 **({"source_id": source_ids[0]} if source_ids else {}),
                             }
                         )
+            allowed_binding_refs = [
+                item
+                for item in raw_binding.get(
+                    "allowed_source_refs",
+                    [],
+                )
+                if isinstance(item, Mapping)
+            ]
+
+            def origin_is_binding_source(
+                origin: ValueOrigin,
+            ) -> bool:
+                return any(
+                    origin.app.lower()
+                    == str(allowed.get("app", "")).lower()
+                    and canonical_entity_name(
+                        origin.app,
+                        origin.entity,
+                    )
+                    == canonical_entity_name(
+                        str(allowed.get("app", "")),
+                        str(allowed.get("entity", "")),
+                    )
+                    and tool_identity(
+                        origin.source_tool,
+                        origin.app,
+                    )
+                    == tool_identity(
+                        str(
+                            allowed.get(
+                                "source_action",
+                                "",
+                            )
+                        ),
+                        str(allowed.get("app", "")),
+                    )
+                    and (
+                        not str(
+                            allowed.get(
+                                "source_path",
+                                "",
+                            )
+                        ).strip()
+                        or _path_matches(
+                            origin.source_path,
+                            str(
+                                allowed.get(
+                                    "source_path",
+                                    "",
+                                )
+                            ),
+                        )
+                    )
+                    for allowed in allowed_binding_refs
+                )
+
+            if allowed_binding_refs and matched:
+                allowed_matched = [
+                    origin
+                    for origin in matched
+                    if origin_is_binding_source(origin)
+                ]
+                if allowed_matched:
+                    dropped = [
+                        origin
+                        for origin in matched
+                        if origin not in allowed_matched
+                    ]
+                    if dropped:
+                        warnings.extend(
+                            "model_source_ref_not_allowed:"
+                            f"{parameter}:{origin.app}:"
+                            f"{origin.entity}:"
+                            f"{origin.source_tool}:"
+                            f"{origin.source_path}"
+                            for origin in dropped
+                        )
+                    matched = allowed_matched
+                    allowed_keys = {
+                        (
+                            origin.app,
+                            origin.entity,
+                            origin.entity_id,
+                            origin.source_tool,
+                            normalize_source_path(
+                                origin.source_path
+                            ),
+                        )
+                        for origin in matched
+                    }
+                    evidence = [
+                        item
+                        for item in evidence
+                        if (
+                            str(item.get("app", "")),
+                            str(item.get("entity", "")),
+                            str(item.get("entity_id", "")),
+                            str(
+                                item.get(
+                                    "source_action",
+                                    "",
+                                )
+                            ),
+                            normalize_source_path(
+                                str(
+                                    item.get(
+                                        "source_path",
+                                        "",
+                                    )
+                                )
+                            ),
+                        )
+                        in allowed_keys
+                    ]
+                else:
+                    # A model-supplied source outside the parameter's
+                    # allowed paths cannot authorize presentation content.
+                    # Clearing the match allows the explicit successful
+                    # control-source fallback below, but never accepts the
+                    # unauthorized origin itself.
+                    matched = []
+                    evidence = []
+            if natural_language_validation and not matched:
+                for required in raw_binding.get(
+                    "required_source_refs",
+                    [],
+                ):
+                    if not isinstance(required, Mapping):
+                        continue
+                    source_id = str(
+                        required.get("source_id")
+                        or required.get("id")
+                        or ""
+                    )
+                    source_ref = source_bindings.get(source_id)
+                    event = successful_control_event(source_id)
+                    if not source_id or not isinstance(
+                        source_ref,
+                        Mapping,
+                    ) or event is None:
+                        continue
+                    source_app = str(
+                        source_ref.get("app", "") or ""
+                    ).lower()
+                    if (
+                        source_app
+                        != str(
+                            required.get("app", "") or ""
+                        ).lower()
+                        or canonical_entity_name(
+                            source_app,
+                            str(
+                                source_ref.get("entity", "")
+                                or ""
+                            ),
+                        )
+                        != canonical_entity_name(
+                            source_app,
+                            str(
+                                required.get("entity", "")
+                                or ""
+                            ),
+                        )
+                        or tool_identity(
+                            str(
+                                source_ref.get("source_action")
+                                or source_ref.get("source_tool")
+                                or ""
+                            ),
+                            source_app,
+                        )
+                        != tool_identity(
+                            str(
+                                required.get("source_action")
+                                or ""
+                            ),
+                            source_app,
+                        )
+                    ):
+                        continue
+                    source_path = normalize_source_path(
+                        str(
+                            required.get("source_path", "")
+                            or "$"
+                        )
+                    )
+                    control_origin = ValueOrigin(
+                        app=source_app,
+                        entity=canonical_entity_name(
+                            source_app,
+                            str(
+                                source_ref.get("entity", "")
+                                or ""
+                            ),
+                        ),
+                        level="confidential",
+                        source_tool=str(
+                            source_ref.get("source_action")
+                            or source_ref.get("source_tool")
+                            or ""
+                        ),
+                        source_activity_id=str(
+                            event.get("activity_id", "")
+                            or ""
+                        ),
+                        entity_id=str(
+                            event.get("source_entity_id", "")
+                            or source_id
+                        ),
+                        source_path=source_path,
+                        value_key="",
+                        value="",
+                    )
+                    matched.append(control_origin)
+                    evidence.append(
+                        {
+                            "source_id": source_id,
+                            "app": control_origin.app,
+                            "entity": control_origin.entity,
+                            "entity_id": (
+                                control_origin.entity_id
+                            ),
+                            "source_action": (
+                                control_origin.source_tool
+                            ),
+                            "source_path": (
+                                control_origin.source_path
+                            ),
+                            "start": None,
+                            "end": None,
+                            "extracted_text": "",
+                        }
+                    )
             if not evidence or not matched:
                 errors.append(f"derived_source_evidence_missing:{parameter}")
                 continue
@@ -2258,7 +2603,6 @@ def resolve_parameter_bindings(
 
             if (
                 allowed_refs
-                and not natural_language_validation
                 and any(
                     not source_is_allowed(origin)
                     and (
@@ -2729,6 +3073,84 @@ def resolve_parameter_bindings(
             def required_source_present(
                 required: Mapping[str, str],
             ) -> bool:
+                if natural_language_validation:
+                    required_source_id = str(
+                        required.get("source_id", "") or ""
+                    )
+                    for source_id, source_ref in (
+                        source_bindings.items()
+                    ):
+                        if (
+                            required_source_id
+                            and str(source_id)
+                            != required_source_id
+                        ):
+                            continue
+                        source_app = str(
+                            source_ref.get("app", "") or ""
+                        ).lower()
+                        if (
+                            source_app
+                            != str(
+                                required.get("app", "") or ""
+                            ).lower()
+                            or canonical_entity_name(
+                                source_app,
+                                str(
+                                    source_ref.get(
+                                        "entity",
+                                        "",
+                                    )
+                                    or ""
+                                ),
+                            )
+                            != canonical_entity_name(
+                                source_app,
+                                str(
+                                    required.get(
+                                        "entity",
+                                        "",
+                                    )
+                                    or ""
+                                ),
+                            )
+                            or tool_identity(
+                                str(
+                                    source_ref.get(
+                                        "source_action",
+                                        "",
+                                    )
+                                    or source_ref.get(
+                                        "source_tool",
+                                        "",
+                                    )
+                                    or ""
+                                ),
+                                source_app,
+                            )
+                            != tool_identity(
+                                str(
+                                    required.get(
+                                        "source_action",
+                                        "",
+                                    )
+                                    or ""
+                                ),
+                                source_app,
+                            )
+                        ):
+                            continue
+                        if control_binding_succeeded(
+                            str(source_id)
+                        ):
+                            # Presentation wording is generated from the
+                            # successful action as control evidence.  Its
+                            # output may legitimately be withheld behind an
+                            # opaque controller reference, so requiring a
+                            # visible payload span would make the task
+                            # unsatisfiable. Non-presentation parameters keep
+                            # the stricter visible-source requirement below.
+                            return True
                 directly_present = any(
                     source_refs_match(
                         {

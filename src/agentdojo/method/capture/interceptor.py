@@ -372,6 +372,30 @@ def _message_content_text(message: Any) -> str:
     return _content_to_text(message.get("content", ""))
 
 
+def _response_is_removal(
+    candidate: str,
+    source: str,
+) -> bool:
+    """Return whether candidate only removes text from source."""
+    candidate_text = " ".join(
+        str(candidate or "")
+        .strip("*_`# \t\r\n")
+        .casefold()
+        .split()
+    )
+    source_text = " ".join(
+        str(source or "").casefold().split()
+    )
+    return bool(
+        candidate_text
+        and candidate_text != source_text
+        and re.search(
+            rf"(?<!\w){re.escape(candidate_text)}(?!\w)",
+            source_text,
+        )
+    )
+
+
 def _plan_step_for_action(
     plan: Any,
     action_name: str,
@@ -586,44 +610,11 @@ def _refresh_completed_plan_steps(
             "error": error or "",
         }
     )
-    raw_steps = plan.get("steps", [])
-    steps = raw_steps if isinstance(raw_steps, list) else []
-    step = next(
-        (item for item in steps if isinstance(item, dict) and str(item.get("id")) == step_id),
-        None,
+    from ..analysis.plan_progress import (
+        reconcile_completed_plan_steps,
     )
-    if step is None:
-        return
-    required_actions = [
-        str(action.get("name"))
-        for action in step.get("actions", [])
-        if isinstance(action, dict)
-        and action.get("name")
-        and action.get("necessity") not in {"fallback", "optional"}
-    ]
-    evidenced_actions = {
-        str(item.get("action"))
-        for item in action_results
-        if str(item.get("step_id")) == step_id and item.get("status") == "success" and item.get("has_result_evidence")
-    }
 
-    def evidenced(required_action: str) -> bool:
-        return any(
-            candidate == required_action
-            or (
-                "__" not in candidate
-                and "__" not in required_action
-                and base_tool_name(candidate) == base_tool_name(required_action)
-            )
-            for candidate in evidenced_actions
-        )
-
-    completed = ctx.plan_usage.setdefault("completed_steps", [])
-    if required_actions and all(evidenced(action) for action in required_actions):
-        if step_id not in completed:
-            completed.append(step_id)
-    elif step_id in completed:
-        completed.remove(step_id)
+    reconcile_completed_plan_steps(plan, ctx.plan_usage)
 
 
 def _record_successful_planned_action(
@@ -2460,13 +2451,36 @@ def capture_llm_interaction(func: Callable):
                                 "证据校验的表述，已停止展示原文。请查看"
                                 "完成审计和溯源图谱。"
                             )
-                        corrected_audit = audit_final_response_claims(
-                            user_prompt=effective_prompt,
-                            plan=ctx.task_data_plan,
-                            events=ctx.events,
-                            final_response=corrected_response,
-                            provider=ctx.task_data_plan_provider,
-                        )
+                        if _response_is_removal(
+                            corrected_response,
+                            response_text,
+                        ):
+                            corrected_audit = {
+                                "applicable": True,
+                                "assessed": True,
+                                "safe": True,
+                                "unsupported_claims": [],
+                                "coverage_gaps": [],
+                                "corrected_response": (
+                                    corrected_response
+                                ),
+                                "summary": (
+                                    "The correction only removes draft "
+                                    "content and introduces no new claims."
+                                ),
+                                "confidence": 1.0,
+                                "warnings": [
+                                    "final_response_correction_validated_by_removal"
+                                ],
+                            }
+                        else:
+                            corrected_audit = audit_final_response_claims(
+                                user_prompt=effective_prompt,
+                                plan=ctx.task_data_plan,
+                                events=ctx.events,
+                                final_response=corrected_response,
+                                provider=ctx.task_data_plan_provider,
+                            )
                         ctx.plan_usage["final_response_correction_audit"] = corrected_audit
                         if corrected_audit.get("applicable") and not corrected_audit.get("safe"):
                             corrected_response = (
@@ -3401,6 +3415,15 @@ def capture_tool_call(func: Callable):
             kwargs,
             app_domain,
         )
+        if isinstance(ctx.task_data_plan, Mapping):
+            from ..analysis.plan_progress import (
+                reconcile_completed_plan_steps,
+            )
+
+            reconcile_completed_plan_steps(
+                ctx.task_data_plan,
+                ctx.plan_usage,
+            )
 
         event_record = {
             "timestamp": start_time,

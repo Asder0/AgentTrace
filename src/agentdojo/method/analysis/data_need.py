@@ -502,6 +502,11 @@ Rules:
   opaque_fields and hidden_fields empty so the result is withheld. Do not use
   wildcards for the whole object when more specific fields are available.
   Unlisted fields are withheld before Agent reasoning.
+- When a calculation must distinguish outgoing from incoming money,
+  messages, events or ownership, include every field needed to establish that
+  direction in visible_fields (normally both sender and recipient, plus the
+  filter amount or date). Never hide the field that determines the requested
+  direction merely because another field already identifies the target.
 - max_exposure_level is the highest field sensitivity allowed to enter the
   Agent context for that read. Use public or internal by default. Set
   confidential or secret only when the user's instruction explicitly requires
@@ -519,6 +524,12 @@ Rules:
   exact source_path that produces the selector. Omit resource_parameters only
   when the tool has no resource selector or all returned records are explicitly
   required by the user's task.
+- Read actions can also have search, filter or control parameters such as
+  query, sender, subject or date. When one of those values is discovered from
+  tool output, declare it as a derived resource parameter with the exact
+  allowed_source_refs, required_sources and source_path. Use literal
+  allowed_values only when the trusted user instruction supplies the value.
+  Never leave a data-derived read filter silently unbound.
 - Every non-read action whose tool metadata declares resource_fields must
   declare resource_access.resource_parameters for each declared field. This
   includes writes, deletions, privilege changes and resource-addressed egress.
@@ -6638,9 +6649,21 @@ def synchronize_resource_binding_sources(
             for source_id in required_ids
             if source_id in observed_ids
         ]
-        if narrowed_ids == required_ids:
-            continue
         if not narrowed_ids:
+            explicit_required = bool(
+                raw_binding.get("required_source_refs")
+                or raw_binding.get("required_source_groups")
+            )
+            if explicit_required:
+                # Explicit source instances and groups are hard constraints.
+                # A mismatch must remain visible to policy validation.
+                continue
+            # Planner-declared source IDs may describe upstream constraints
+            # instead of the actual origin of a resource parameter.  Once
+            # deterministic provenance resolves the value from an authorized
+            # allowed source, bind the requirement to those observed IDs.
+            narrowed_ids = sorted(observed_ids)
+        if narrowed_ids == required_ids:
             continue
         raw_binding["required_sources"] = narrowed_ids
         required_refs = [
@@ -6678,7 +6701,8 @@ def synchronize_resource_binding_sources(
         "trigger": "deterministic_parameter_provenance",
         "reason": (
             "Resolved parameter values narrowed required source "
-            "instances without expanding the allowed source set."
+            "instances to their observed authorized origins without "
+            "expanding the allowed source set."
         ),
     }
     updated.setdefault("runtime_updates", []).append(update)
@@ -7277,10 +7301,20 @@ Rules:
   without visible_fields when its values only need to flow onward.
   When a resource selector such as file_id, file_path, event_id, channel, user
   or url is required, declare its literal or derived source authorization.
+- When a calculation must distinguish outgoing from incoming money,
+  messages, events or ownership, request every field needed for that
+  direction (normally sender and recipient) together with amount and date.
+  Do not omit the direction-defining field from a read intended for
+  calculation.
 - Every runtime read whose tool metadata declares resource_fields
   must include the corresponding data_access.resource_parameters or
   resource_access.resource_parameters contract. Runtime discovery cannot
   expand an authorized resource range or infer it from the concrete argument.
+- For runtime read search/filter/control parameters such as query, sender,
+  subject or date, declare a literal rule only when the trusted prompt supplies
+  the value. If the Agent derives it from an earlier read, add the exact
+  allowed_source_refs, required_sources and source_path. Do not admit an
+  unbound data-derived read filter.
 - For non-read actions, put output visibility in data_access.visible_fields and
   resource selection in resource_access.resource_parameters. When the returned
   entity is not needed, leave visible_fields, opaque_fields and hidden_fields
