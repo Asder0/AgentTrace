@@ -2138,6 +2138,26 @@ def evaluate_plan_execution_conformance(
     ] = defaultdict(set)
     contract_flow_adjacency: dict[str, set[str]] = defaultdict(set)
     if isinstance(execution_contract, Mapping):
+        for required_step in execution_contract.get(
+            "required_steps",
+            [],
+        ) or []:
+            if not isinstance(required_step, Mapping):
+                continue
+            target_step = str(
+                required_step.get("id", "") or ""
+            )
+            if not target_step:
+                continue
+            for source_step in required_step.get(
+                "depends_on",
+                [],
+            ) or []:
+                source_step = str(source_step or "")
+                if source_step:
+                    contract_flow_adjacency[
+                        source_step
+                    ].add(target_step)
         for expected in execution_contract.get(
             "expected_flow_edges",
             [],
@@ -2880,6 +2900,70 @@ def evaluate_plan_execution_conformance(
             not in satisfied_any_groups
         )
     ]
+    advisory_verification_requirements = [
+        requirement
+        for requirement in effective_missing_required
+        if (
+            str(requirement.get("edge_kind", ""))
+            == "verification"
+            and str(
+                requirement.get("target_parameter", "")
+            )
+            == "__verification__"
+        )
+    ]
+    advisory_ambiguous_verification_requirements = [
+        requirement
+        for requirement in ambiguous_source_instances
+        if (
+            str(requirement.get("edge_kind", ""))
+            == "verification"
+            and str(
+                requirement.get("target_parameter", "")
+            )
+            == "__verification__"
+        )
+    ]
+    advisory_verification_requirement_keys = {
+        (
+            requirement["plan_revision"],
+            requirement["target_step_id"],
+            requirement["target_action"],
+            requirement["target_parameter"],
+            requirement["required_group"],
+            _plan_ref_key(requirement["source_ref"]),
+        )
+        for requirement in (
+            advisory_verification_requirements
+            + advisory_ambiguous_verification_requirements
+        )
+    }
+    certifying_missing_required = [
+        requirement
+        for requirement in effective_missing_required
+        if (
+            requirement["plan_revision"],
+            requirement["target_step_id"],
+            requirement["target_action"],
+            requirement["target_parameter"],
+            requirement["required_group"],
+            _plan_ref_key(requirement["source_ref"]),
+        )
+        not in advisory_verification_requirement_keys
+    ]
+    certifying_ambiguous_source_instances = [
+        requirement
+        for requirement in ambiguous_source_instances
+        if (
+            requirement["plan_revision"],
+            requirement["target_step_id"],
+            requirement["target_action"],
+            requirement["target_parameter"],
+            requirement["required_group"],
+            _plan_ref_key(requirement["source_ref"]),
+        )
+        not in advisory_verification_requirement_keys
+    ]
 
     unexpected_edges: list[dict[str, Any]] = []
     allowed_parameter_pairs: set[tuple[int, str, str, str]] = set()
@@ -3085,9 +3169,9 @@ def evaluate_plan_execution_conformance(
     )
     execution_conformant = bool(
         available
-        and not effective_missing_required
+        and not certifying_missing_required
         and not unexpected_edges
-        and not ambiguous_source_instances
+        and not certifying_ambiguous_source_instances
         and not unplanned_actions
         and not plan_binding_issues
         and (
@@ -3178,6 +3262,15 @@ def evaluate_plan_execution_conformance(
         "required_edges": len(required_edges),
         "matched_required_edges": len(matched_required),
         "missing_required_edges": effective_missing_required,
+        "certifying_missing_required_edges": (
+            certifying_missing_required
+        ),
+        "advisory_verification_edges": (
+            advisory_verification_requirements
+        ),
+        "advisory_ambiguous_verification_edges": (
+            advisory_ambiguous_verification_requirements
+        ),
         "ambiguous_source_instances": ambiguous_source_instances,
         "required_source_groups": group_records,
         "actual_edges": len(actual_edge_list),

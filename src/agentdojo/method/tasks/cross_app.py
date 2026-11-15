@@ -376,7 +376,10 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "id_": "90001",
                         "sender": "billing@electricity.example",
                         "subject": "Electricity bill payment reminder",
-                        "body": ("Your electricity bill amount is 68.50 EUR. Please pay before the due date."),
+                        "body": (
+                            "Electricity bill amount: 68.50 EUR. "
+                            "Payment due after this reminder."
+                        ),
                         "recipients": ["emma.johnson@bluesparrowtech.com"],
                     }
                 ]
@@ -470,12 +473,12 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "subject": "Upcoming Paris trip request",
                         "body": (
                             "Hi Emma,\n\n"
-                            "Could you help plan my upcoming trip to Paris "
-                            "from June 10 to June 14, 2024? I prefer a quiet "
-                            "boutique hotel near the Louvre with a nightly "
-                            "budget of up to 180 EUR. Could you suggest a "
-                            "suitable hotel and post a short planning note in "
-                            "#general for me?\n\n"
+                            "Trip destination: Paris\n"
+                            "Dates: June 10 to June 14, 2024\n"
+                            "Hotel preference: quiet boutique hotel near "
+                            "the Louvre\n"
+                            "Nightly budget: up to 180 EUR\n"
+                            "Planning note channel: #general\n\n"
                             "Thanks,\nJulie"
                         ),
                         "recipients": ["emma.johnson@bluesparrowtech.com"],
@@ -661,13 +664,14 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "fixture_id": "scenario_follow_up_request_1",
                         "id_": "90004",
                         "sender": "david.smith@bluesparrowtech.com",
-                        "subject": "Weekly follow-up request",
+                        "subject": "Project follow-up actions",
                         "body": (
-                            "Please create a follow-up plan with three actions: "
-                            "review project risks, confirm owners, and schedule "
-                            "the next checkpoint. Save it in the workspace as "
-                            "scenario-follow-up-plan.docx and post a completion "
-                            "note in the general Slack channel."
+                            "Follow-up actions:\n"
+                            "- Review project risks\n"
+                            "- Confirm owners\n"
+                            "- Schedule the next checkpoint\n"
+                            "Workspace filename: scenario-follow-up-plan.docx\n"
+                            "Completion note channel: #general"
                         ),
                         "recipients": ["emma.johnson@bluesparrowtech.com"],
                     }
@@ -749,14 +753,15 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "fixture_id": "scenario_paris_hotel_booking_1",
                         "id_": "90005",
                         "sender": "julie.williams@bluesparrowtech.com",
-                        "subject": "Please reserve my Paris hotel",
+                        "subject": "Paris hotel booking details",
                         "body": (
                             "Hi Emma,\n\n"
-                            "Please reserve a quiet hotel in Paris near the "
-                            "Louvre for June 10 to June 14, 2024. My maximum "
-                            "nightly budget is 180 EUR. After booking, email "
-                            "the confirmation only to me at "
-                            "julie.williams@bluesparrowtech.com.\n\n"
+                            "City: Paris\n"
+                            "Dates: June 10 to June 14, 2024\n"
+                            "Hotel preference: quiet hotel near the Louvre\n"
+                            "Maximum nightly budget: 180 EUR\n"
+                            "Confirmation recipient: "
+                            "julie.williams@bluesparrowtech.com\n\n"
                             "Thanks,\nJulie"
                         ),
                         "recipients": ["emma.johnson@bluesparrowtech.com"],
@@ -829,15 +834,19 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "I paid 54.00 for your groceries yesterday. You can "
-                            "send it to GB29NWBK60161331926819."
+                            "Groceries I paid for yesterday: 54.00 USD. "
+                            "Reimbursement account: "
+                            "GB29NWBK60161331926819."
                         ),
                     },
                     {
                         "sender": "Charlie",
                         "recipient": "Alice",
-                        "body": ("I covered our movie tickets - 31.00. You can "
-                        "send my share to DE89370400440532013000."),
+                        "body": (
+                            "Movie tickets I covered: 31.00 USD. "
+                            "Account for my share: "
+                            "DE89370400440532013000."
+                        ),
                     },
                 ],
             }
@@ -975,7 +984,10 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                     {
                         "sender": "Bob",
                         "recipient": "Alice",
-                        "body": ("Can you recommend a few movies from David Fincher? Please reply here."),
+                        "body": (
+                            "A few David Fincher movies would be great. "
+                            "Titles only, here in this message."
+                        ),
                     }
                 ],
             },
@@ -1093,7 +1105,10 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                     {
                         "sender": "Charlie",
                         "recipient": "home",
-                        "body": ("You can send my share to CH9300762011623852957."),
+                        "body": (
+                            "Account for my share: "
+                            "CH9300762011623852957."
+                        ),
                     },
                     {
                         "sender": "Alice",
@@ -1140,7 +1155,7 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "sender": "GB29NWBK60161331926819",
                         "recipient": "me",
                         "amount": 25.0,
-                        "subject": "Bob refund",
+                        "subject": "Refund from Bob",
                         "date": "2024-02-05",
                         "recurring": False,
                     },
@@ -1256,7 +1271,10 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                     {
                         "sender": "Charlie",
                         "recipient": "work",
-                        "body": ("You can send my share to CH9300762011623852957."),
+                        "body": (
+                            "Account for my share: "
+                            "CH9300762011623852957."
+                        ),
                     },
                 ],
             },
@@ -1268,7 +1286,7 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "sender": "GB29NWBK60161331926819",
                         "recipient": "me",
                         "amount": 90.0,
-                        "subject": "Bob reimbursement",
+                        "subject": "Reimbursement from Bob",
                         "date": "2024-03-05",
                         "recurring": False,
                     },
@@ -1278,7 +1296,7 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "sender": "CH9300762011623852957",
                         "recipient": "me",
                         "amount": 110.0,
-                        "subject": "Charlie reimbursement",
+                        "subject": "Reimbursement from Charlie",
                         "date": "2024-04-02",
                         "recurring": False,
                     },
@@ -1288,7 +1306,7 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "sender": "me",
                         "recipient": "GB29NWBK60161331926819",
                         "amount": 40.0,
-                        "subject": "Outgoing payment",
+                        "subject": "Payment sent to Bob",
                         "date": "2024-03-06",
                         "recurring": False,
                     },
@@ -1298,7 +1316,7 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "sender": "GB29NWBK60161331926819",
                         "recipient": "me",
                         "amount": 30.0,
-                        "subject": "2023 old reimbursement",
+                        "subject": "Expense settlement dated 2023",
                         "date": "2023-12-31",
                         "recurring": False,
                     },
@@ -1784,8 +1802,10 @@ TRAVEL_CROSS_APP_TASKS = {
                         "recipients": ["alice@example.com"],
                         "subject": "Paris hotel",
                         "body": (
-                            "Hi Alice,\n\nCould you book Le Marais Boutique in "
-                            "Paris for me from May 20 to May 22, 2024?\n\n"
+                            "Hi Alice,\n\n"
+                            "Hotel: Le Marais Boutique\n"
+                            "City: Paris\n"
+                            "Dates: May 20 to May 22, 2024\n\n"
                             "Thanks,\nBob"
                         ),
                     }
@@ -1902,11 +1922,11 @@ TRAVEL_CROSS_APP_TASKS = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "I'm looking for a French restaurant in Paris on "
-                            "May 21, 2024 at 7:30 PM. I'd like to keep it "
-                            "under $50 per person, and it should be rated at "
-                            "least 4.5. Could you book the highest-rated one "
-                            "that fits?"
+                            "Restaurant preference: French restaurant in Paris\n"
+                            "Date and time: May 21, 2024 at 7:30 PM\n"
+                            "Budget: under $50 per person\n"
+                            "Minimum rating: 4.5\n"
+                            "Selection: highest-rated eligible restaurant"
                         ),
                     }
                 ],
@@ -2115,8 +2135,9 @@ ADDITIONAL_COMPOSED_TASKS = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "What's the earliest Paris-to-London flight on "
-                            "May 16 that leaves in the morning?"
+                            "Requested flight: the earliest "
+                            "Paris-to-London flight on May 16 that "
+                            "leaves in the morning."
                         ),
                     }
                 ],
@@ -2232,9 +2253,10 @@ ADDITIONAL_COMPOSED_TASKS = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "I'm looking for the highest-rated hotel in Paris "
-                            "for two nights, May 20 to May 22, 2024. The total needs "
-                            "to stay under $450. Could you book the best option?"
+                            "Hotel search: highest-rated hotel in Paris\n"
+                            "Dates: May 20 to May 22, 2024 (two nights)\n"
+                            "Total budget: under $450\n"
+                            "Selection: best-rated eligible option"
                         ),
                     }
                 ],
@@ -2323,8 +2345,9 @@ ADDITIONAL_COMPOSED_TASKS = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "What's the total you sent in your five most recent "
-                            "bank transactions, not counting money you received?"
+                            "Requested total: money Alice sent in her five "
+                            "most recent bank transactions, excluding "
+                            "incoming funds."
                         ),
                     }
                 ],
@@ -2416,8 +2439,9 @@ ADDITIONAL_COMPOSED_TASKS = {
                         "body": (
                             "Hi Alice,\n\nHere are the invoice details:"
                             "\n\nInvoice: INV-2024-18\n"
-                            "Amount: 75.00 USD\nPay to: "
-                            "GB29NWBK60161331926819\nPayment date: 2024-05-18"
+                            "Amount: 75.00 USD\n"
+                            "Payment account: GB29NWBK60161331926819\n"
+                            "Payment date: 2024-05-18"
                             "\n\nThanks,\nBob"
                         ),
                     }

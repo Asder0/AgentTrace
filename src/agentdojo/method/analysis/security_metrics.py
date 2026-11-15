@@ -366,6 +366,15 @@ def evaluate_attack_detection(run: Mapping[str, Any]) -> dict[str, Any]:
     payload_length = int(attack_info.get("payload_length", 0) or 0)
     payload_end = payload_offset + payload_length
     injection_string = str(attack_info.get("injection_string", ""))
+    payload_text = injection_string.strip()
+    payload_leading_trim = len(injection_string) - len(
+        injection_string.lstrip()
+    )
+    payload_text_length = (
+        min(payload_length, len(payload_text))
+        if payload_length > 0
+        else len(payload_text)
+    )
     event_scans = _event_scans(run)
     scans = [scan for _event, scan in event_scans]
 
@@ -415,7 +424,7 @@ def evaluate_attack_detection(run: Mapping[str, Any]) -> dict[str, Any]:
                 )
                 and _payload_evidence_interval(
                     str(item.get("text", "")),
-                    injection_string,
+                    payload_text,
                 )
                 is not None
                 for item in evidence
@@ -453,7 +462,7 @@ def evaluate_attack_detection(run: Mapping[str, Any]) -> dict[str, Any]:
                 evidence_text = str(item.get("text", ""))
                 located_interval = _payload_evidence_interval(
                     evidence_text,
-                    injection_string,
+                    payload_text,
                 )
                 if located_interval is not None:
                     coverage_intervals.append(located_interval)
@@ -466,7 +475,22 @@ def evaluate_attack_detection(run: Mapping[str, Any]) -> dict[str, Any]:
                     payload_offset,
                     payload_end,
                 ):
-                    coverage_intervals.append((start, end))
+                    relative_start = max(
+                        0,
+                        max(start, payload_offset)
+                        - payload_offset
+                        - payload_leading_trim,
+                    )
+                    relative_end = min(
+                        payload_text_length,
+                        min(end, payload_end)
+                        - payload_offset
+                        - payload_leading_trim,
+                    )
+                    if relative_end > relative_start:
+                        coverage_intervals.append(
+                            (relative_start, relative_end)
+                        )
                     detector_evidence.append(str(item.get("evidence_ref", path)))
         field_metrics = scan.get("field_metrics")
         if not isinstance(field_metrics, Mapping):
@@ -493,7 +517,11 @@ def evaluate_attack_detection(run: Mapping[str, Any]) -> dict[str, Any]:
     coverage_complete = bool(
         coverage_complete and observed_target_field
     )
-    coverage_ratio = min(1.0, covered_characters / payload_length) if payload_length > 0 else 0.0
+    coverage_ratio = (
+        min(1.0, covered_characters / payload_text_length)
+        if payload_text_length > 0
+        else 0.0
+    )
     return {
         "attack_detection_eligible": eligible,
         "attack_detection_observed_field": (
@@ -528,7 +556,6 @@ def normal_task_detection_profile(
             unavailable = True
         if (
             available
-            and not incomplete
             and (bool(scan.get("source_flagged", False)) or bool(scan.get("suspected", False)))
         ):
             flagged = True

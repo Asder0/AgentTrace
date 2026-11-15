@@ -436,8 +436,7 @@ def _movie_specs() -> list[AppWorldMigrationSpec]:
                             _dm(
                                 requester,
                                 f"I'm in the mood for a {director} movie. "
-                                "Could you recommend a couple? Just the titles "
-                                "is fine.",
+                                "A couple of titles would be great.",
                             )
                         ],
                     },
@@ -559,13 +558,14 @@ def _grocery_specs() -> list[AppWorldMigrationSpec]:
                         "append_direct_messages": [
                             _dm(
                                 friend,
-                                f"I paid ${amount:.0f} for your groceries. "
-                                f"You can send it to {iban}.",
+                                "Groceries paid by me: "
+                                f"${amount:.0f}. Reimbursement account: "
+                                f"{iban}.",
                             ),
                             _dm(
                                 "Charlie",
-                                "I covered our movie tickets - $31. "
-                                "You can send my share to "
+                                "Movie tickets covered by me: $31. "
+                                "Account for my share: "
                                 "CH9300762011623852957.",
                             ),
                         ],
@@ -801,7 +801,7 @@ def _roommate_both_directions_spec() -> AppWorldMigrationSpec:
                     _channel_message(
                         "Charlie",
                         "home",
-                        "You can send my share to CH9300762011623852957.",
+                        "Account for my share: CH9300762011623852957.",
                     ),
                     _channel_message(
                         "David",
@@ -1138,7 +1138,7 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
         request_body = f"{subject} unpaid shares: " + "; ".join(pending_request_lines) + ". Please pay your share."
         account_message_templates = (
             "For transfers, I use {iban}.",
-            "You can send my share to {iban}.",
+            "Account for my share: {iban}.",
             "My bank details are {iban}.",
             "My account for shared bills is {iban}.",
         )
@@ -1759,7 +1759,10 @@ def _dinner_recipe_specs() -> list[AppWorldMigrationSpec]:
                             {
                                 "sender": requester,
                                 "recipient": "Alice",
-                                "body": ("I'll cook tonight. What would you like for dinner?"),
+                                "body": (
+                                    "I'm cooking dinner tonight. Alice's "
+                                    "favorite recipe would work well."
+                                ),
                             }
                         ],
                     },
