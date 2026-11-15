@@ -20,7 +20,9 @@ from agentdojo import model_assets
 from agentdojo.model_assets import (
     DEFAULT_INJECTION_MODEL_ID,
     DIRECT_INJECTION_MODEL_ID,
+    FALLBACK_INJECTION_MODEL_ID,
     resolve_direct_injection_model_path,
+    resolve_fallback_injection_model_path,
 )
 
 from ..modeling.policy import security_thresholds
@@ -36,6 +38,9 @@ from .unplug_model import (
 DEFAULT_MODEL_NAME = DEFAULT_INJECTION_MODEL_ID
 _SCAN_POLICY = dict(security_thresholds().get("prompt_injection_scan", {}))
 DEFAULT_THRESHOLD = float(_SCAN_POLICY.get("threshold", 0.95))
+DEFAULT_FALLBACK_THRESHOLD = float(
+    _SCAN_POLICY.get("fallback_threshold", 0.5)
+)
 DEFAULT_SPAN_THRESHOLD = float(_SCAN_POLICY.get("span_threshold", 0.45))
 DEFAULT_DOC_THRESHOLD = float(_SCAN_POLICY.get("doc_threshold", 0.9))
 MASK_URLS = bool(_SCAN_POLICY.get("mask_urls", True))
@@ -51,7 +56,7 @@ DEFAULT_CONTEXT_OVERLAP_CHARS = 128
 DEFAULT_NATIVE_CHUNK_CHARS = 2048
 DEFAULT_NATIVE_OVERLAP_CHARS = 256
 DIRECT_INJECTION_THRESHOLD = 0.5
-LEGACY_FALLBACK_MODEL_DIR = Path(__file__).resolve().parents[4] / "models" / "prompt-injection-guard-small"
+LEGACY_FALLBACK_MODEL_DIR = model_assets.FALLBACK_INJECTION_MODEL_DIR
 DIRECT_INJECTION_PLACEHOLDER = "[[DATA_REMOVED]]"
 INDIRECT_INJECTION_PLACEHOLDER = "[[DATA_REMOVED]]"
 _URL_IN_TEXT_RE = re.compile(r"(?:https?://|www\.)[^\s<>]+", re.IGNORECASE)
@@ -186,7 +191,7 @@ class TransformersInjectionClassifier:
 
     def __init__(
         self,
-        model_name: str = "Horizon-Labs/prompt-injection-guard-small",
+        model_name: str = FALLBACK_INJECTION_MODEL_ID,
         safe_label: str = "SAFE",
         model_path: str | Path | None = None,
     ) -> None:
@@ -212,7 +217,8 @@ class TransformersInjectionClassifier:
                 ) from exc
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.model_path = str(
-                self.explicit_model_path or model_assets.DEFAULT_INJECTION_MODEL_DIR or LEGACY_FALLBACK_MODEL_DIR
+                self.explicit_model_path
+                or resolve_fallback_injection_model_path()
             )
             self._pipeline = _build_local_text_classification_pipeline(
                 pipeline,
@@ -259,6 +265,7 @@ class InjectionScanner:
         fallback_classifier: Any | None = None,
         *,
         threshold: float = DEFAULT_THRESHOLD,
+        fallback_threshold: float = DEFAULT_FALLBACK_THRESHOLD,
         chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
         overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
         max_chunks: int = DEFAULT_MAX_CHUNKS,
@@ -271,12 +278,18 @@ class InjectionScanner:
         )
         self.fallback_classifier = fallback_classifier
         if self.fallback_classifier is None and classifier is None:
-            fallback_model_dir = model_assets.DEFAULT_INJECTION_MODEL_DIR
-            if (fallback_model_dir / "config.json").is_file() and (fallback_model_dir / "model.safetensors").is_file():
+            fallback_model_dir = (
+                model_assets.FALLBACK_INJECTION_MODEL_DIR
+            )
+            if not model_assets.missing_injection_model_files(
+                fallback_model_dir
+            ):
                 self.fallback_classifier = TransformersInjectionClassifier(
-                    model_name="Horizon-Labs/prompt-injection-guard-small",
+                    model_name=FALLBACK_INJECTION_MODEL_ID,
+                    model_path=fallback_model_dir,
                 )
         self.threshold = float(threshold)
+        self.fallback_threshold = float(fallback_threshold)
         self.chunk_tokens = max(32, int(chunk_tokens))
         self.overlap_tokens = max(0, min(int(overlap_tokens), self.chunk_tokens - 1))
         self.max_chunks = max(1, int(max_chunks))
@@ -334,7 +347,12 @@ class InjectionScanner:
         results: list[InjectionScanResult | None] = [None] * len(values)
         keys = [
             hashlib.sha256(
-                (f"{self.detector_name}\0{self.fallback_detector_name}\0{self.threshold}\0{value}").encode(
+                (
+                    f"{self.detector_name}\0"
+                    f"{self.fallback_detector_name}\0"
+                    f"{self.threshold}\0"
+                    f"{self.fallback_threshold}\0{value}"
+                ).encode(
                     "utf-8",
                     errors="replace",
                 )
@@ -759,7 +777,7 @@ class InjectionScanner:
         ):
             score = min(1.0, max(0.0, float(raw_score or 0.0)))
             max_score = max(max_score, score)
-            if score >= self.threshold:
+            if score >= self.fallback_threshold:
                 chunks.append(
                     InjectionChunk(
                         index=len(chunks),
@@ -773,6 +791,98 @@ class InjectionScanner:
             _merge_injection_chunks(chunks, value),
             len(expanded),
             max_score,
+        )
+
+    def review_adjacent_units(
+        self,
+        value: str,
+        covered_spans: Sequence[tuple[int, int]],
+    ) -> tuple[list[InjectionChunk], bool]:
+        """Block-review unprotected sentence units near a native span hit."""
+        if self.fallback_classifier is None or not covered_spans:
+            return [], False
+        units = [
+            (start, end)
+            for start, end in self._semantic_unit_spans(value)
+            if start < end and value[start:end].strip()
+        ]
+        if not units:
+            return [], False
+
+        def overlaps(
+            left: tuple[int, int],
+            right: tuple[int, int],
+        ) -> bool:
+            return min(left[1], right[1]) > max(
+                left[0],
+                right[0],
+            )
+
+        candidate_indices: set[int] = set()
+        covered_indices: set[int] = set()
+        for covered in covered_spans:
+            paragraph_start = value.rfind(
+                "\n\n",
+                0,
+                covered[0],
+            )
+            paragraph_start = (
+                paragraph_start + 2
+                if paragraph_start >= 0
+                else 0
+            )
+            paragraph_end = value.find("\n\n", covered[1])
+            if paragraph_end < 0:
+                paragraph_end = len(value)
+            paragraph_units = {
+                index
+                for index, unit in enumerate(units)
+                if unit[0] < paragraph_end
+                and unit[1] > paragraph_start
+            }
+            local_covered = {
+                index
+                for index in paragraph_units
+                if overlaps(units[index], covered)
+            }
+            covered_indices.update(local_covered)
+            candidate_indices.update(
+                paragraph_units - local_covered
+            )
+        candidate_indices -= covered_indices
+        if not candidate_indices:
+            return [], False
+
+        ordered_indices = sorted(candidate_indices)
+        texts = [
+            _mask_nonlinguistic_tokens(
+                value[units[index][0] : units[index][1]]
+            )
+            for index in ordered_indices
+        ]
+        scores = self.fallback_classifier.classify_many(texts)
+        chunks = [
+            InjectionChunk(
+                index=index,
+                start=units[unit_index][0],
+                end=units[unit_index][1],
+                score=min(
+                    1.0,
+                    max(0.0, float(score or 0.0)),
+                ),
+                text=value[
+                    units[unit_index][0] : units[unit_index][1]
+                ],
+            )
+            for index, (unit_index, score) in enumerate(
+                zip(ordered_indices, scores, strict=True)
+            )
+            if float(score or 0.0)
+            >= self.fallback_threshold
+        ]
+        return (
+            _merge_injection_chunks(chunks, value),
+            True,
         )
 
     def _native_window_spans(self, text: str) -> list[tuple[int, int]]:

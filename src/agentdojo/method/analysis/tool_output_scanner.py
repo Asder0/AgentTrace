@@ -250,6 +250,20 @@ def _expand_injection_spans(
         )
         if not closing_tag.search(text, match.end()):
             envelopes.append((match.start(), len(text)))
+    sentence_units: list[tuple[int, int]] = []
+    sentence_start = 0
+    for match in re.finditer(
+        r"(?:[.!?](?=\s|$)|\u3002|\uff01|\uff1f|\r?\n)",
+        text,
+    ):
+        sentence_end = match.end()
+        if sentence_end > sentence_start:
+            sentence_units.append(
+                (sentence_start, sentence_end)
+            )
+            sentence_start = sentence_end
+    if sentence_start < len(text):
+        sentence_units.append((sentence_start, len(text)))
     expanded: list[dict[str, int | float]] = []
     for chunk in chunks:
         start = max(0, int(getattr(chunk, "start", 0) or 0))
@@ -268,25 +282,21 @@ def _expand_injection_spans(
         )
         if envelope is not None:
             start, end = envelope
-        elif "\n" in text:
-            paragraph_start = text.rfind("\n\n", 0, start)
-            paragraph_end = text.find("\n\n", end)
-            if paragraph_start >= 0 or paragraph_end >= 0:
-                start = (
-                    paragraph_start + 2
-                    if paragraph_start >= 0
-                    else 0
-                )
-                end = (
-                    paragraph_end
-                    if paragraph_end >= 0
-                    else len(text)
-                )
-            else:
-                line_start = text.rfind("\n", 0, start)
-                line_end = text.find("\n", end)
-                start = line_start + 1 if line_start >= 0 else 0
-                end = line_end if line_end >= 0 else len(text)
+        elif sentence_units:
+            unit_index = next(
+                (
+                    index
+                    for index, (unit_start, unit_end) in enumerate(
+                        sentence_units
+                    )
+                    if unit_start <= start < unit_end
+                    or unit_start < end <= unit_end
+                ),
+                None,
+            )
+            if unit_index is not None:
+                start = sentence_units[unit_index][0]
+                end = sentence_units[unit_index][1]
         expanded.append(
             {
                 "start": start,
@@ -525,6 +535,47 @@ def scan_tool_output(
                         "score": float(scan.score),
                     }
                 ]
+            reviewed_spans, fallback_reviewed = (
+                scanner.review_adjacent_units(
+                    item,
+                    [
+                        (
+                            int(span["start"]),
+                            int(span["end"]),
+                        )
+                        for span in expanded_spans
+                    ],
+                )
+            )
+            if fallback_reviewed:
+                result.fallback_executed = True
+                scan.fallback_executed = True
+            if reviewed_spans:
+                result.detector = (
+                    f"{scan.detector}+{scan.fallback_detector}"
+                )
+                scan.detector = result.detector
+                expanded_spans.extend(
+                    {
+                        "start": int(span.start),
+                        "end": int(span.end),
+                        "score": float(span.score),
+                    }
+                    for span in reviewed_spans
+                )
+                result.max_score = max(
+                    result.max_score,
+                    max(
+                        float(span.score)
+                        for span in reviewed_spans
+                    ),
+                )
+                expanded_spans.sort(
+                    key=lambda span: (
+                        int(span["start"]),
+                        int(span["end"]),
+                    )
+                )
             for index, span in enumerate(expanded_spans):
                 start = int(span["start"])
                 end = int(span["end"])

@@ -10,6 +10,7 @@
     "gliner_sensitivity_threshold": 0.45,
     "prompt_injection_scan": {
       "threshold": 0.95,
+      "fallback_threshold": 0.5,
       "doc_threshold": 0.9,
       "span_threshold": 0.45,
       "mask_urls": false,

@@ -16,10 +16,20 @@ INJECTION_MODEL_PATH_ENV = "AGENTDOJO_PI_MODEL_PATH"
 DIRECT_INJECTION_MODEL_ID = "deberta-v3-base-prompt-injection-v2"
 DIRECT_INJECTION_MODEL_DIRNAME = "deberta-v3-base-prompt-injection-v2"
 DIRECT_INJECTION_MODEL_PATH_ENV = "AGENTDOJO_DIRECT_PI_MODEL_PATH"
+FALLBACK_INJECTION_MODEL_ID = (
+    "Horizon-Labs/prompt-injection-guard-small"
+)
+FALLBACK_INJECTION_MODEL_DIRNAME = "prompt-injection-guard-small"
+FALLBACK_INJECTION_MODEL_PATH_ENV = (
+    "AGENTDOJO_FALLBACK_PI_MODEL_PATH"
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INJECTION_MODEL_DIR = PROJECT_ROOT / "models" / DEFAULT_INJECTION_MODEL_DIRNAME
 DIRECT_INJECTION_MODEL_DIR = PROJECT_ROOT / "models" / DIRECT_INJECTION_MODEL_DIRNAME
+FALLBACK_INJECTION_MODEL_DIR = (
+    PROJECT_ROOT / "models" / FALLBACK_INJECTION_MODEL_DIRNAME
+)
 
 
 def missing_injection_model_files(model_dir: Path) -> list[str]:
@@ -95,5 +105,37 @@ def resolve_direct_injection_model_path(
             f"files. Missing or incomplete model directory: {resolved}. "
             f"Missing: {', '.join(missing)}. Place the model assets there "
             f"or set {DIRECT_INJECTION_MODEL_PATH_ENV}."
+        )
+    return resolved
+
+
+def resolve_fallback_injection_model_path(
+    model_path: str | Path | None = None,
+) -> Path:
+    """Resolve the block-level fallback detector from local files only."""
+    configured = os.getenv(
+        FALLBACK_INJECTION_MODEL_PATH_ENV,
+        "",
+    ).strip()
+    requested = configured or (
+        str(model_path).strip() if model_path else ""
+    )
+    if requested:
+        candidate = (
+            FALLBACK_INJECTION_MODEL_DIR
+            if requested == FALLBACK_INJECTION_MODEL_ID
+            else Path(requested).expanduser()
+        )
+    else:
+        candidate = FALLBACK_INJECTION_MODEL_DIR
+    resolved = candidate.resolve()
+    missing = missing_injection_model_files(resolved)
+    if missing:
+        raise FileNotFoundError(
+            "Prompt-injection fallback detector must be loaded from "
+            f"local files. Missing or incomplete model directory: "
+            f"{resolved}. Missing: {', '.join(missing)}. Place the "
+            f"model assets there or set "
+            f"{FALLBACK_INJECTION_MODEL_PATH_ENV}."
         )
     return resolved
