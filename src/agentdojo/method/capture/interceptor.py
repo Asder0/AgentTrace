@@ -2127,6 +2127,56 @@ def _apply_schema_semantic_types(
     return result
 
 
+_DYNAMIC_SCALAR_FIELD_ALIASES = {
+    "location": ("$.location", "$.address"),
+}
+
+
+def _dynamic_scalar_output_fields(
+    output_schema: Mapping[str, Any],
+    output_entity_fields: Sequence[str],
+) -> list[str]:
+    """Select the entity field represented by a scalar dynamic map."""
+    if (
+        output_schema.get("type") != "object"
+        or output_schema.get("dynamic") is not True
+    ):
+        return []
+    value_schema = output_schema.get("value_schema")
+    if not isinstance(value_schema, Mapping):
+        return []
+    value_type = str(value_schema.get("type", "")).lower()
+    if value_type in {"object", "array"}:
+        return []
+    semantic_type = str(
+        value_schema.get("semantic_type", "") or ""
+    ).strip().lower()
+    if not semantic_type:
+        return []
+    semantic_field = re.sub(
+        r"[^a-z0-9_]+",
+        "_",
+        semantic_type,
+    ).strip("_")
+    candidates = [
+        *_DYNAMIC_SCALAR_FIELD_ALIASES.get(
+            semantic_field,
+            (),
+        ),
+        f"$.{semantic_field}",
+    ]
+    available = {
+        str(path): str(path)
+        for path in output_entity_fields
+        if str(path).startswith("$.")
+    }
+    return [
+        available[path]
+        for path in candidates
+        if path in available
+    ][:1]
+
+
 def _build_tool_catalog(
     runtime: Any,
     *,
@@ -2197,6 +2247,17 @@ def _build_tool_catalog(
             schema_for_type(getattr(function, "return_type", None)),
             policy.output_semantic_types,
         )
+        output_entity_field_names = sorted(
+            output_entity_policies.keys()
+        )
+        dynamic_scalar_fields = (
+            _dynamic_scalar_output_fields(
+                output_schema,
+                output_entity_field_names,
+            )
+        )
+        if dynamic_scalar_fields:
+            output_entity_field_names = dynamic_scalar_fields
         catalog.append(
             {
                 "name": str(name),
@@ -2220,7 +2281,9 @@ def _build_tool_catalog(
                 "input_schema": input_schema,
                 "output_schema": output_schema,
                 "output_entity": output_entity,
-                "output_entity_fields": sorted(output_entity_policies.keys()),
+                "output_entity_fields": (
+                    output_entity_field_names
+                ),
                 "output_entity_field_levels": {
                     path: str(policy.get("level", "secret")).lower() for path, policy in output_entity_policies.items()
                 },

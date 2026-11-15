@@ -1418,6 +1418,65 @@ def check_sensitive_egress(
                         ),
                     }
                 )
+        field_sources_by_parameter: dict[
+            str,
+            list[dict[str, Any]],
+        ] = {}
+        for item in field_sources:
+            parameter = str(item.get("parameter", ""))
+            if parameter:
+                field_sources_by_parameter.setdefault(
+                    parameter,
+                    [],
+                ).append(item)
+        exact_source_confidentialities = []
+        for field, label in argument_labels.items():
+            field = str(field)
+            if field in destination_parameters or not isinstance(
+                label,
+                Mapping,
+            ):
+                continue
+            sources = field_sources_by_parameter.get(field, [])
+            source_confidentialities = [
+                {
+                    "level": str(
+                        source.get("confidentiality", "")
+                    ),
+                    "categories": list(
+                        source.get("categories", [])
+                    ),
+                    "source_entities": [
+                        str(source.get("source", ""))
+                    ]
+                    if source.get("source")
+                    else [],
+                }
+                for source in sources
+                if source.get("confidentiality")
+            ]
+            exact_source_confidentialities.append(
+                join_confidentiality(
+                    source_confidentialities
+                )
+                if source_confidentialities
+                else label.get("confidentiality", {})
+            )
+        if exact_source_confidentialities:
+            confidentiality = join_confidentiality(
+                exact_source_confidentialities
+            )
+            categories = list(
+                confidentiality.get("categories", [])
+            )
+            ancestor_source_entities = sorted(
+                str(item)
+                for item in confidentiality.get(
+                    "source_entities",
+                    [],
+                )
+                if item
+            )
         provenance_refs = list({str(item["ref_id"]): item for item in provenance_refs}.values())
         data_field_refs = [
             {

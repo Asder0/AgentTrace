@@ -7,6 +7,7 @@ categories from content, but it is only allowed to raise the configured level.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -523,12 +524,30 @@ def _walk_values(
         data_influence=True,
         control_influence=True,
     )
+    field_policy_governs_confidentiality = bool(
+        str(policy.get("source", "")).startswith(
+            "dynamic_entity_map"
+        )
+        or str(policy.get("source", "")).startswith(
+            "field_policy"
+        )
+    )
     if inherited_label:
+        own_confidentiality = copy.deepcopy(
+            origin_label.get("confidentiality", {})
+        )
         origin_label = aggregate_flow_labels(
             [origin_label, inherited_label],
             generated=True,
             control_influence=True,
         )
+        if field_policy_governs_confidentiality:
+            # The exact value comes from an explicitly typed scalar field.
+            # Ancestor labels still propagate integrity and injection taint,
+            # but must not raise the value's own confidentiality level.
+            origin_label["confidentiality"] = (
+                own_confidentiality
+            )
     records.append(
         ValueOrigin(
             app=app,

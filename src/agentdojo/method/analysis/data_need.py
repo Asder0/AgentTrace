@@ -2648,8 +2648,7 @@ def _authorization_value_is_grounded(
         elif not semantic:
             return True
     if (
-        trusted
-        and str(semantic_type).strip().lower()
+        str(semantic_type).strip().lower()
         in {"slack_user", "user", "email"}
         and normalized
         in {
@@ -2660,6 +2659,9 @@ def _authorization_value_is_grounded(
             "self",
         }
     ):
+        # These aliases denote the environment owner, not an attacker-
+        # selectable third-party identity. Identity-role parameters are
+        # replaced with the runtime current user before execution.
         return True
     return value_occurs_in_trusted_text(
         rendered,
