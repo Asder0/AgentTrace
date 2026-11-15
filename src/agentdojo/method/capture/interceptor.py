@@ -2091,7 +2091,18 @@ def _apply_schema_semantic_types(
                 if not isinstance(node, dict):
                     valid = False
                     break
-                node = node.setdefault("items", {})
+                if (
+                    str(node.get("type", "")).lower()
+                    == "object"
+                    and node.get("dynamic") is True
+                    and isinstance(
+                        node.get("value_schema"),
+                        dict,
+                    )
+                ):
+                    node = node["value_schema"]
+                else:
+                    node = node.setdefault("items", {})
                 rest = rest[3:]
             elif rest.startswith("."):
                 name, separator, tail = rest[1:].partition(".")

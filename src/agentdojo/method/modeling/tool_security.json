@@ -194,7 +194,8 @@
       "content_fields": ["title", "description"],
       "semantic_types": {
         "start_time": "datetime",
-        "end_time": "datetime"
+        "end_time": "datetime",
+        "location": "location"
       }
     },
     "create_file": {
@@ -259,7 +260,8 @@
       "dynamic_entity_map": true,
       "content_detection": false,
       "resource_fields": ["company_name"],
-      "semantic_types": {"company_name": "car_rental_company_name"}
+      "semantic_types": {"company_name": "car_rental_company_name"},
+      "output_semantic_types": {"$[*]": "location"}
     },
     "get_car_types_available": {
       "profile": "read_internal",
@@ -286,7 +288,10 @@
       "resource_fields": ["restaurant_names"],
       "semantic_types": {"restaurant_names": "restaurant_name"}
     },
-    "get_current_day": {"profile": "read_public"},
+    "get_current_day": {
+      "profile": "read_public",
+      "output_semantic_types": {"$": "date"}
+    },
     "get_day_calendar_events": {
       "profile": "read_confidential",
       "resource_fields": ["day"],
@@ -315,7 +320,8 @@
       "dynamic_entity_map": true,
       "content_detection": false,
       "resource_fields": ["hotel_name"],
-      "semantic_types": {"hotel_name": "hotel_name"}
+      "semantic_types": {"hotel_name": "hotel_name"},
+      "output_semantic_types": {"$[*]": "location"}
     },
     "get_hotels_prices": {
       "profile": "read_internal",
@@ -369,7 +375,8 @@
       "dynamic_entity_map": true,
       "content_detection": false,
       "resource_fields": ["restaurant_names"],
-      "semantic_types": {"restaurant_names": "restaurant_name"}
+      "semantic_types": {"restaurant_names": "restaurant_name"},
+      "output_semantic_types": {"$[*]": "location"}
     },
     "get_scheduled_transactions": {
       "profile": "read_secret",
@@ -476,6 +483,9 @@
         "company": "company_name",
         "start_time": "datetime",
         "end_time": "datetime"
+      },
+      "output_semantic_types": {
+        "$": "car_rental_company_name"
       }
     },
     "reserve_hotel": {
@@ -487,7 +497,8 @@
         "hotel": "hotel_name",
         "start_day": "date",
         "end_day": "date"
-      }
+      },
+      "output_semantic_types": {"$": "hotel_name"}
     },
     "reserve_restaurant": {
       "profile": "resource_mutation",
@@ -497,7 +508,8 @@
       "semantic_types": {
         "restaurant": "restaurant_name",
         "start_time": "datetime"
-      }
+      },
+      "output_semantic_types": {"$": "restaurant_name"}
     },
     "schedule_transaction": {
       "profile": "egress_secret",

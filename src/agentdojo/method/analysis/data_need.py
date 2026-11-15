@@ -46,6 +46,7 @@ from .access_plan import parse_plan_json, schema_paths
 from .artifact_semantics import resolve_artifact_target_parameters
 from .data_access import (
     canonicalize_resource_value,
+    composed_value_supports_origin,
     compile_data_access,
     compile_resource_access,
     value_occurs_in_origin,
@@ -554,9 +555,34 @@ Rules:
   in flow_contract.destination or parameter bindings; it does not forbid all
   actions of that effect.
 - Every egress action must have a flow_contract.
-- Cover every input field marked required=true in the tool input schema.
-  Destination parameters may use literal allowed_values. Every other required
-  field must have a parameter binding or an authoritative tool default.
+- Treat every field in each tool input schema as a planning candidate. Cover
+  every field marked required=true. Destination parameters may use literal
+  allowed_values. Every other required field must have a parameter binding or
+  an authoritative tool default.
+- For optional fields marked required=false, perform an explicit best-effort
+  completion pass. Add a binding whenever the value is explicitly stated in
+  the trusted user instruction or can be copied, extracted, selected,
+  normalized or summarized from an earlier planned tool output that the task
+  already needs. Do not omit an optional field merely because it is optional
+  or because no required outcome names it. Match by semantic meaning as well
+  as field name: for example, an available address or street can support a
+  location field, a sender or person name can support an identity field, and
+  a start or end timestamp can support a date or time field. Use the value's
+  proper parameter role and the minimum required data exposure; transport a
+  sensitive value through opaque_fields when the Agent only needs to pass it
+  onward.
+- Omit an optional field binding when its value is absent, ambiguous,
+  speculative, unverifiable, or would require inventing data. Prefer an
+  already planned source. If the value is not produced by any planned action,
+  search available_tools for the smallest read-only getter that returns the
+  same semantic value and accepts selectors already available from the user
+  instruction or an earlier planned step. Add that getter when it stays within
+  the same authorized APP and data scope. The absence of a required outcome is
+  not a reason to omit this support read. Omission is the fallback when no
+  safe getter exists: the tool may use its declared default and the plan must
+  remain valid.
+- Optional bindings authorize data flow when the Agent explicitly supplies a
+  non-default value, but they do not by themselves create a required outcome.
 - Fields with role=presentation may use generation_kind=presentation for
   generated wording. They may also use a more specific generation_kind such as
   copy, extraction, normalization, selection, calculation or summary when the
@@ -652,6 +678,82 @@ Rules:
   action, selector, destination rule and source binding is explicit, use
   confidence >= 0.8 even if business values remain to be read.
 - Return a low confidence instead of guessing missing authorization details."""
+
+
+OPTIONAL_PARAMETER_SUPPORT_PROMPT = """You add safe read-only support
+steps for optional inputs in an existing Agent task plan.
+
+Return JSON only:
+{
+  "base_revision": 1,
+  "reason": "brief reason in Simplified Chinese",
+  "operations": [
+    {
+      "op": "add_step",
+      "step": {
+        "id": "optional_support_step_id",
+        "description": "why the optional value is useful",
+        "condition": "always",
+        "depends_on": ["existing producer step needed by the getter"],
+        "supports_outcomes": [],
+        "actions": [
+          {
+            "name": "exact read-only tool name from available_tools",
+            "purpose": "why this getter supports the optional field",
+            "authorization_evidence": "short object-level phrase grounded in the user instruction",
+            "data_access": {
+              "max_exposure_level": "internal",
+              "resource_parameters": {},
+              "visible_fields": [],
+              "opaque_fields": ["exact output paths needed for the optional value"],
+              "hidden_fields": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "op": "add_binding",
+      "target_action": "existing action with the optional field",
+      "target_step_id": "existing target step id",
+      "parameter": "optional parameter name",
+      "source_action": "the read-only getter added above",
+      "source_step_id": "the getter step id",
+      "source_path": "$[*] for a single dynamic-map value, otherwise the exact scalar path",
+      "selector": "unique"
+    }
+  ]
+}
+
+Rules:
+- Inspect every optional_candidate. Add a step only when the optional value is
+  useful for the user's object and no already planned output directly supplies
+  that value.
+- Use the smallest available L0 read-only getter with the same semantic
+  result. An address getter can support a location field, a date/time getter
+  can support a date/time field, and an identity/contact getter can support an
+  identity field when that identity is needed by the already authorized action.
+- The getter must stay in an allowed APP suite and may only be read-only.
+  Never add write, privilege or egress actions.
+- Use only selectors that are exact values from the trusted user instruction
+  or already available from an earlier planned source. Declare derived
+  resource selectors with exact source_action/source_path and source IDs from
+  current_plan.source_refs.
+- When the support getter directly returns the optional scalar, add one
+  add_binding operation for the existing target action. For a dynamic
+  name-to-scalar map use source_path="$[*]". Use selector="unique" only when
+  the getter is restricted to one selected resource; do not guess or select
+  among multiple records.
+- Put raw values the Agent does not need to inspect in opaque_fields. Use
+  visible_fields only when the Agent must reason over the value. Never expand
+  sensitivity merely to populate an optional field.
+- Do not add an action when no safe getter exists. Returning operations=[] is
+  correct.
+- Do not alter existing steps, destinations, effects, permissions or required
+  outcomes. Return only new read-only support steps.
+- When no operation is needed, return
+  {"base_revision": current_revision, "reason": "...", "operations": []}.
+"""
 
 
 def make_pipeline_task_planner(llm: Any) -> Callable[[str], str]:
@@ -2120,6 +2222,15 @@ def _known_tool_output_paths(
         }:
             return {"$"}
         paths.update(normalize_source_path(path) for path in schema_paths(output_schema))
+        if (
+            schema_type == "object"
+            and output_schema.get("dynamic") is True
+            and isinstance(
+                output_schema.get("value_schema"),
+                Mapping,
+            )
+        ):
+            paths.add("$[*]")
     paths.update(normalize_source_path(path) for path in metadata.get("output_entity_fields", []) if str(path).strip())
     return paths
 
@@ -8682,35 +8793,97 @@ def compile_runtime_plan_update(
                 "source_action": source_action,
                 "source_path": source_path,
             }
-            bindings[parameter] = {
-                "mode": "copy",
-                "generation_kind": "copy",
-                "parameter_role": _schema_field_role(
-                    target_metadata,
-                    parameter,
-                ),
-                "semantic_type": _schema_field_semantic_type(
-                    target_metadata,
-                    parameter,
-                ),
-                "source_id": source_id,
-                "source_action": source_action,
-                "source_tool": source_action,
-                "source_path": source_path,
-                "allowed_source_refs": [allowed_ref],
-                "required_source_refs": [allowed_ref],
-                "required_sources": [source_id],
-                "required_source_groups": [],
-                "allowed_source_paths": [source_path],
-                "selector": selector,
-                "symbol": make_placeholder_symbol(
-                    plan_seed=str(updated.get("task_goal", "")),
-                    tool_name=target_action,
-                    parameter=parameter,
-                    source_tool=source_action,
-                    source_path=source_path,
-                ),
-            }
+            requested_mode = str(
+                binding_value(
+                    "mode",
+                    "binding_mode",
+                    default="copy",
+                )
+            ).lower()
+            requested_generation_kind = str(
+                binding_value(
+                    "generation_kind",
+                    default="copy",
+                )
+            ).lower()
+            if requested_mode == "derived_sources":
+                if requested_generation_kind not in {
+                    "extraction",
+                    "normalization",
+                    "selection",
+                    "calculation",
+                    "summary",
+                    "presentation",
+                }:
+                    warnings.append(
+                        "invalid_runtime_binding_generation_kind:"
+                        f"{target_action}:{parameter}:"
+                        f"{requested_generation_kind}"
+                    )
+                    continue
+                bindings[parameter] = {
+                    "mode": "derived_sources",
+                    "generation_kind": requested_generation_kind,
+                    "parameter_role": _schema_field_role(
+                        target_metadata,
+                        parameter,
+                    ),
+                    "semantic_type": _schema_field_semantic_type(
+                        target_metadata,
+                        parameter,
+                    ),
+                    "constraints": {
+                        "must_not_introduce_facts": True,
+                    },
+                    "allowed_source_refs": [allowed_ref],
+                    "required_source_refs": [allowed_ref],
+                    "required_sources": [source_id],
+                    "required_source_groups": [],
+                    "allowed_source_paths": [source_path],
+                    "source_tool": "derived_sources",
+                    "source_path": "sources",
+                    "symbol": make_placeholder_symbol(
+                        plan_seed=str(
+                            updated.get("task_goal", "")
+                        ),
+                        tool_name=target_action,
+                        parameter=parameter,
+                        source_tool="derived_sources",
+                        source_path="sources",
+                    ),
+                }
+            else:
+                bindings[parameter] = {
+                    "mode": "copy",
+                    "generation_kind": "copy",
+                    "parameter_role": _schema_field_role(
+                        target_metadata,
+                        parameter,
+                    ),
+                    "semantic_type": _schema_field_semantic_type(
+                        target_metadata,
+                        parameter,
+                    ),
+                    "source_id": source_id,
+                    "source_action": source_action,
+                    "source_tool": source_action,
+                    "source_path": source_path,
+                    "allowed_source_refs": [allowed_ref],
+                    "required_source_refs": [allowed_ref],
+                    "required_sources": [source_id],
+                    "required_source_groups": [],
+                    "allowed_source_paths": [source_path],
+                    "selector": selector,
+                    "symbol": make_placeholder_symbol(
+                        plan_seed=str(
+                            updated.get("task_goal", "")
+                        ),
+                        tool_name=target_action,
+                        parameter=parameter,
+                        source_tool=source_action,
+                        source_path=source_path,
+                    ),
+                }
             _attach_runtime_source_to_contract(
                 contract,
                 source_id,
@@ -9461,6 +9634,384 @@ def compile_runtime_binding_sync(
         if changed_parameters:
             contract["resource_parameters"] = bindings
 
+    # Complete optional non-resource parameters only when the concrete value
+    # supplied by the Agent is already traceable to an earlier admitted tool
+    # output. This keeps optional-field planning best-effort without granting
+    # new actions or accepting invented values.
+    for call_index, call in enumerate(tool_calls):
+        if not isinstance(call, dict):
+            continue
+        requested_tool = canonical_tool(str(call.get("name", "")))
+        if not requested_tool:
+            continue
+        hint = (
+            str(target_step_ids[call_index])
+            if call_index < len(target_step_ids)
+            else ""
+        )
+        target_step, target_action = resolve_target_action(
+            call,
+            hint,
+        )
+        if target_step is None or target_action is None:
+            continue
+        target_effect = str(target_action.get("effect", "") or "")
+        if target_effect == "read":
+            continue
+        contract = target_action.get("flow_contract")
+        if (
+            not isinstance(contract, dict)
+            or not contract.get("valid", False)
+        ):
+            continue
+        metadata = catalog.get(requested_tool, {})
+        input_schema = metadata.get("input_schema")
+        schema_fields = (
+            input_schema.get("fields", {})
+            if isinstance(input_schema, Mapping)
+            else {}
+        )
+        if not isinstance(schema_fields, Mapping):
+            continue
+        destination_fields = {
+            str(item)
+            for item in metadata.get("destination_fields", [])
+            if str(item).strip()
+        }
+        authoritative_fields = {
+            str(item)
+            for item in metadata.get(
+                "authoritative_parameters",
+                {},
+            )
+            if str(item).strip()
+        }
+        bindings = contract.get("parameter_bindings")
+        bindings = dict(bindings) if isinstance(bindings, Mapping) else {}
+        call_args = (
+            call.get("args", {})
+            if isinstance(call.get("args"), Mapping)
+            else {}
+        )
+        target_step_id = str(target_step.get("id", ""))
+        for parameter, field_schema in schema_fields.items():
+            parameter = str(parameter)
+            if (
+                not isinstance(field_schema, Mapping)
+                or field_schema.get("required") is not False
+                or parameter in destination_fields
+                or parameter in authoritative_fields
+                or parameter in bindings
+            ):
+                continue
+            value = call_args.get(parameter)
+            if value in (None, "", [], {}):
+                continue
+            if (
+                "default" in field_schema
+                and value == field_schema.get("default")
+            ):
+                continue
+            parameter_values = flattened(value)
+            if not parameter_values:
+                continue
+            semantic_type = (
+                _schema_field_semantic_type(
+                    metadata,
+                    parameter,
+                )
+                or "identifier"
+            )
+            parameter_role = _schema_field_role(
+                metadata,
+                parameter,
+            )
+            allow_composed_source = (
+                parameter_role == "presentation"
+            )
+            source_candidates: dict[
+                tuple[str, str, str, str, str],
+                tuple[Any, str, str, str, str],
+            ] = {}
+            exact_source_keys: set[
+                tuple[str, str, str, str, str]
+            ] = set()
+            for parameter_value in parameter_values:
+                for origin in value_origins:
+                    origin_value = getattr(origin, "value", None)
+                    exact_match = (
+                        value_key(origin_value)
+                        == value_key(parameter_value)
+                    )
+                    if not exact_match and not (
+                        value_occurs_in_origin(
+                            parameter_value,
+                            origin,
+                            semantic_type,
+                        )
+                        or (
+                            allow_composed_source
+                            and composed_value_supports_origin(
+                                parameter_value,
+                                origin,
+                            )
+                        )
+                    ):
+                        continue
+                    label = getattr(origin, "label", {})
+                    injection = (
+                        label.get("injection", {})
+                        if isinstance(label, Mapping)
+                        else {}
+                    )
+                    if isinstance(injection, Mapping) and (
+                        injection.get("source_flagged")
+                        or injection.get("risky_entities")
+                    ):
+                        continue
+                    source_action = canonical_tool(
+                        str(
+                            getattr(
+                                origin,
+                                "source_tool",
+                                "",
+                            )
+                            or ""
+                        )
+                    )
+                    if (
+                        not source_action
+                        or same_tool(
+                            source_action,
+                            requested_tool,
+                        )
+                    ):
+                        continue
+                    source_step_id = source_step_for_origin(
+                        origin,
+                        source_action,
+                    )
+                    if (
+                        not source_step_id
+                        or source_step_id == target_step_id
+                    ):
+                        continue
+                    event = event_by_activity.get(
+                        str(
+                            getattr(
+                                origin,
+                                "source_activity_id",
+                                "",
+                            )
+                            or ""
+                        ),
+                        {},
+                    )
+                    status = str(
+                        event.get("status", "") or ""
+                    ).lower()
+                    if (
+                        status in {"blocked", "error", "failed"}
+                        or event.get("error")
+                    ):
+                        continue
+                    source_metadata = catalog.get(
+                        source_action,
+                        {},
+                    )
+                    source_suite = str(
+                        source_metadata.get("suite", "") or ""
+                    ).lower()
+                    source_entity = canonical_entity_name(
+                        source_suite,
+                        str(
+                            getattr(origin, "entity", "") or ""
+                        ),
+                    )
+                    if (
+                        not source_suite
+                        or not source_entity
+                        or not has_entity(
+                            source_suite,
+                            source_entity,
+                        )
+                    ):
+                        continue
+                    source_path = _canonicalize_source_path(
+                        str(
+                            getattr(origin, "source_path", "") or ""
+                        ),
+                        (
+                            source_metadata.get("output_schema")
+                            if isinstance(
+                                source_metadata.get("output_schema"),
+                                Mapping,
+                            )
+                            else None
+                        ),
+                    )
+                    known_paths = _known_tool_output_paths(
+                        source_metadata
+                    )
+                    if (
+                        not source_path
+                        or (
+                            known_paths
+                            and source_path not in known_paths
+                        )
+                    ):
+                        continue
+                    source_key = (
+                        source_suite,
+                        source_entity,
+                        source_action,
+                        source_step_id,
+                        source_path,
+                    )
+                    source_candidates.setdefault(
+                        source_key,
+                        (
+                            origin,
+                            source_action,
+                            source_step_id,
+                            source_suite,
+                            source_path,
+                        ),
+                    )
+                    if exact_match:
+                        exact_source_keys.add(source_key)
+            if not source_candidates:
+                warnings.append(
+                    "optional_parameter_binding_unavailable:"
+                    f"{requested_tool}:{parameter}"
+                )
+                continue
+            if len(exact_source_keys) > 1:
+                warnings.append(
+                    "optional_parameter_binding_ambiguous:"
+                    f"{requested_tool}:{parameter}"
+                )
+                continue
+            if len(source_candidates) > 8:
+                warnings.append(
+                    "optional_parameter_binding_too_broad:"
+                    f"{requested_tool}:{parameter}"
+                )
+                continue
+            allowed_refs: list[dict[str, Any]] = []
+            required_refs: list[dict[str, Any]] = []
+            required_sources: list[str] = []
+            for (
+                origin,
+                source_action,
+                source_step_id,
+                source_suite,
+                source_path,
+            ) in source_candidates.values():
+                source_entity = canonical_entity_name(
+                    source_suite,
+                    str(getattr(origin, "entity", "") or ""),
+                )
+                source_id = source_ref_id(
+                    app=source_suite,
+                    entity=source_entity,
+                    source_action=source_action,
+                    source_step_id=source_step_id,
+                )
+                if source_id not in required_sources:
+                    required_sources.append(source_id)
+                source_ref = {
+                    "source_id": source_id,
+                    "app": source_suite,
+                    "entity": source_entity,
+                    "producer_step": source_step_id,
+                    "source_action": source_action,
+                    "source_path": source_path,
+                }
+                allowed_refs.append(source_ref)
+                required_refs.append(dict(source_ref))
+                source_binding = source_refs.get(
+                    source_id,
+                    {},
+                )
+                if isinstance(source_binding, Mapping):
+                    _attach_runtime_source_to_contract(
+                        contract,
+                        source_id,
+                        source_binding,
+                        required=True,
+                    )
+                dependencies = [
+                    str(item)
+                    for item in target_step.get("depends_on", [])
+                    if str(item).strip()
+                ]
+                if (
+                    source_step_id not in dependencies
+                    and not step_depends_on(
+                        source_step_id,
+                        target_step_id,
+                    )
+                ):
+                    dependencies.append(source_step_id)
+                target_step["depends_on"] = list(
+                    dict.fromkeys(dependencies)
+                )
+            generation_kind = (
+                "presentation"
+                if parameter_role == "presentation"
+                else "normalization"
+            )
+            bindings[parameter] = {
+                "mode": "derived_sources",
+                "generation_kind": generation_kind,
+                "parameter_role": parameter_role,
+                "semantic_type": _schema_field_semantic_type(
+                    metadata,
+                    parameter,
+                ),
+                "constraints": {
+                    "must_not_introduce_facts": True,
+                },
+                "allowed_source_refs": allowed_refs,
+                "required_source_refs": required_refs,
+                "required_sources": required_sources,
+                "required_source_groups": [],
+                "allowed_source_paths": list(
+                    dict.fromkeys(
+                        str(item.get("source_path", ""))
+                        for item in allowed_refs
+                    )
+                ),
+                "source_tool": "derived_sources",
+                "source_path": "sources",
+                "symbol": make_placeholder_symbol(
+                    plan_seed=str(
+                        updated.get("task_goal", "")
+                    ),
+                    tool_name=requested_tool,
+                    parameter=parameter,
+                    source_tool="derived_sources",
+                    source_path="sources",
+                ),
+            }
+            updates.append(
+                {
+                    "operation": "synchronize_runtime_optional_binding",
+                    "target_step_id": target_step_id,
+                    "target_action": requested_tool,
+                    "parameter": parameter,
+                    "source_ids": required_sources,
+                    "trigger": "controller_optional_parameter",
+                    "reason": (
+                        "The supplied optional value is traceable "
+                        "to earlier admitted tool output."
+                    ),
+                }
+            )
+        if bindings != contract.get("parameter_bindings"):
+            contract["parameter_bindings"] = bindings
+
     if not updates:
         return plan, [], warnings
 
@@ -9903,6 +10454,484 @@ def _attach_execution_contract_identity(
     return _finalize_plan(plan) if changed else plan
 
 
+def _optional_parameter_support_candidates(
+    plan: Mapping[str, Any],
+    available_tools: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    catalog = {
+        str(item.get("name")): item
+        for item in available_tools
+        if isinstance(item, Mapping) and item.get("name")
+    }
+    candidates: list[dict[str, Any]] = []
+    for step in plan.get("steps", []):
+        if not isinstance(step, Mapping):
+            continue
+        for action in step.get("actions", []):
+            if not isinstance(action, Mapping):
+                continue
+            action_name = str(action.get("name", ""))
+            metadata = catalog.get(action_name, {})
+            input_schema = metadata.get("input_schema")
+            fields = (
+                input_schema.get("fields", {})
+                if isinstance(input_schema, Mapping)
+                else {}
+            )
+            if not isinstance(fields, Mapping):
+                continue
+            effect = str(action.get("effect", "") or "")
+            if effect == "read":
+                contract = action.get("data_access")
+                bound = (
+                    contract.get("resource_parameters", {})
+                    if isinstance(contract, Mapping)
+                    else {}
+                )
+            elif effect == "egress":
+                contract = action.get("flow_contract")
+                bound = (
+                    contract.get("parameter_bindings", {})
+                    if isinstance(contract, Mapping)
+                    else {}
+                )
+            else:
+                contract = action.get("resource_access")
+                bound = (
+                    contract.get("resource_parameters", {})
+                    if isinstance(contract, Mapping)
+                    else {}
+                )
+            bound = bound if isinstance(bound, Mapping) else {}
+            destinations = {
+                str(item)
+                for item in metadata.get("destination_fields", [])
+                if str(item).strip()
+            }
+            authoritative = {
+                str(item)
+                for item in metadata.get(
+                    "authoritative_parameters",
+                    {},
+                )
+                if str(item).strip()
+            }
+            for parameter, field in fields.items():
+                parameter = str(parameter)
+                if (
+                    not isinstance(field, Mapping)
+                    or field.get("required") is not False
+                    or parameter in bound
+                    or parameter in destinations
+                    or parameter in authoritative
+                ):
+                    continue
+                role = str(field.get("role", "input"))
+                if role == "presentation":
+                    continue
+                candidates.append(
+                    {
+                        "step_id": str(step.get("id", "")),
+                        "action": action_name,
+                        "effect": effect,
+                        "parameter": parameter,
+                        "role": role,
+                        "semantic_type": str(
+                            field.get("semantic_type", "") or ""
+                        ),
+                        "description": str(
+                            field.get("description", "") or ""
+                        ),
+                        "default": copy.deepcopy(
+                            field.get("default")
+                        ),
+                    }
+                )
+    return candidates
+
+
+def _schema_output_semantic_paths(
+    schema: Mapping[str, Any],
+    prefix: str = "$",
+) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    semantic_type = str(schema.get("semantic_type", "") or "")
+    if semantic_type:
+        result.setdefault(semantic_type, []).append(prefix)
+    schema_type = str(schema.get("type", "") or "").lower()
+    if schema_type == "array":
+        items = schema.get("items")
+        if isinstance(items, Mapping):
+            for semantic, paths in _schema_output_semantic_paths(
+                items,
+                f"{prefix}[*]",
+            ).items():
+                result.setdefault(semantic, []).extend(paths)
+    elif schema_type == "object":
+        fields = schema.get("fields")
+        if isinstance(fields, Mapping):
+            for name, raw_field in fields.items():
+                if not isinstance(raw_field, Mapping):
+                    continue
+                child = raw_field.get("type_schema", raw_field)
+                if not isinstance(child, Mapping):
+                    continue
+                for semantic, paths in _schema_output_semantic_paths(
+                    child,
+                    f"{prefix}.{name}",
+                ).items():
+                    result.setdefault(semantic, []).extend(paths)
+        value_schema = schema.get("value_schema")
+        if (
+            schema.get("dynamic") is True
+            and isinstance(value_schema, Mapping)
+        ):
+            for semantic, paths in _schema_output_semantic_paths(
+                value_schema,
+                f"{prefix}[*]",
+            ).items():
+                result.setdefault(semantic, []).extend(paths)
+    return {
+        semantic: list(dict.fromkeys(paths))
+        for semantic, paths in result.items()
+        if paths
+    }
+
+
+def _semantic_optional_support_patch(
+    plan: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    available_tools: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    catalog = {
+        str(item.get("name")): item
+        for item in available_tools
+        if isinstance(item, Mapping) and item.get("name")
+    }
+    tools_by_base: dict[str, list[str]] = {}
+    for name in catalog:
+        tools_by_base.setdefault(base_tool_name(name), []).append(name)
+
+    def canonical_tool(name: str) -> str:
+        value = str(name or "").strip()
+        if value in catalog:
+            return value
+        matches = tools_by_base.get(base_tool_name(value), [])
+        return matches[0] if len(matches) == 1 else ""
+
+    allowed_suites = {
+        str(item)
+        for item in plan.get("allowed_suites", [])
+        if str(item).strip()
+    }
+    existing_actions = {
+        canonical_tool(str(action.get("name", "")))
+        for step in plan.get("steps", [])
+        if isinstance(step, Mapping)
+        for action in step.get("actions", [])
+        if isinstance(action, Mapping)
+    }
+    source_refs = (
+        plan.get("source_refs", {})
+        if isinstance(plan.get("source_refs"), Mapping)
+        else {}
+    )
+    operations: list[dict[str, Any]] = []
+    used_getters: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        parameter = str(candidate.get("parameter", ""))
+        semantic_type = str(candidate.get("semantic_type", "") or "")
+        target_action = str(candidate.get("action", ""))
+        target_step_id = str(candidate.get("step_id", ""))
+        if not parameter or not semantic_type or not target_action:
+            continue
+        for getter_name in sorted(catalog):
+            getter = catalog[getter_name]
+            getter_suite = str(getter.get("suite", "") or "")
+            if (
+                getter_name in existing_actions
+                or str(getter.get("effect", "")) != "read"
+                or str(getter.get("risk_level", "")).upper()
+                != "L0"
+                or not getter_suite
+                or getter_suite not in allowed_suites
+            ):
+                continue
+            output_paths = _schema_output_semantic_paths(
+                getter.get("output_schema", {})
+                if isinstance(
+                    getter.get("output_schema"),
+                    Mapping,
+                )
+                else {}
+            ).get(semantic_type, [])
+            if not output_paths:
+                continue
+            resource_rules: dict[str, dict[str, Any]] = {}
+            selector_steps: set[str] = set()
+            getter_ready = True
+            for resource_field in getter.get("resource_fields", []):
+                resource_field = str(resource_field)
+                resource_semantic = _schema_field_semantic_type(
+                    getter,
+                    resource_field,
+                )
+                matched_source: tuple[
+                    str,
+                    Mapping[str, Any],
+                    str,
+                ] | None = None
+                for source_id, source_ref in source_refs.items():
+                    if not isinstance(source_ref, Mapping):
+                        continue
+                    source_action = canonical_tool(
+                        str(source_ref.get("source_action", ""))
+                    )
+                    source_metadata = catalog.get(source_action, {})
+                    source_paths = _schema_output_semantic_paths(
+                        source_metadata.get("output_schema", {})
+                        if isinstance(
+                            source_metadata.get(
+                                "output_schema",
+                            ),
+                            Mapping,
+                        )
+                        else {}
+                    ).get(resource_semantic, [])
+                    if not source_paths:
+                        continue
+                    matched_source = (
+                        str(source_id),
+                        source_ref,
+                        source_paths[0],
+                    )
+                    break
+                if matched_source is None:
+                    getter_ready = False
+                    break
+                source_id, source_ref, source_path = matched_source
+                source_step = str(
+                    source_ref.get("producer_step", "") or ""
+                )
+                if source_step:
+                    selector_steps.add(source_step)
+                resource_rules[resource_field] = {
+                    "mode": "derived",
+                    "semantic_type": resource_semantic,
+                    "allowed_values": [],
+                    "allowed_source_refs": [
+                        {
+                            "app": str(
+                                source_ref.get("app", "")
+                            ).lower(),
+                            "entity": canonical_entity_name(
+                                str(source_ref.get("app", "")),
+                                str(source_ref.get("entity", "")),
+                            ),
+                            "source_action": canonical_tool(
+                                str(
+                                    source_ref.get(
+                                        "source_action",
+                                        "",
+                                    )
+                                )
+                            ),
+                            "source_path": source_path,
+                        }
+                    ],
+                    "required_sources": [source_id],
+                }
+            if not getter_ready:
+                continue
+            support_step_id = (
+                f"optional_support_{target_step_id}_"
+                f"{parameter}_{base_tool_name(getter_name)}"
+            )
+            if (support_step_id, getter_name) in used_getters:
+                continue
+            used_getters.add((support_step_id, getter_name))
+            operations.append(
+                {
+                    "op": "add_step",
+                    "step": {
+                        "id": support_step_id,
+                        "description": (
+                            f"读取 {semantic_type}，用于填充 "
+                            f"{target_action}.{parameter}。"
+                        ),
+                        "condition": "always",
+                        "depends_on": sorted(selector_steps),
+                        "supports_outcomes": [],
+                        "actions": [
+                            {
+                                "name": getter_name,
+                                "purpose": (
+                                    f"支持可选参数 {parameter} 的 "
+                                    f"{semantic_type} 值。"
+                                ),
+                                "authorization_evidence": (
+                                    "The getter supports an optional "
+                                    "field on the already authorized "
+                                    "task object."
+                                ),
+                                "data_access": {
+                                    "max_exposure_level": "internal",
+                                    "resource_parameters": (
+                                        resource_rules
+                                    ),
+                                    "visible_fields": (
+                                        ["$"]
+                                        if getter.get("dynamic_entity_map")
+                                        else output_paths[:1]
+                                    ),
+                                    "opaque_fields": [],
+                                    "hidden_fields": [],
+                                },
+                            }
+                        ],
+                    },
+                }
+            )
+            operations.append(
+                {
+                    "op": "add_binding",
+                    "target_action": target_action,
+                    "target_step_id": target_step_id,
+                    "parameter": parameter,
+                    "source_action": getter_name,
+                    "source_step_id": support_step_id,
+                    "source_path": "$",
+                    "mode": "derived_sources",
+                    "generation_kind": "normalization",
+                    "selector": "unique",
+                }
+            )
+            break
+    if not operations:
+        return None
+    return {
+        "base_revision": int(
+            plan.get("plan_revision", 1) or 1
+        ),
+        "reason": "为可确定的可选字段补充只读来源。",
+        "operations": operations,
+    }
+
+
+def _complete_optional_parameter_support(
+    plan: dict[str, Any],
+    prompt: str,
+    planner: Callable[[str], str],
+    available_tools: list[dict[str, Any]] | None,
+    trusted_identity_values: Sequence[str],
+    execution_contract: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    candidates = _optional_parameter_support_candidates(
+        plan,
+        available_tools or [],
+    )
+    if not candidates:
+        return plan
+    semantic_patch = _semantic_optional_support_patch(
+        plan,
+        candidates,
+        available_tools or [],
+    )
+    if semantic_patch is not None:
+        semantic_plan, semantic_updates, semantic_warnings = (
+            compile_runtime_plan_update(
+                plan,
+                json.dumps(semantic_patch, ensure_ascii=False),
+                available_tools,
+                trusted_identity_values=trusted_identity_values,
+                user_prompt=prompt,
+                proposed_tool_calls=[],
+                execution_contract=execution_contract,
+            )
+        )
+        if (
+            isinstance(semantic_plan, dict)
+            and semantic_plan.get("valid", False)
+            and semantic_updates
+        ):
+            plan = semantic_plan
+        else:
+            plan.setdefault("warnings", []).extend(
+                f"optional_semantic_support:{warning}"
+                for warning in semantic_warnings
+                if warning
+            )
+    candidates = _optional_parameter_support_candidates(
+        plan,
+        available_tools or [],
+    )
+    if not candidates:
+        return plan
+    allowed_suites = {
+        str(item)
+        for item in plan.get("allowed_suites", [])
+        if str(item).strip()
+    }
+    read_tools = [
+        dict(item)
+        for item in (available_tools or [])
+        if isinstance(item, Mapping)
+        and str(item.get("effect", "")) == "read"
+        and str(item.get("suite", "")) in allowed_suites
+    ]
+    request = (
+        OPTIONAL_PARAMETER_SUPPORT_PROMPT
+        + "\n\nOPTIONAL_SUPPORT_INPUT:\n"
+        + json.dumps(
+            {
+                "user_instruction": prompt,
+                "current_plan": plan,
+                "optional_candidates": candidates,
+                "available_tools": read_tools,
+                "trusted_identity_context_available": bool(
+                    trusted_identity_values
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
+    try:
+        response = planner(request)
+    except Exception as exc:
+        plan.setdefault("warnings", []).append(
+            f"optional_support_planner_failed:{exc}"
+        )
+        return plan
+    updated, updates, warnings = compile_runtime_plan_update(
+        plan,
+        response,
+        available_tools,
+        trusted_identity_values=trusted_identity_values,
+        user_prompt=prompt,
+        proposed_tool_calls=[],
+        execution_contract=execution_contract,
+    )
+    if (
+        isinstance(updated, dict)
+        and updated.get("valid", False)
+        and updates
+    ):
+        updated.setdefault("warnings", []).extend(
+            f"optional_support:{warning}"
+            for warning in warnings
+            if warning
+        )
+        return updated
+    plan.setdefault("warnings", []).extend(
+        f"optional_support:{warning}"
+        for warning in warnings
+        if warning
+    )
+    return plan
+
+
 def generate_task_data_plan(
     prompt: str,
     planner: Callable[[str], str] | None,
@@ -9986,6 +11015,17 @@ def generate_task_data_plan(
             plan,
             execution_contract,
         )
+        if plan.get("valid", False) and not plan.get(
+            "invalid_actions"
+        ):
+            plan = _complete_optional_parameter_support(
+                plan,
+                str(prompt),
+                planner,
+                available_tools,
+                trusted_identity_values,
+                execution_contract,
+            )
         contract_failures = validate_plan_against_contract(
             plan,
             execution_contract,
@@ -10057,6 +11097,19 @@ def generate_task_data_plan(
                                 "Cover every expected_flow_edges entry from "
                                 "execution_contract with one of its declared "
                                 "legal source alternatives."
+                            ),
+                            (
+                                "Perform a best-effort completion pass for every "
+                                "optional input field. Bind it when its value is "
+                                "grounded in the trusted user instruction or an "
+                                "earlier planned tool output, including "
+                                "semantically equivalent source fields such as "
+                                "an address for a location. Omit it only when "
+                                "the value cannot be determined reliably; "
+                                "if a minimal L0 getter can return the value from "
+                                "already known selectors, add that getter and bind "
+                                "the optional field. Omission must use the tool "
+                                "default and must not invalidate the plan."
                             ),
                             (
                                 "Verification-only reads such as checking a "
