@@ -268,6 +268,25 @@ def _expand_injection_spans(
         )
         if envelope is not None:
             start, end = envelope
+        elif "\n" in text:
+            paragraph_start = text.rfind("\n\n", 0, start)
+            paragraph_end = text.find("\n\n", end)
+            if paragraph_start >= 0 or paragraph_end >= 0:
+                start = (
+                    paragraph_start + 2
+                    if paragraph_start >= 0
+                    else 0
+                )
+                end = (
+                    paragraph_end
+                    if paragraph_end >= 0
+                    else len(text)
+                )
+            else:
+                line_start = text.rfind("\n", 0, start)
+                line_end = text.find("\n", end)
+                start = line_start + 1 if line_start >= 0 else 0
+                end = line_end if line_end >= 0 else len(text)
         expanded.append(
             {
                 "start": start,
