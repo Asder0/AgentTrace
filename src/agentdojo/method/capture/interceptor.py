@@ -29,6 +29,7 @@ from ..analysis import requirement_audit as requirement_audit_module
 from ..analysis.data_access import (
     action_data_access,
     canonicalize_resource_value,
+    composed_value_supports_origin,
     normalize_resource_source_path,
     project_agent_exposure,
     resolve_resource_parameter_resolutions,
@@ -482,12 +483,14 @@ def _plan_step_for_action(
             and (
                 str(
                     item.get("plan_step_id", "")
+                    or item.get("step_id", "")
                     or ""
                 )
                 in matching_steps
                 or (
                     not str(
                         item.get("plan_step_id", "")
+                        or item.get("step_id", "")
                         or ""
                     )
                     and tool_identity(
@@ -1218,7 +1221,13 @@ def _argument_flow_labels(
                     )
                 ] = origin
             for origin in all_origins:
-                if value_occurs_in_origin(scalar, origin, ""):
+                if (
+                    value_occurs_in_origin(scalar, origin, "")
+                    or composed_value_supports_origin(
+                        scalar,
+                        origin,
+                    )
+                ):
                     matches[
                         (
                             origin.app,
@@ -1263,7 +1272,16 @@ def _argument_flow_labels(
     for name, value in inputs.items():
         resolution = resolution_by_parameter.get(str(name), {})
         source_refs = [item for item in resolution.get("source_refs", []) if isinstance(item, dict)]
-        if any(str(item.get("source_kind", "")).lower() == "user_prompt" for item in source_refs):
+        is_user_prompt_literal = bool(
+            resolution.get("literal") is True
+            and str(resolution.get("source_kind", "")).lower()
+            == "user_prompt"
+        )
+        if is_user_prompt_literal or any(
+            str(item.get("source_kind", "")).lower()
+            == "user_prompt"
+            for item in source_refs
+        ):
             labels[str(name)] = make_flow_label(
                 confidentiality=make_confidentiality(
                     level="internal",
@@ -1606,6 +1624,10 @@ def _merge_verified_requirement_sources(
                         origin,
                         "",
                     )
+                    or composed_value_supports_origin(
+                        scalar,
+                        origin,
+                    )
                     for scalar in scalar_values(value)
                 )
             }
@@ -1908,19 +1930,11 @@ def _infer_suite_from_environment(environment: Any) -> str | None:
 
 def _trusted_identity_values(
     environment: Any,
-    prompt: str,
+    _prompt: str,
 ) -> tuple[str, ...]:
-    """Collect task-owned identities usable for first-person selectors."""
+    """Collect environment-owned identities usable as trusted selectors."""
     if environment is None:
         return ()
-    prompt_text = str(prompt or "").casefold()
-    first_person = bool(
-        re.search(
-        r"(?:\b(?:i|me|my|mine|myself)\b|我(?:的)?|本人|自己)",
-        prompt_text,
-        re.IGNORECASE,
-        )
-    )
 
     values: set[str] = set()
 
@@ -1945,19 +1959,7 @@ def _trusted_identity_values(
     if str(current_user).strip() and str(current_user) != "bot":
         values.add(str(current_user).strip())
 
-    if first_person:
-        return tuple(sorted(values))
-    return tuple(
-        sorted(
-            value
-            for value in values
-            if re.search(
-                rf"(?<![\w]){re.escape(value)}(?![\w])",
-                prompt_text,
-                re.IGNORECASE,
-            )
-        )
-    )
+    return tuple(sorted(values))
 
 
 def _identity_parameter_value(
@@ -3095,9 +3097,7 @@ def capture_tool_call(func: Callable):
         target_app = _infer_app_from_function(tracked_function)
         effect = tool_effect(base_function)
         current_options = get_config()
-        flow_user_prompt = (
-            ctx.current_reasoning.prompt if ctx.current_reasoning and ctx.current_reasoning.prompt else ctx.user_prompt
-        ) or ""
+        flow_user_prompt = ctx.user_prompt or ""
         plan_step_id = _plan_step_for_action(
             ctx.task_data_plan,
             tracked_function,
@@ -3456,6 +3456,7 @@ def capture_tool_call(func: Callable):
             "input_flow_label": input_flow_label,
             "thought": ctx.current_reasoning.response if ctx.current_reasoning else None,
             "thought_prompt": ctx.current_reasoning.prompt if ctx.current_reasoning else None,
+            "user_instruction": ctx.user_prompt,
             "type": "api_call_start",
         }
 
@@ -4708,6 +4709,11 @@ def capture_tool_call(func: Callable):
                     agent_result,
                     intent_data=intended_data_categories,
                     options=get_config(),
+                    detection_source=(
+                        result
+                        if agent_result is not result
+                        else None
+                    ),
                 )
             else:
                 final_result = agent_result
@@ -4854,13 +4860,19 @@ def capture_tool_call(func: Callable):
             update_activity_outcome(event_complete)
             raise
         except Exception as exc:
-            # The tool may already have committed a side effect. Preserve that
-            # fact in the trace while withholding the unprocessed result.
+            # The tool may already have committed a side effect. Roll back the
+            # local APP environment whenever the pre-execution snapshot can be
+            # restored, then withhold the unprocessed result.
+            rollback_applied = _restore_environment(
+                env,
+                execution_snapshot,
+            )
             event_complete["tool_status"] = "error" if error else "success"
             event_complete["status"] = "error"
             event_complete["error"] = error or f"PostExecutionPolicyError: {type(exc).__name__}: {exc}"
             event_complete["post_execution_error"] = f"{type(exc).__name__}: {exc}"
-            event_complete["execution_uncertain"] = True
+            event_complete["execution_rollback"] = rollback_applied
+            event_complete["execution_uncertain"] = not rollback_applied
             event_complete["quarantined"] = True
             event_complete["defense_diagnostics"] = {
                 "before": defense_diagnostics,

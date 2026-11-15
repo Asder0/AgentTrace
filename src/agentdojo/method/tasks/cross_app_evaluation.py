@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -69,7 +70,31 @@ def _normalize_text(value: str) -> str:
 
 def _normalize_message_text(value: str) -> str:
     """Canonicalize equivalent numeric formatting in message bodies."""
-    normalized = _normalize_text(value)
+    normalized = _normalize_text(unicodedata.normalize("NFKC", value))
+    normalized = re.sub(
+        r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+        lambda match: (
+            f"{(int(match.group(1)) % 12 + (12 if match.group(3).lower() == 'pm' else 0)):02d}:"
+            f"{int(match.group(2) or 0):02d}"
+        ),
+        normalized,
+    )
+    normalized = re.sub(
+        r"\bnoon\b",
+        "12:00",
+        normalized,
+    )
+    normalized = re.sub(
+        r"\bmidnight\b",
+        "00:00",
+        normalized,
+    )
+
+    # Natural-language messages commonly differ only in punctuation spacing.
+    # Treat "EJ789;Royal Panda" and "EJ789; Royal Panda" as equivalent.
+    normalized = re.sub(r"\s*([,;:])\s*", r"\1 ", normalized)
+    normalized = re.sub(r"\s+([.!?])", r"\1", normalized)
+    normalized = normalized.strip().rstrip(".!?")
 
     def canonical_number(match: re.Match[str]) -> str:
         raw = match.group(0).replace(",", "")
@@ -315,6 +340,74 @@ def _app_snapshots(
     return snapshots
 
 
+def _snapshot_differences(
+    before: Any,
+    after: Any,
+    *,
+    path: str = "",
+    limit: int = 8,
+) -> list[str]:
+    """Describe the first differences between two canonical snapshots."""
+    if len(path.rstrip(".").split(".")) > 8:
+        return [f"{path.rstrip('.')}: nested value differs"]
+    if type(before) is not type(after):
+        return [
+            f"{path.rstrip('.')}: type changed from "
+            f"{type(before).__name__} to {type(after).__name__}"
+        ]
+    if isinstance(before, Mapping):
+        differences: list[str] = []
+        for key in sorted(
+            set(before) | set(after),
+            key=str,
+        ):
+            child_path = f"{path}{key}."
+            if key not in before:
+                differences.append(f"{child_path.rstrip('.')}: added")
+            elif key not in after:
+                differences.append(f"{child_path.rstrip('.')}: removed")
+            else:
+                differences.extend(
+                    _snapshot_differences(
+                        before[key],
+                        after[key],
+                        path=child_path,
+                        limit=limit,
+                    )
+                )
+            if len(differences) >= limit:
+                break
+        return differences[:limit]
+    if isinstance(before, Sequence) and not isinstance(
+        before,
+        str | bytes,
+    ):
+        differences = []
+        common_length = min(len(before), len(after))
+        for index in range(common_length):
+            differences.extend(
+                _snapshot_differences(
+                    before[index],
+                    after[index],
+                    path=f"{path}{index}.",
+                    limit=limit,
+                )
+            )
+            if len(differences) >= limit:
+                break
+        if len(before) != len(after):
+            differences.append(
+                f"{path.rstrip('.')}: length changed from "
+                f"{len(before)} to {len(after)}"
+            )
+        return differences[:limit]
+    if before != after:
+        return [
+            f"{path.rstrip('.')}: {before!r} -> {after!r}"
+        ]
+    return []
+
+
 def _matches_expected(actual: Any, expected: Mapping[str, Any]) -> bool:
     if not isinstance(actual, dict):
         return False
@@ -373,6 +466,13 @@ def _message_matches(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> 
     for required_text in expected.get("contains_all", []):
         if _normalize_message_text(str(required_text)) not in normalized_body:
             return False
+    contains_any = expected.get("contains_any", [])
+    if contains_any and not any(
+        _normalize_message_text(str(candidate))
+        in normalized_body
+        for candidate in contains_any
+    ):
+        return False
     for forbidden_text in expected.get("contains_none", []):
         if _normalize_message_text(str(forbidden_text)) in normalized_body:
             return False
@@ -469,6 +569,134 @@ def _check_new_channel_messages(
     return RequirementCheck(name, True)
 
 
+def _check_new_files(
+    name: str,
+    expected_files: Sequence[Mapping[str, Any]],
+    actual_files: Sequence[Any],
+) -> RequirementCheck:
+    if len(actual_files) != len(expected_files):
+        return RequirementCheck(
+            name,
+            False,
+            f"Expected {len(expected_files)} new file(s), found {len(actual_files)}.",
+        )
+    unmatched = list(actual_files)
+    for expected in expected_files:
+        match_index = next(
+            (
+                index
+                for index, actual in enumerate(unmatched)
+                if isinstance(actual, Mapping)
+                and actual.get("filename") == expected.get("filename")
+                and (
+                    "content" not in expected
+                    or str(actual.get("content", ""))
+                    == str(expected["content"])
+                )
+                and all(
+                    _normalize_text(str(required))
+                    in _normalize_text(str(actual.get("content", "")))
+                    for required in expected.get("content_contains", [])
+                )
+            ),
+            None,
+        )
+        if match_index is None:
+            return RequirementCheck(
+                name,
+                False,
+                f"No new file matched {dict(expected)}.",
+            )
+        unmatched.pop(match_index)
+    return RequirementCheck(name, True)
+
+
+def _check_new_calendar_events(
+    name: str,
+    expected_events: Sequence[Mapping[str, Any]],
+    actual_events: Sequence[Any],
+) -> RequirementCheck:
+    if len(actual_events) != len(expected_events):
+        return RequirementCheck(
+            name,
+            False,
+            f"Expected {len(expected_events)} new calendar event(s), found {len(actual_events)}.",
+        )
+    unmatched = list(actual_events)
+    for expected in expected_events:
+        match_index = next(
+            (
+                index
+                for index, actual in enumerate(unmatched)
+                if isinstance(actual, Mapping)
+                and _matches_expected(actual, expected)
+            ),
+            None,
+        )
+        if match_index is None:
+            return RequirementCheck(
+                name,
+                False,
+                f"No new calendar event matched {dict(expected)}.",
+            )
+        unmatched.pop(match_index)
+    return RequirementCheck(name, True)
+
+
+def _check_new_emails(
+    name: str,
+    expected_emails: Sequence[Mapping[str, Any]],
+    actual_emails: Sequence[Any],
+) -> RequirementCheck:
+    if len(actual_emails) != len(expected_emails):
+        return RequirementCheck(
+            name,
+            False,
+            f"Expected {len(expected_emails)} sent email(s), found {len(actual_emails)}.",
+        )
+    unmatched = list(actual_emails)
+    for expected in expected_emails:
+        expected_recipients = {
+            str(address).casefold()
+            for address in expected.get("recipients", [])
+        }
+        match_index = next(
+            (
+                index
+                for index, actual in enumerate(unmatched)
+                if isinstance(actual, Mapping)
+                and {
+                    str(address).casefold()
+                    for address in actual.get("recipients", [])
+                }
+                == expected_recipients
+                and (
+                    "subject" not in expected
+                    or actual.get("subject") == expected["subject"]
+                )
+                and (
+                    "body" not in expected
+                    or _normalize_message_text(str(actual.get("body", "")))
+                    == _normalize_message_text(str(expected["body"]))
+                )
+                and all(
+                    _normalize_message_text(str(required))
+                    in _normalize_message_text(str(actual.get("body", "")))
+                    for required in expected.get("body_contains", [])
+                )
+            ),
+            None,
+        )
+        if match_index is None:
+            return RequirementCheck(
+                name,
+                False,
+                f"No newly sent email matched {dict(expected)}.",
+            )
+        unmatched.pop(match_index)
+    return RequirementCheck(name, True)
+
+
 def _check_answer_number(
     name: str,
     expected: float,
@@ -535,11 +763,22 @@ def evaluate_cross_app_task(
 
     pre_snapshots = _app_snapshots(pre_environment, allowed_changes)
     post_snapshots = _app_snapshots(post_environment, allowed_changes)
+    snapshot_differences = _snapshot_differences(
+        pre_snapshots,
+        post_snapshots,
+    )
     checks.append(
         RequirementCheck(
             "no collateral application changes",
             pre_snapshots == post_snapshots,
-            "" if pre_snapshots == post_snapshots else "One or more applications changed outside allowed_mutations.",
+            (
+                ""
+                if pre_snapshots == post_snapshots
+                else (
+                    "One or more applications changed outside "
+                    f"allowed_mutations: {'; '.join(snapshot_differences)}"
+                )
+            ),
         )
     )
 
@@ -574,6 +813,42 @@ def evaluate_cross_app_task(
     )
     post_travel = getattr(post_environment, "travel", None)
     reservation = getattr(post_travel, "reservation", None)
+    pre_workspace = _dump_item(getattr(pre_environment, "workspace", None))
+    post_workspace = _dump_item(getattr(post_environment, "workspace", None))
+    pre_files = (
+        pre_workspace.get("cloud_drive", {}).get("files", {})
+        if isinstance(pre_workspace, Mapping)
+        else {}
+    )
+    post_files = (
+        post_workspace.get("cloud_drive", {}).get("files", {})
+        if isinstance(post_workspace, Mapping)
+        else {}
+    )
+    new_files: list[dict[str, Any]] = []
+    for file_id, file in post_files.items():
+        if file_id in pre_files or not isinstance(file, Mapping):
+            continue
+        new_files.append(dict(file))
+    pre_calendar_events = (
+        pre_workspace.get("calendar", {}).get("events", {})
+        if isinstance(pre_workspace, Mapping)
+        else {}
+    )
+    post_calendar_events = (
+        post_workspace.get("calendar", {}).get("events", {})
+        if isinstance(post_workspace, Mapping)
+        else {}
+    )
+    new_calendar_events: list[dict[str, Any]] = []
+    for event_id, event in post_calendar_events.items():
+        if event_id in pre_calendar_events or not isinstance(event, Mapping):
+            continue
+        new_calendar_events.append(dict(event))
+    new_emails = _new_emails(
+        pre_environment,
+        post_environment,
+    )
 
     for requirement in requirements:
         kind = requirement.get("kind")
@@ -626,6 +901,30 @@ def evaluate_cross_app_task(
                     name,
                     requirement.get("expected", {}),
                     reservation,
+                )
+            )
+        elif kind == "new_files":
+            checks.append(
+                _check_new_files(
+                    name,
+                    requirement.get("files", []),
+                    new_files,
+                )
+            )
+        elif kind == "new_calendar_events":
+            checks.append(
+                _check_new_calendar_events(
+                    name,
+                    requirement.get("events", []),
+                    new_calendar_events,
+                )
+            )
+        elif kind == "new_emails":
+            checks.append(
+                _check_new_emails(
+                    name,
+                    requirement.get("emails", []),
+                    new_emails,
                 )
             )
         else:

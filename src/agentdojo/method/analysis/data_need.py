@@ -49,6 +49,7 @@ from .data_access import (
     compile_data_access,
     compile_resource_access,
     value_occurs_in_origin,
+    value_occurs_in_trusted_text,
 )
 from .execution_contract import validate_plan_against_contract
 from .outcome_audit import normalize_required_outcomes
@@ -2166,6 +2167,21 @@ def _literal_is_grounded(value: Any, prompt_text: str) -> bool:
         " ",
         str(prompt_text or ""),
     ).casefold()
+    if len(normalized_value) >= 2:
+        semantic_type = (
+            "datetime"
+            if re.match(
+                r"^\d{4}-\d{2}-\d{2}"
+                r"(?:[T ]\d{2}:\d{2})?$",
+                rendered,
+            )
+            else ""
+        )
+        return value_occurs_in_trusted_text(
+            rendered,
+            str(prompt_text or ""),
+            semantic_type,
+        )
     if bool(normalized_value) and normalized_value in normalized_prompt:
         return True
     return _temporal_literal_is_grounded(
@@ -2179,17 +2195,56 @@ _MONTH_NAME_PATTERN = (
     r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
     r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
 )
+_PROMPT_TIME_PATTERN = (
+    r"(?:(?:noon|midnight)|"
+    r"\d{1,2}(?::\d{2})?\s*[AP]M|"
+    r"\d{1,2}:\d{2})"
+)
 _PROMPT_DATE_RE = re.compile(
     rf"(?:{_MONTH_NAME_PATTERN}\.?\s+\d{{1,2}}"
     r"(?:st|nd|rd|th)?(?:,?\s+\d{4})?"
-    r"(?:\s+(?:at\s+)?\d{1,2}:\d{2}(?:\s*[AP]M)?)?|"
+    rf"(?:\s+(?:at\s+)?{_PROMPT_TIME_PATTERN})?|"
     r"\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?"
     rf"{_MONTH_NAME_PATTERN}(?:,?\s+\d{{4}})?"
-    r"(?:\s+(?:at\s+)?\d{1,2}:\d{2}(?:\s*[AP]M)?)?|"
+    rf"(?:\s+(?:at\s+)?{_PROMPT_TIME_PATTERN})?|"
     r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?|"
     r"\d{1,2}/\d{1,2}/\d{2,4})",
     re.IGNORECASE,
 )
+
+
+def _parse_prompt_time(value: str) -> tuple[int, int] | None:
+    """Parse common clock expressions used in natural-language task prompts."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    if not text:
+        return None
+    if text == "noon":
+        return 12, 0
+    if text == "midnight":
+        return 0, 0
+    match = re.fullmatch(
+        r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)",
+        text,
+    )
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        marker = match.group(3)
+        if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+            return None
+        if marker == "pm" and hour < 12:
+            hour += 12
+        elif marker == "am" and hour == 12:
+            hour = 0
+        return hour, minute
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    return hour, minute
 
 
 def _temporal_literal_is_grounded(value: str, prompt_text: str) -> bool:
@@ -2208,10 +2263,16 @@ def _temporal_literal_is_grounded(value: str, prompt_text: str) -> bool:
     expected_has_time = bool(re.search(r"[T ]\d{2}:\d{2}", value))
     for match in _PROMPT_DATE_RE.finditer(prompt_text):
         fragment = match.group(0)
+        date_fragment = re.sub(
+            rf"\s+(?:at\s+)?{_PROMPT_TIME_PATTERN}\s*$",
+            "",
+            fragment,
+            flags=re.IGNORECASE,
+        )
         cleaned = re.sub(
             r"(?<=\d)(?:st|nd|rd|th)\b",
             "",
-            fragment,
+            date_fragment,
             flags=re.IGNORECASE,
         ).replace(" of ", " ")
         try:
@@ -2230,7 +2291,13 @@ def _temporal_literal_is_grounded(value: str, prompt_text: str) -> bool:
             continue
         if re.search(r"\b\d{4}\b", fragment) and actual.year != expected.year:
             continue
-        fragment_has_time = bool(re.search(r"\d{1,2}:\d{2}", fragment))
+        fragment_has_time = bool(
+            re.search(
+                _PROMPT_TIME_PATTERN,
+                fragment,
+                re.IGNORECASE,
+            )
+        )
         if expected_has_time and (
             not fragment_has_time or actual.hour != expected.hour or actual.minute != expected.minute
         ):
@@ -2242,22 +2309,17 @@ def _temporal_literal_is_grounded(value: str, prompt_text: str) -> bool:
     prompt_dates: list[str] = []
     prompt_times: list[tuple[int, int]] = []
     for time_match in re.finditer(
-        r"\b(\d{1,2}):(\d{2})(?:\s*([AP]M))?\b",
+        rf"\b(?:{_PROMPT_TIME_PATTERN})\b",
         prompt_text,
         re.IGNORECASE,
     ):
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2))
-        marker = str(time_match.group(3) or "").upper()
-        if marker == "PM" and hour < 12:
-            hour += 12
-        elif marker == "AM" and hour == 12:
-            hour = 0
-        prompt_times.append((hour, minute))
+        parsed_time = _parse_prompt_time(time_match.group(0))
+        if parsed_time is not None:
+            prompt_times.append(parsed_time)
     for match in _PROMPT_DATE_RE.finditer(prompt_text):
         fragment = match.group(0)
         date_fragment = re.sub(
-            r"\s+(?:at\s+)?\d{1,2}:\d{2}(?:\s*[AP]M)?",
+            rf"\s+(?:at\s+)?{_PROMPT_TIME_PATTERN}\s*$",
             "",
             fragment,
             flags=re.IGNORECASE,
@@ -2326,7 +2388,7 @@ def _temporal_literal_is_grounded(value: str, prompt_text: str) -> bool:
             return False
         # A date and a time may be stated separately in the same sentence.
         prompt_without_times = re.sub(
-            r"\b\d{1,2}:\d{2}(?:\s*[AP]M)?\b",
+            rf"\b(?:{_PROMPT_TIME_PATTERN})\b",
             "",
             prompt_text,
             flags=re.IGNORECASE,
@@ -2375,7 +2437,7 @@ def _temporal_literal_date_is_grounded(
     expected_year, expected_month, expected_day = (int(item) for item in value_match.groups())
     for match in _PROMPT_DATE_RE.finditer(prompt_text):
         fragment = re.sub(
-            r"\s+(?:at\s+)?\d{1,2}:\d{2}(?:\s*[AP]M)?",
+            rf"\s+(?:at\s+)?{_PROMPT_TIME_PATTERN}\s*$",
             "",
             match.group(0),
             flags=re.IGNORECASE,
@@ -2418,6 +2480,7 @@ def _authorization_value_is_grounded(
     value: Any,
     prompt_text: str,
     trusted_identity_values: Sequence[str] = (),
+    semantic_type: str = "",
 ) -> bool:
     """Ground a selector in the prompt or a trusted task identity."""
     rendered = str(value).strip()
@@ -2427,42 +2490,61 @@ def _authorization_value_is_grounded(
     trusted = {
         re.sub(r"\s+", " ", str(item)).strip().casefold() for item in trusted_identity_values if str(item).strip()
     }
+    semantic = str(semantic_type).strip().lower()
     if normalized in trusted:
-        return True
-    negative_pattern = re.compile(
-        r"(?:\b(?:not|never|without|except|excluding|avoid|"
-        r"do\s+not|don't|must\s+not|should\s+not|cannot|can't)\b|"
-        r"不要|不得|禁止|不能|不可|除外|排除|无需|避免)",
-        re.IGNORECASE,
-    )
-
-    def contains_value(clause: str) -> bool:
-        return bool(
-            re.search(
-                rf"(?<![\w@]){re.escape(normalized)}(?![\w@])",
-                clause,
-                re.IGNORECASE,
-            )
-        )
-
-    for clause in re.split(
-        r"(?<=[.!?;])(?=\s|$)|[；，。！？]\s*|\n+|,\s*",
-        str(prompt_text or ""),
-    ):
-        normalized_clause = (
-            re.sub(
-                r"\s+",
-                " ",
-                clause,
-            )
-            .strip()
-            .casefold()
-        )
-        if not contains_value(normalized_clause):
-            continue
-        if not negative_pattern.search(normalized_clause):
+        if semantic == "email":
+            if re.fullmatch(
+                r"[^@\s]+@[^@\s]+\.[^@\s]+",
+                normalized,
+            ):
+                return True
+        elif semantic == "iban":
+            if re.fullmatch(
+                r"[a-z]{2}\d{2}[a-z0-9]{10,30}",
+                normalized,
+            ):
+                return True
+        elif semantic in {"slack_user", "user"}:
+            if (
+                "@" not in normalized
+                and not re.fullmatch(
+                    r"[a-z]{2}\d{2}[a-z0-9]{10,30}",
+                    normalized,
+                )
+            ):
+                return True
+        elif not semantic:
             return True
-    return False
+    if (
+        trusted
+        and str(semantic_type).strip().lower()
+        in {"slack_user", "user", "email"}
+        and normalized
+        in {
+            "current_user",
+            "current user",
+            "me",
+            "myself",
+            "self",
+        }
+    ):
+        return True
+    return value_occurs_in_trusted_text(
+        rendered,
+        str(prompt_text or ""),
+        (
+            semantic_type
+            or (
+                "datetime"
+                if re.match(
+                    r"^\d{4}-\d{2}-\d{2}"
+                    r"(?:[T ]\d{2}:\d{2})?$",
+                    rendered,
+                )
+                else ""
+            )
+        ),
+    )
 
 
 def _resource_authorization_errors(
@@ -2495,6 +2577,7 @@ def _resource_authorization_errors(
                 value,
                 prompt_text,
                 trusted_identity_values,
+                str(raw_rule.get("semantic_type", "")),
             ):
                 errors.append(f"{contract_kind}_value_not_grounded:{action_name}:{raw_name}:{value}")
     return errors
@@ -2516,16 +2599,48 @@ def _destination_authorization_errors(
     values = destination.get("allowed_values", [])
     if not isinstance(values, list):
         values = [values]
-    return [
-        f"destination_value_not_grounded:{action_name}:{value}"
-        for value in values
-        if value not in (None, "")
-        and not _authorization_value_is_grounded(
+    semantic_types = destination.get("semantic_types", {})
+    semantic_types = (
+        semantic_types
+        if isinstance(semantic_types, Mapping)
+        else {}
+    )
+    distinct_semantic_types = {
+        str(item).strip().lower()
+        for item in semantic_types.values()
+        if str(item).strip()
+    }
+    errors: list[str] = []
+    for value in values:
+        if value in (None, ""):
+            continue
+        rendered = str(value)
+        if len(distinct_semantic_types) == 1:
+            semantic_type = next(
+                iter(distinct_semantic_types)
+            )
+        elif re.fullmatch(
+            r"[^@\s]+@[^@\s]+\.[^@\s]+",
+            rendered,
+        ):
+            semantic_type = "email"
+        elif re.fullmatch(
+            r"[A-Za-z]{2}\d{2}[A-Za-z0-9]{10,30}",
+            rendered,
+        ):
+            semantic_type = "iban"
+        else:
+            semantic_type = "slack_user"
+        if not _authorization_value_is_grounded(
             value,
             prompt_text,
             trusted_identity_values,
-        )
-    ]
+            semantic_type,
+        ):
+            errors.append(
+                f"destination_value_not_grounded:{action_name}:{value}"
+            )
+    return errors
 
 
 def _explicit_authorization_is_grounded(
@@ -2587,107 +2702,6 @@ def _contract_max_confidentiality(
     if CONFIDENTIALITY_LEVELS.get(tool_level, 3) > CONFIDENTIALITY_LEVELS.get(source_max, 0):
         return tool_level
     return source_max
-
-
-_SEMANTIC_COPY_SELECTORS = frozenset(
-    {
-        "latest",
-        "most_recent",
-        "newest",
-    }
-)
-
-
-def _normalize_semantic_copy_bindings(
-    raw_flow_contract: Any,
-    *,
-    source_registry: Mapping[str, Mapping[str, Any]],
-    action_name: str,
-) -> list[str]:
-    """Convert semantic latest selectors into auditable source selection."""
-    if not isinstance(raw_flow_contract, dict):
-        return []
-    raw_bindings = raw_flow_contract.get("parameter_bindings")
-    if not isinstance(raw_bindings, dict):
-        return []
-    warnings: list[str] = []
-    for raw_parameter, raw_binding in raw_bindings.items():
-        if not isinstance(raw_binding, dict):
-            continue
-        if str(raw_binding.get("mode", "copy")).lower() != "copy":
-            continue
-        selector = str(raw_binding.get("selector", "unique")).lower()
-        if selector not in _SEMANTIC_COPY_SELECTORS:
-            continue
-        parameter = str(raw_parameter)
-        raw_source = raw_binding.get("source_ref")
-        source_id = str(
-            raw_binding.get("source_id")
-            or (
-                raw_source.get("source_id")
-                or raw_source.get("id")
-                if isinstance(raw_source, Mapping)
-                else raw_source
-            )
-            or ""
-        ).strip()
-        source_ref = source_registry.get(source_id)
-        if not isinstance(source_ref, Mapping):
-            warnings.append(
-                "binding_selector_requires_known_source:"
-                f"{action_name}:{parameter}:{selector}"
-            )
-            continue
-        source_path = normalize_source_path(
-            str(raw_binding.get("source_path", ""))
-        )
-        if not source_path:
-            warnings.append(
-                "binding_selector_requires_source_path:"
-                f"{action_name}:{parameter}:{selector}"
-            )
-            continue
-        allowed_ref = {
-            "source_id": source_id,
-            "app": str(source_ref.get("app", "")),
-            "entity": str(source_ref.get("entity", "")),
-            "source_action": str(
-                source_ref.get("source_action", "")
-            ),
-            "source_path": source_path,
-        }
-        required_ref = {
-            **allowed_ref,
-            "producer_step": str(
-                source_ref.get("producer_step", "")
-            ),
-        }
-        constraints = raw_binding.get("constraints")
-        constraints = (
-            copy.deepcopy(constraints)
-            if isinstance(constraints, Mapping)
-            else {}
-        )
-        constraints.setdefault("must_not_introduce_facts", True)
-        constraints["selection_criterion"] = selector
-        raw_binding.clear()
-        raw_binding.update(
-            {
-                "mode": "derived_sources",
-                "generation_kind": "selection",
-                "required_sources": [source_id],
-                "allowed_source_refs": [allowed_ref],
-                "required_source_refs": [required_ref],
-                "allowed_source_paths": [source_path],
-                "required_source_groups": [],
-                "constraints": constraints,
-            }
-        )
-        warnings.append(
-            "semantic_copy_selector_normalized:"
-            f"{action_name}:{parameter}:{selector}"
-        )
-    return warnings
 
 
 def _resolve_copy_binding_source_refs(
@@ -2763,17 +2777,10 @@ def _normalize_flow_binding_references(
     action_name: str,
 ) -> list[str]:
     """Apply deterministic binding normalizations before compilation."""
-    warnings = _normalize_semantic_copy_bindings(
+    warnings = _resolve_copy_binding_source_refs(
         raw_flow_contract,
         source_registry=source_registry,
         action_name=action_name,
-    )
-    warnings.extend(
-        _resolve_copy_binding_source_refs(
-            raw_flow_contract,
-            source_registry=source_registry,
-            action_name=action_name,
-        )
     )
     return warnings
 
@@ -3774,6 +3781,7 @@ def _validate_task_plan(
     prompt: str,
     available_tools: list[dict[str, Any]] | None = None,
     trusted_identity_values: Sequence[str] = (),
+    execution_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     warnings: list[str] = []
     plan_structure_valid = True
@@ -3784,12 +3792,31 @@ def _validate_task_plan(
     for name in tool_catalog:
         tools_by_base.setdefault(base_tool_name(name), []).append(name)
 
-    def canonical_tool(name: str) -> str:
+    contract_actions_by_step: dict[str, list[str]] = {}
+    if isinstance(execution_contract, Mapping):
+        for contract_step in execution_contract.get("required_steps", []) or []:
+            if not isinstance(contract_step, Mapping):
+                continue
+            step_id = str(contract_step.get("id", "")).strip()
+            action_name = str(contract_step.get("action", "")).strip()
+            if step_id and action_name in tool_catalog:
+                contract_actions_by_step.setdefault(step_id, []).append(
+                    action_name
+                )
+
+    def canonical_tool(name: str, step_id: str = "") -> str:
         candidate = str(name).strip()
         if not tool_catalog or candidate in tool_catalog:
             return candidate
         matches = tools_by_base.get(base_tool_name(candidate), [])
-        return matches[0] if len(matches) == 1 else ""
+        if len(matches) == 1:
+            return matches[0]
+        contracted = [
+            action
+            for action in contract_actions_by_step.get(step_id, [])
+            if action in matches
+        ]
+        return contracted[0] if len(contracted) == 1 else ""
 
     prompt_text = " ".join(str(prompt).casefold().split())
     allowed_effects_guard = {"read", "write", "privilege", "egress"}
@@ -3895,7 +3922,10 @@ def _validate_task_plan(
                     data_flow_bindings = None
                     data_access = None
                     resource_access = None
-                canonical = canonical_tool(str(action_name))
+                canonical = canonical_tool(
+                    str(action_name),
+                    step_id,
+                )
                 if not canonical:
                     reason = f"unknown_allowed_action:{action_name}"
                     warnings.append(reason)
@@ -5897,6 +5927,10 @@ def _validate_task_plan(
             if isinstance(action, Mapping) and action.get("name")
         ]
         valid_applies_to: list[str] = []
+        applies_to_is_authoritative = kind in {
+            "action",
+            "constraint",
+        }
         for target in outcome.get("applies_to", []) or []:
             target = str(target).strip()
             if not target:
@@ -5968,7 +6002,8 @@ def _validate_task_plan(
                     f"{outcome['id']}:{target}:"
                     f"{sorted(candidate_targets)}"
                 )
-                plan_structure_valid = False
+                if applies_to_is_authoritative:
+                    plan_structure_valid = False
             else:
                 warnings.append(
                     f"invalid_outcome_applies_to:{outcome['id']}:{target}"
@@ -5978,7 +6013,7 @@ def _validate_task_plan(
                         "constraint_applies_to_unplanned_action_ignored:"
                         f"{outcome['id']}:{target}"
                     )
-                else:
+                elif applies_to_is_authoritative:
                     plan_structure_valid = False
         outcome["applies_to"] = valid_applies_to
         valid_required_sources: list[dict[str, str]] = []
@@ -9937,6 +9972,7 @@ def generate_task_data_plan(
             str(prompt),
             available_tools,
             trusted_identity_values=trusted_identity_values,
+            execution_contract=execution_contract,
         )
         alignment_failures = align_plan_step_ids(
             plan,
@@ -10065,6 +10101,7 @@ def generate_task_data_plan(
                 str(prompt),
                 available_tools,
                 trusted_identity_values=trusted_identity_values,
+                execution_contract=execution_contract,
             )
             repaired_alignment_failures = align_plan_step_ids(
                 repaired,

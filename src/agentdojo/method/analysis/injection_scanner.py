@@ -47,27 +47,6 @@ DEFAULT_CHUNK_CHARS = 2048
 DEFAULT_OVERLAP_CHARS = 256
 DEFAULT_CONTEXT_WINDOW_CHARS = 512
 
-_DIRECT_INJECTION_MARKER_RE = re.compile(
-    r"(?:"
-    r"ignore\s+(?:all\s+)?(?:the\s+)?(?:previous|prior|above)\s+"
-    r"(?:instructions|rules)|"
-    r"disregard\s+(?:all\s+)?(?:previous|prior|above)\s+"
-    r"(?:instructions|rules)|"
-    r"forget\s+(?:all\s+)?(?:previous|prior|above)\s+"
-    r"(?:instructions|rules)|"
-    r"(?:reveal|print|show|repeat)\s+(?:the\s+)?"
-    r"(?:system|developer)\s+(?:prompt|message|instructions)|"
-    r"(?:system|developer)\s+(?:prompt|message)|"
-    r"jailbreak|developer\s+mode|"
-    r"bypass\s+(?:the\s+)?(?:safety|security)\s+(?:policy|rules)|"
-    r"act\s+as\s+(?:a\s+)?system|you\s+are\s+now\s+(?:a\s+)?system|"
-    r"忽略(?:之前|以上|所有|前面)?的?指令|"
-    r"无视(?:之前|以上|所有|前面)?的?指令|"
-    r"显示(?:系统|开发者)(?:提示词|消息)|"
-    r"绕过(?:安全|防护)(?:策略|规则)"
-    r")",
-    re.IGNORECASE,
-)
 DEFAULT_CONTEXT_OVERLAP_CHARS = 128
 DEFAULT_NATIVE_CHUNK_CHARS = 2048
 DEFAULT_NATIVE_OVERLAP_CHARS = 256
@@ -81,6 +60,17 @@ _EMAIL_IN_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _CONTROLLER_REFERENCE_RE = re.compile(r"\[\[(?:SENSITIVE_REF:.+?|DATA_REMOVED)\]\]")
+_DIRECT_OVERRIDE_RE = re.compile(
+    r"(?:<\s*(?:information|system|instructions|important)\b"
+    r"|<\|\s*(?:im_start|im_end|system|assistant)\s*\|>"
+    r"|\b(?:ignore|disregard|override)\s+(?:all\s+)?(?:the\s+)?"
+    r"(?:previous|prior|above|system|developer)\b"
+    r"|\b(?:system|developer)\s+(?:prompt|message|instructions)\b"
+    r"|\breveal\s+(?:the\s+)?system\s+prompt\b"
+    r"|\byou\s+are\s+now\s+(?:a|an|the|system|developer)\b"
+    r")",
+    re.IGNORECASE,
+)
 SECURITY_PLACEHOLDER_NOTICE = (
     "AgentTrace security notice: the marker "
     f"'{DIRECT_INJECTION_PLACEHOLDER}' is controller-generated "
@@ -291,7 +281,9 @@ class InjectionScanner:
         self.overlap_tokens = max(0, min(int(overlap_tokens), self.chunk_tokens - 1))
         self.max_chunks = max(1, int(max_chunks))
         self.full_text_gate = bool(full_text_gate)
-        self.trusted_instruction_mode = bool(trusted_instruction_mode)
+        self.trusted_instruction_mode = bool(
+            trusted_instruction_mode
+        )
         self._cache: dict[str, InjectionScanResult] = {}
         self._lock = threading.Lock()
 
@@ -369,6 +361,18 @@ class InjectionScanner:
                     InjectionScanResult(
                         detector=self.detector_name,
                         threshold=self.threshold,
+                    )
+                )
+                continue
+            if (
+                self.trusted_instruction_mode
+                and not _DIRECT_OVERRIDE_RE.search(value)
+            ):
+                results[index] = self._decorate_result(
+                    InjectionScanResult(
+                        detector=self.detector_name,
+                        threshold=self.threshold,
+                        chunk_count=1,
                     )
                 )
                 continue
@@ -556,21 +560,6 @@ class InjectionScanner:
                         max_score,
                         context_score_by_value.get(value, 0.0),
                     )
-                trusted_command_without_marker = bool(
-                    self.trusted_instruction_mode
-                    and self.full_text_gate
-                    and chunks
-                    and not _DIRECT_INJECTION_MARKER_RE.search(value)
-                )
-                if trusted_command_without_marker:
-                    # A trusted user's ordinary imperative ("then send Bob a
-                    # message") is an authorization request, not an attempt
-                    # to override the system. Privilege-escalation language
-                    # still enters quarantine below.
-                    chunks = []
-                    document_score = None
-                    context_score_by_value[value] = 0.0
-                    max_score = 0.0
                 result = self._decorate_result(
                     InjectionScanResult(
                         suspected=bool(chunks) or document_score is not None,
@@ -1106,6 +1095,7 @@ def configure_direct_injection_classifier(
             classifier,
             threshold=threshold,
             full_text_gate=True,
+            trusted_instruction_mode=True,
         )
         return _DIRECT_INJECTION_SCANNER
 

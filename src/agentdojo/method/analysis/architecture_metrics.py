@@ -19,6 +19,7 @@ from ..modeling.policy import (
     tool_identity,
 )
 from .artifact_semantics import resolve_artifact_target_parameters
+from .data_access import value_occurs_in_trusted_text
 from .execution_contract import validate_plan_against_contract
 from .plan_actions import plan_action_identity
 from .plan_identity import plan_hash_valid
@@ -257,6 +258,7 @@ def evaluate_plan_execution_conformance(
     final_plan: Mapping[str, Any] | None = None,
     execution_contract: Mapping[str, Any] | None = None,
     events: Sequence[Mapping[str, Any]] = (),
+    user_prompt: str = "",
 ) -> dict[str, Any]:
     """Compare actual data and control edges with each action's frozen plan."""
     graph = graph if isinstance(graph, Mapping) else {}
@@ -1903,6 +1905,9 @@ def evaluate_plan_execution_conformance(
         tuple[int, str, str, str],
         list[dict[str, Any]],
     ] = defaultdict(list)
+    bound_parameter_keys: set[
+        tuple[int, str, str, str]
+    ] = set()
     actual_edge_list: list[dict[str, Any]] = []
     unplanned_actions: list[dict[str, Any]] = []
     for node in nodes:
@@ -1935,12 +1940,70 @@ def evaluate_plan_execution_conformance(
             or node.get("subgoal_id")
             or ""
         )
+        for contract_name in (
+            "flow_contract",
+            "data_flow_bindings",
+        ):
+            flow_contract = action.get(contract_name)
+            if not isinstance(flow_contract, Mapping):
+                continue
+            parameter_bindings = flow_contract.get(
+                "parameter_bindings",
+                {},
+            )
+            if isinstance(parameter_bindings, Mapping):
+                for parameter in parameter_bindings:
+                    bound_parameter_keys.add(
+                        (
+                            reference_revision,
+                            target_step_id,
+                            target_parameter,
+                            str(parameter),
+                        )
+                    )
+        for contract_name in (
+            "data_access",
+            "resource_access",
+        ):
+            resource_contract = action.get(contract_name)
+            if not isinstance(resource_contract, Mapping):
+                continue
+            resource_parameters = resource_contract.get(
+                "resource_parameters",
+                {},
+            )
+            if isinstance(resource_parameters, Mapping):
+                for parameter in resource_parameters:
+                    bound_parameter_keys.add(
+                        (
+                            reference_revision,
+                            target_step_id,
+                            target_parameter,
+                            str(parameter),
+                        )
+                    )
         bindings = plan_bindings(
             reference_plan,
             action,
             step_id=target_step_id,
         )
+        action_required_for_process = str(
+            action.get("necessity", "explicit")
+            or "explicit"
+        ).lower() not in {
+            "optional",
+            "fallback",
+            "recommended",
+        }
         for parameter, binding in bindings.items():
+            bound_parameter_keys.add(
+                (
+                    reference_revision,
+                    target_step_id,
+                    target_parameter,
+                    parameter,
+                )
+            )
             for reference in binding["allowed"]:
                 allowed_by_parameter[
                     (
@@ -1950,24 +2013,8 @@ def evaluate_plan_execution_conformance(
                         parameter,
                     )
                 ].append(reference)
-            for reference in binding["required"]:
-                required_edges.append(
-                    {
-                        "target_step_id": target_step_id,
-                        "target_action": target_parameter,
-                        "target_parameter": parameter,
-                        "source_ref": reference,
-                        "plan_revision": reference_revision,
-                        "edge_kind": binding.get(
-                            "edge_kind",
-                            "data",
-                        ),
-                        "required_group": "",
-                        "group_mode": "",
-                    }
-                )
-            for group in binding.get("groups", []):
-                for reference in group.get("sources", []):
+            if action_required_for_process:
+                for reference in binding["required"]:
                     required_edges.append(
                         {
                             "target_step_id": target_step_id,
@@ -1979,14 +2026,31 @@ def evaluate_plan_execution_conformance(
                                 "edge_kind",
                                 "data",
                             ),
-                            "required_group": str(
-                                group.get("group_id", "") or ""
-                            ),
-                            "group_mode": str(
-                                group.get("mode", "all") or "all"
-                            ),
+                            "required_group": "",
+                            "group_mode": "",
                         }
                     )
+                for group in binding.get("groups", []):
+                    for reference in group.get("sources", []):
+                        required_edges.append(
+                            {
+                                "target_step_id": target_step_id,
+                                "target_action": target_parameter,
+                                "target_parameter": parameter,
+                                "source_ref": reference,
+                                "plan_revision": reference_revision,
+                                "edge_kind": binding.get(
+                                    "edge_kind",
+                                    "data",
+                                ),
+                                "required_group": str(
+                                    group.get("group_id", "") or ""
+                                ),
+                                "group_mode": str(
+                                    group.get("mode", "all") or "all"
+                                ),
+                            }
+                        )
         node_status = str(
             node.get("status", "") or ""
         ).lower()
@@ -2033,11 +2097,23 @@ def evaluate_plan_execution_conformance(
         tuple[str, str],
         set[str],
     ] = defaultdict(set)
+    contract_flow_adjacency: dict[str, set[str]] = defaultdict(set)
     if isinstance(execution_contract, Mapping):
         for expected in execution_contract.get(
             "expected_flow_edges",
             [],
         ) or []:
+            if isinstance(expected, Mapping):
+                expected_source_step = str(
+                    expected.get("from", "") or ""
+                )
+                expected_target_step = str(
+                    expected.get("to", "") or ""
+                )
+                if expected_source_step and expected_target_step:
+                    contract_flow_adjacency[
+                        expected_source_step
+                    ].add(expected_target_step)
             if (
                 not isinstance(expected, Mapping)
                 or not bool(
@@ -2086,6 +2162,130 @@ def evaluate_plan_execution_conformance(
                     "group_mode": "any",
                 }
             )
+    def contract_dependency_reaches(
+        source_step: str,
+        target_step: str,
+    ) -> bool:
+        """Return whether the canonical contract contains a dependency path."""
+        if not source_step or not target_step:
+            return False
+        pending = [source_step]
+        visited: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            for dependent in contract_flow_adjacency.get(
+                current,
+                set(),
+            ):
+                if dependent == target_step:
+                    return True
+                pending.append(dependent)
+        return False
+
+    def parameter_is_grounded_by_prompt(
+        requirement: Mapping[str, Any],
+    ) -> bool:
+        parameter = str(
+            requirement.get("target_parameter", "")
+            or ""
+        )
+        if parameter.startswith("__verification__:"):
+            parameter = parameter.split(":", 1)[1]
+        if (
+            not user_prompt.strip()
+            or not parameter
+            or parameter.startswith("__")
+        ):
+            return False
+        target_step = str(
+            requirement.get("target_step_id", "")
+            or ""
+        )
+        target_action = str(
+            requirement.get("target_action", "")
+            or ""
+        )
+        target_nodes = [
+            node
+            for node in nodes
+            if str(node.get("status", "")).lower() == "success"
+            and not bool(node.get("blocked", False))
+            and str(
+                node.get("plan_step_id")
+                or node.get("subgoal_id")
+                or ""
+            )
+            == target_step
+            and _tool_identity(
+                node.get("tool_alias")
+                or node.get("tool_base_name")
+                or node.get("label")
+                or "",
+                node.get("app")
+                or node.get("target_app")
+                or node.get("suite")
+                or "",
+            )
+            == target_action
+        ]
+        if not target_nodes:
+            return False
+
+        def scalar_values(value: Any) -> list[Any]:
+            if isinstance(value, Mapping):
+                return [
+                    child
+                    for item in value.values()
+                    for child in scalar_values(item)
+                ]
+            if isinstance(value, Sequence) and not isinstance(
+                value,
+                str | bytes,
+            ):
+                return [
+                    child
+                    for item in value
+                    for child in scalar_values(item)
+                ]
+            return [] if value in (None, "") else [value]
+
+        semantic_type = str(
+            tool_effect(
+                base_tool_name(target_action)
+            ).semantic_types.get(parameter, "")
+        )
+        for node in target_nodes:
+            inputs = node.get("inputs")
+            if not isinstance(inputs, Mapping) or parameter not in inputs:
+                continue
+            values = scalar_values(inputs.get(parameter))
+            inferred_semantic_type = semantic_type
+            if (
+                not inferred_semantic_type
+                and values
+                and all(
+                    re.fullmatch(
+                        r"\d{4}-\d{1,2}-\d{1,2}(?:[T ].*)?",
+                        str(value).strip(),
+                    )
+                    for value in values
+                )
+            ):
+                inferred_semantic_type = "datetime"
+            if values and all(
+                value_occurs_in_trusted_text(
+                    value,
+                    user_prompt,
+                    inferred_semantic_type,
+                )
+                for value in values
+            ):
+                return True
+        return False
+
     required_edges = list(
         {
             (
@@ -2100,6 +2300,139 @@ def evaluate_plan_execution_conformance(
             for item in required_edges
         }.values()
     )
+    invalid_verification_targets: list[dict[str, Any]] = []
+    filtered_concrete_verifications: list[dict[str, Any]] = []
+    for item in required_edges:
+        target_parameter = str(
+            item.get("target_parameter", "")
+        )
+        if (
+            str(item.get("edge_kind", "")) != "verification"
+            or not target_parameter.startswith(
+                "__verification__:"
+            )
+        ):
+            filtered_concrete_verifications.append(item)
+            continue
+        concrete_parameter = target_parameter.split(
+            ":",
+            1,
+        )[1]
+        target_action = str(
+            item.get("target_action", "")
+        )
+        target_policy = tool_effect(
+            base_tool_name(target_action)
+        )
+        valid_action_parameters = {
+            *target_policy.control_fields,
+            *target_policy.content_fields,
+            *target_policy.destination_fields,
+            *target_policy.resource_fields,
+            *target_policy.semantic_types,
+        }
+        if (
+            concrete_parameter not in valid_action_parameters
+            and (
+                int(item.get("plan_revision", 0) or 0),
+                str(item.get("target_step_id", "")),
+                target_action,
+                concrete_parameter,
+            )
+            not in bound_parameter_keys
+        ):
+            invalid_verification_targets.append(item)
+            continue
+        has_actual_parameter_edge = any(
+            str(edge.get("plan_revision", ""))
+            == str(item.get("plan_revision", ""))
+            and str(edge.get("target_step_id", ""))
+            == str(item.get("target_step_id", ""))
+            and str(edge.get("target_action", ""))
+            == str(item.get("target_action", ""))
+            and str(edge.get("target_parameter", ""))
+            == concrete_parameter
+            and str(edge.get("influence_kind", "data"))
+            in {"data", "control"}
+            for edge in actual_edge_list
+        )
+        if has_actual_parameter_edge:
+            continue
+        concrete_binding_refs = allowed_by_parameter.get(
+            (
+                int(item.get("plan_revision", 0) or 0),
+                str(item.get("target_step_id", "")),
+                str(item.get("target_action", "")),
+                concrete_parameter,
+            ),
+            [],
+        )
+        if (
+            (
+                int(item.get("plan_revision", 0) or 0),
+                str(item.get("target_step_id", "")),
+                str(item.get("target_action", "")),
+                concrete_parameter,
+            )
+            in bound_parameter_keys
+            or concrete_binding_refs
+        ):
+            # The parameter already has an explicit binding, so its
+            # data/control obligations are authoritative. Outcome-level
+            # verification must not add unrelated action sources to that
+            # single parameter.
+            continue
+        allowed_for_parameter = allowed_by_parameter.get(
+            (
+                int(item.get("plan_revision", 0) or 0),
+                str(item.get("target_step_id", "")),
+                str(item.get("target_action", "")),
+                target_parameter,
+            ),
+            [],
+        )
+        if not allowed_for_parameter:
+            continue
+        if any(
+            source_refs_match(
+                item.get("source_ref", {}),
+                allowed,
+            )
+            for allowed in allowed_for_parameter
+        ):
+            filtered_concrete_verifications.append(item)
+    required_edges = filtered_concrete_verifications
+    explicit_parameter_bindings = {
+        (
+            str(item.get("target_step_id", "")),
+            str(item.get("target_action", "")),
+            str(item.get("target_parameter", "")),
+        )
+        for item in required_edges
+        if str(item.get("edge_kind", "data")) != "verification"
+        and not str(
+            item.get("target_parameter", "")
+        ).startswith("__")
+    }
+    required_edges = [
+        item
+        for item in required_edges
+        if not (
+            str(item.get("edge_kind", "")) == "verification"
+            and str(item.get("target_parameter", "")).startswith(
+                "__verification__:"
+            )
+            and (
+                str(item.get("target_step_id", "")),
+                str(item.get("target_action", "")),
+                str(item.get("target_parameter", "")).split(
+                    ":",
+                    1,
+                )[1],
+            )
+            in explicit_parameter_bindings
+        )
+    ]
     required_edges = [
         requirement
         for requirement in required_edges
@@ -2238,6 +2571,17 @@ def evaluate_plan_execution_conformance(
         )
 
     for requirement in required_edges:
+        if parameter_is_grounded_by_prompt(requirement):
+            matched_required.append(
+                {
+                    **requirement,
+                    "matched_activity_id": "",
+                    "matched_influence_kind": (
+                        "user_prompt_grounding"
+                    ),
+                }
+            )
+            continue
         if requirement.get("edge_kind") == "dependency":
             source_step = str(
                 requirement["source_ref"].get(
@@ -2263,6 +2607,36 @@ def evaluate_plan_execution_conformance(
             else:
                 missing_required.append(requirement)
             continue
+        if requirement.get("edge_kind") == "control":
+            source_step = str(
+                requirement["source_ref"].get(
+                    "producer_step",
+                    "",
+                )
+                or ""
+            )
+            target_step = str(
+                requirement.get("target_step_id", "")
+                or ""
+            )
+            if (
+                source_step in successful_step_ids
+                and target_step in successful_step_ids
+                and contract_dependency_reaches(
+                    source_step,
+                    target_step,
+                )
+            ):
+                matched_required.append(
+                    {
+                        **requirement,
+                        "matched_activity_id": "",
+                        "matched_influence_kind": (
+                            "transitive_control_dependency"
+                        ),
+                    }
+                )
+                continue
         source_ref = requirement["source_ref"]
         source_app = str(
             source_ref.get("app", "") or ""
@@ -2759,6 +3133,9 @@ def evaluate_plan_execution_conformance(
         "plan_snapshot_complete": actions_without_plan == 0,
         "unplanned_actions": unplanned_actions,
         "plan_binding_issues": plan_binding_issues,
+        "invalid_verification_targets": (
+            invalid_verification_targets
+        ),
         "required_edges": len(required_edges),
         "matched_required_edges": len(matched_required),
         "missing_required_edges": effective_missing_required,

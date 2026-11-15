@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -222,6 +222,73 @@ def _collect_string_fields(value: Any) -> dict[str, str]:
     return result
 
 
+_CONTROL_ENVELOPE_RE = re.compile(
+    r"<(information|system|instructions|important)\b[^>]*>"
+    r".*?"
+    r"</\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_CONTROL_ENVELOPE_OPEN_RE = re.compile(
+    r"<(information|system|instructions|important)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _expand_injection_spans(
+    text: str,
+    chunks: Sequence[Any],
+) -> list[dict[str, int | float]]:
+    """Expand local detector hits to complete control envelopes."""
+    envelopes = [
+        (match.start(), match.end())
+        for match in _CONTROL_ENVELOPE_RE.finditer(text)
+    ]
+    for match in _CONTROL_ENVELOPE_OPEN_RE.finditer(text):
+        closing_tag = re.compile(
+            rf"</{re.escape(match.group(1))}\s*>",
+            re.IGNORECASE,
+        )
+        if not closing_tag.search(text, match.end()):
+            envelopes.append((match.start(), len(text)))
+    expanded: list[dict[str, int | float]] = []
+    for chunk in chunks:
+        start = max(0, int(getattr(chunk, "start", 0) or 0))
+        end = min(len(text), int(getattr(chunk, "end", start) or start))
+        score = float(getattr(chunk, "score", 0.0) or 0.0)
+        if end <= start:
+            continue
+        envelope = next(
+            (
+                (envelope_start, envelope_end)
+                for envelope_start, envelope_end in envelopes
+                if envelope_start <= start < envelope_end
+                or envelope_start < end <= envelope_end
+            ),
+            None,
+        )
+        if envelope is not None:
+            start, end = envelope
+        expanded.append(
+            {
+                "start": start,
+                "end": end,
+                "score": score,
+            }
+        )
+    expanded.sort(key=lambda item: (int(item["start"]), int(item["end"])))
+    merged: list[dict[str, int | float]] = []
+    for item in expanded:
+        start = int(item["start"])
+        end = int(item["end"])
+        score = float(item["score"])
+        if merged and start <= int(merged[-1]["end"]):
+            merged[-1]["end"] = max(int(merged[-1]["end"]), end)
+            merged[-1]["score"] = max(float(merged[-1]["score"]), score)
+        else:
+            merged.append({"start": start, "end": end, "score": score})
+    return merged
+
+
 def _replace_string_paths(
     value: Any,
     paths: set[str],
@@ -273,6 +340,26 @@ def _replace_string_paths(
     for path, tokens in tokens_by_path.items():
         result = walk(result, tokens, {path})
     return result
+
+
+def quarantine_tool_output_fields(
+    value: Any,
+    fields: Sequence[str],
+    *,
+    placeholder: str = REDACTION_PLACEHOLDER,
+) -> tuple[Any, bool]:
+    """Fail closed by replacing every flagged projected field."""
+    paths = {
+        str(path)
+        for path in fields
+        if str(path).strip()
+    }
+    sanitized = _replace_string_paths(
+        value,
+        paths,
+        replacement=placeholder,
+    )
+    return sanitized, sanitized != value
 
 
 def scan_tool_output(
@@ -407,23 +494,41 @@ def scan_tool_output(
             result.field_statuses[path] = "quarantined"
             result.flagged_fields.append(path)
             result.quarantined_fields.append(path)
-            for chunk in scan.chunks:
-                evidence_ref = f"{tool_name}:{path}:chunk:{chunk.index}" if tool_name else f"{path}:chunk:{chunk.index}"
+            expanded_spans = _expand_injection_spans(
+                item,
+                scan.chunks,
+            )
+            if not expanded_spans:
+                expanded_spans = [
+                    {
+                        "start": 0,
+                        "end": len(item),
+                        "score": float(scan.score),
+                    }
+                ]
+            for index, span in enumerate(expanded_spans):
+                start = int(span["start"])
+                end = int(span["end"])
+                evidence_ref = (
+                    f"{tool_name}:{path}:chunk:{index}"
+                    if tool_name
+                    else f"{path}:chunk:{index}"
+                )
                 result.evidence_refs.append(evidence_ref)
                 result.chunk_evidence.append(
                     {
                         "field": path,
-                        "chunk_index": chunk.index,
-                        "start": chunk.start,
-                        "end": chunk.end,
-                        "text": item[chunk.start : chunk.end],
-                        "score": round(chunk.score, 6),
+                        "chunk_index": index,
+                        "start": start,
+                        "end": end,
+                        "text": item[start:end],
+                        "score": round(float(span["score"]), 6),
                         "evidence_ref": evidence_ref,
                     }
                 )
             sanitized, metrics = redact_injection_chunks_with_metrics(
                 item,
-                scan,
+                {"chunks": expanded_spans},
                 placeholder=REDACTION_PLACEHOLDER,
             )
             field_metrics[path] = metrics

@@ -490,6 +490,10 @@ def check_task_scope(
         tool_name,
         str(event.get("plan_step_id", "")),
     )
+    trusted_user_instruction = str(
+        event.get("user_instruction")
+        or ""
+    )
     resource_failures = validate_resource_access(
         access_contract,
         event,
@@ -498,6 +502,7 @@ def check_task_scope(
             if isinstance(plan.get("source_refs", {}), Mapping)
             else {}
         ),
+        user_instruction=trusted_user_instruction,
     )
     result["data_access"] = access_contract
     result["resource_access_failures"] = resource_failures
@@ -545,6 +550,7 @@ def check_task_scope(
                 if isinstance(plan.get("source_refs", {}), Mapping)
                 else {}
             ),
+            user_instruction=trusted_user_instruction,
         )
         result["resource_access"] = access_contract
         result["resource_access_failures"] = resource_failures
@@ -1248,7 +1254,15 @@ def check_sensitive_egress(
         implicit_resolution_ok = all(
             resolution_status(str(item.get("id_parameter", ""))) == "resolved" for item in implicit_egress
         )
-        if mode == "derived":
+        local_only_side_effect = (
+            not destinations
+            and not implicit_egress
+            and not actual_destination_parameters
+        )
+        if local_only_side_effect:
+            destination_ok = True
+            destination_state = "local_authorized"
+        elif mode == "derived":
             destination_ok = (
                 bool(destinations)
                 and implicit_resource_ok

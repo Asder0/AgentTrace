@@ -45,7 +45,11 @@ from .risk_types import (
     make_risk,
     stabilize_risk_identity,
 )
-from .tool_output_scanner import scan_tool_output
+from .tool_output_scanner import (
+    REDACTION_PLACEHOLDER,
+    quarantine_tool_output_fields,
+    scan_tool_output,
+)
 
 
 def _skipped_diagnostics(ring: str, reason: str = "ring_disabled") -> dict:
@@ -316,6 +320,7 @@ def process_after_execution(
     intent_data: set | None = None,
     options: dict | None = None,
     isolated_reader=None,
+    detection_source: Any | None = None,
 ) -> Any:
     """Apply Ring 1 quarantine without exposing the full audit view."""
     final_result, _diagnostics = process_after_execution_with_details(
@@ -325,6 +330,7 @@ def process_after_execution(
         intent_data=intent_data,
         options=options,
         isolated_reader=isolated_reader,
+        detection_source=detection_source,
     )
     return final_result
 
@@ -336,6 +342,7 @@ def process_after_execution_with_details(
     intent_data: set | None = None,
     options: dict | None = None,
     isolated_reader=None,
+    detection_source: Any | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Scan tool output, quarantine suspicious chunks, and retain audit raw data."""
     diagnostics = {
@@ -400,22 +407,29 @@ def process_after_execution_with_details(
         }
         event_complete["injection_scan"] = skipped_scan
         return result, diagnostics
+    scan_source = result if detection_source is None else detection_source
     scan = scan_tool_output(
-        result,
+        scan_source,
         scanner=get_injection_scanner(),
         tool_name=tool_name,
         schema=(event_complete.get("output_schema") if isinstance(event_complete.get("output_schema"), dict) else None),
         app=output_app,
         entity=output_entity,
     )
+    scan_payload = scan.to_dict()
+    scan_payload["detection_source"] = (
+        "raw_tool_result"
+        if detection_source is not None
+        else "projected_tool_result"
+    )
     diagnostics["ring_1"] = {
         "passed": scan.available,
         "executed": True,
         "mode": "chunk_scanner_quarantine",
         "scan_scope": "natural_language_only",
-        **scan.to_dict(),
+        **scan_payload,
     }
-    event_complete["injection_scan"] = scan.to_dict()
+    event_complete["injection_scan"] = scan_payload
 
     output_label = event_complete.get("output_flow_label")
     if not isinstance(output_label, dict):
@@ -459,7 +473,39 @@ def process_after_execution_with_details(
             risk,
             discriminator=(f"ring1-scan:{event_complete.get('tool_intent', '')}:{','.join(scan.flagged_fields)}"),
         )
-    return (
-        scan.sanitized_value if scan.changed else result,
-        diagnostics,
-    )
+    final_result = result
+    if scan.changed:
+        if detection_source is None:
+            final_result = scan.sanitized_value
+        else:
+            projected_scan = scan_tool_output(
+                result,
+                scanner=get_injection_scanner(),
+                tool_name=tool_name,
+                schema=(
+                    event_complete.get("output_schema")
+                    if isinstance(
+                        event_complete.get("output_schema"),
+                        dict,
+                    )
+                    else None
+                ),
+                app=output_app,
+                entity=output_entity,
+            )
+            if projected_scan.changed:
+                final_result = projected_scan.sanitized_value
+            else:
+                # The raw scan is authoritative. If projection changes the
+                # path shape enough for the second scan to miss, quarantine
+                # every field identified by the raw scan instead of silently
+                # returning potentially unsafe projected content.
+                final_result, field_quarantined = (
+                    quarantine_tool_output_fields(
+                        result,
+                        scan.quarantined_fields,
+                    )
+                )
+                if not field_quarantined:
+                    final_result = REDACTION_PLACEHOLDER
+    return final_result, diagnostics

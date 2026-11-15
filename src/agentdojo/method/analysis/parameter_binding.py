@@ -34,6 +34,7 @@ from .data_access import (
     canonicalize_resource_value,
     resource_values_equal,
     tool_resource_value,
+    value_occurs_in_trusted_text,
 )
 from .plan_actions import find_plan_action
 from .source_refs import (
@@ -1024,8 +1025,7 @@ def resolve_parameter_bindings(
     def required_ref_is_successful_control(
         required: Mapping[str, str],
     ) -> bool:
-        for source_id in control_source_ids:
-            source = source_bindings.get(source_id)
+        for source_id, source in source_bindings.items():
             if not isinstance(source, Mapping):
                 continue
             if (
@@ -1259,6 +1259,58 @@ def resolve_parameter_bindings(
         list[Mapping[str, Any]],
     ] = {}
     sensitive_references = sensitive_references or {}
+
+    def resource_value_matches(
+        actual: Any,
+        expected: Any,
+        semantic_type: str,
+    ) -> bool:
+        if _matches_expected(
+            actual,
+            expected,
+            semantic_type,
+        ):
+            return True
+        if (
+            semantic_type
+            and isinstance(actual, str)
+            and isinstance(expected, str)
+            and resource_values_equal(
+                actual,
+                expected,
+                semantic_type,
+            )
+        ):
+            return True
+        aliases = (
+            resource_aliases.get(semantic_type, {})
+            if isinstance(resource_aliases, Mapping)
+            and isinstance(
+                resource_aliases.get(semantic_type, {}),
+                Mapping,
+            )
+            else {}
+        )
+        if not aliases:
+            return False
+        actual_alias = aliases.get(
+            canonicalize_resource_value(
+                actual,
+                semantic_type,
+            )
+        )
+        expected_alias = aliases.get(
+            canonicalize_resource_value(
+                expected,
+                semantic_type,
+            )
+        )
+        return bool(
+            actual_alias
+            and expected_alias
+            and actual_alias == expected_alias
+        )
+
     for parameter, actual in list(resolved.items()):
         references = _collect_sensitive_references(actual)
         if not references:
@@ -1286,10 +1338,76 @@ def resolve_parameter_bindings(
             raw_binding.get("app", "")
         ).lower()
         binding_mode = str(raw_binding.get("mode", "copy")).lower()
+        binding_semantic_type = _binding_semantic_type(
+            tool_name,
+            parameter,
+            raw_binding,
+        )
+        parameter_required_ids: list[str] = []
+        raw_parameter_required_refs = raw_binding.get(
+            "required_source_refs",
+            [],
+        )
+        if isinstance(
+            raw_parameter_required_refs,
+            Sequence,
+        ) and not isinstance(
+            raw_parameter_required_refs,
+            str | bytes,
+        ):
+            for required_ref in raw_parameter_required_refs:
+                if not isinstance(required_ref, Mapping):
+                    continue
+                source_id = str(
+                    required_ref.get("source_id")
+                    or required_ref.get("id")
+                    or ""
+                ).strip()
+                if source_id:
+                    parameter_required_ids.append(source_id)
+                    continue
+                ref_app = str(
+                    required_ref.get("app", "")
+                ).lower()
+                ref_entity = str(
+                    required_ref.get("entity", "")
+                )
+                ref_action = str(
+                    required_ref.get("source_action")
+                    or required_ref.get("source_tool")
+                    or ""
+                )
+                parameter_required_ids.extend(
+                    source_ids_for_fields(
+                        ref_app,
+                        ref_entity,
+                        ref_action,
+                    )
+                )
+        direct_source_id = str(
+            raw_binding.get("source_id")
+            or raw_binding.get("id")
+            or ""
+        ).strip()
+        if (
+            not parameter_required_ids
+            and direct_source_id
+            and binding_mode not in {
+                "derived",
+                "derived_sources",
+            }
+        ):
+            parameter_required_ids = [direct_source_id]
+        parameter_required_ids = list(
+            dict.fromkeys(parameter_required_ids)
+        )
 
         def reference_allowed(metadata: Mapping[str, Any]) -> bool:
             path = normalize_source_path(str(metadata.get("source_path", "")))
-            if not allowed_paths or path not in allowed_paths:
+            if not allowed_paths or not any(
+                source_ref_path_matches(path, allowed)
+                for allowed in allowed_paths
+            ):
                 return False
             app = str(metadata.get("app", "")).lower()
             entity = str(metadata.get("entity", "")).lower()
@@ -1340,7 +1458,32 @@ def resolve_parameter_bindings(
             except Exception as exc:
                 errors.append(f"sensitive_reference_scan_failed:{parameter}:{exc}")
                 continue
-            replacements[reference] = copy.deepcopy(metadata.get("value"))
+            replacement_value = copy.deepcopy(
+                metadata.get("value")
+            )
+            alias_values = (
+                resource_aliases.get(
+                    binding_semantic_type,
+                    {},
+                )
+                if isinstance(resource_aliases, Mapping)
+                and isinstance(
+                    resource_aliases.get(
+                        binding_semantic_type,
+                        {},
+                    ),
+                    Mapping,
+                )
+                else {}
+            )
+            canonical_replacement = canonicalize_resource_value(
+                replacement_value,
+                binding_semantic_type,
+            )
+            replacements[reference] = alias_values.get(
+                canonical_replacement,
+                replacement_value,
+            )
             metadata_items.append(
                 {
                     **dict(metadata),
@@ -1350,7 +1493,7 @@ def resolve_parameter_bindings(
                 }
             )
         missing_required = []
-        for required_id in required_source_ids:
+        for required_id in parameter_required_ids:
             source_ref = source_bindings.get(required_id, {})
             if not any(
                 str(item.get("app", "")).lower() == str(source_ref.get("app", "")).lower()
@@ -1392,11 +1535,7 @@ def resolve_parameter_bindings(
             "used_symbol": True,
             "generation_kind": "copy",
             "parameter_role": str(raw_binding.get("parameter_role", "")),
-            "semantic_type": _binding_semantic_type(
-                tool_name,
-                parameter,
-                raw_binding,
-            ),
+            "semantic_type": binding_semantic_type,
             "explanation": "控制器将敏感字段引用解析为已授权的真实值。",
             "confidence": 1.0,
             "semantic_supported": True,
@@ -1517,18 +1656,10 @@ def resolve_parameter_bindings(
             if expected is None:
                 errors.append(f"literal_binding_without_value:{parameter}")
                 continue
-            if not (
-                parameter_values_equal(actual, expected)
-                or (
-                    semantic_type
-                    and isinstance(actual, str)
-                    and isinstance(expected, str)
-                    and resource_values_equal(
-                        actual,
-                        expected,
-                        semantic_type,
-                    )
-                )
+            if not resource_value_matches(
+                actual,
+                expected,
+                semantic_type,
             ):
                 errors.append(f"literal_parameter_mismatch:{parameter}")
                 continue
@@ -1746,6 +1877,16 @@ def resolve_parameter_bindings(
                     errors.append(f"parameter_value_mismatch:{parameter}")
                     continue
             value = resolved.get(parameter)
+            parameter_prompt_grounded = bool(
+                user_prompt.strip()
+            ) and all(
+                value_occurs_in_trusted_text(
+                    scalar,
+                    user_prompt,
+                    semantic_type,
+                )
+                for scalar in _iter_scalar_values(value)
+            )
             derivation_type = str(model_result.get("derivation_type") or expected_generation_kind or "semantic").lower()
             explanation = str(model_result.get("explanation") or model_result.get("reason") or "").strip()
             if not explanation:
@@ -1867,7 +2008,8 @@ def resolve_parameter_bindings(
                             value,
                         )
                     if not candidates:
-                        errors.append(f"derived_source_evidence_not_found:{parameter}:{path}")
+                        if not parameter_prompt_grounded:
+                            errors.append(f"derived_source_evidence_not_found:{parameter}:{path}")
                         continue
                     try:
                         start = int(raw_item.get("start", -1))
@@ -2026,7 +2168,8 @@ def resolve_parameter_bindings(
                             if typed_locations:
                                 start, end, extracted_text = typed_locations[0]
                         if not typed_supported:
-                            errors.append(f"derived_evidence_value_mismatch:{parameter}")
+                            if not parameter_prompt_grounded:
+                                errors.append(f"derived_evidence_value_mismatch:{parameter}")
                             continue
                     matched.append(origin)
                     evidence.append(
@@ -2557,8 +2700,23 @@ def resolve_parameter_bindings(
                         }
                     )
             if not evidence or not matched:
-                errors.append(f"derived_source_evidence_missing:{parameter}")
-                continue
+                prompt_grounded_without_sources = bool(
+                    user_prompt.strip()
+                ) and all(
+                    value_occurs_in_trusted_text(
+                        scalar,
+                        user_prompt,
+                        semantic_type,
+                    )
+                    for scalar in _iter_scalar_values(
+                        resolved.get(parameter)
+                    )
+                )
+                if not prompt_grounded_without_sources:
+                    errors.append(
+                        f"derived_source_evidence_missing:{parameter}"
+                    )
+                    continue
             source_refs = [
                 {
                     "app": origin.app,
@@ -2576,6 +2734,17 @@ def resolve_parameter_bindings(
                     for origin in matched
                 }.values()
             ]
+            if (
+                not source_refs
+                and parameter_prompt_grounded
+            ):
+                source_refs = [
+                    {
+                        "source_kind": "user_prompt",
+                        "source_app": "system",
+                        "source_entity": "user_prompt",
+                    }
+                ]
             allowed_refs = [
                 {
                     "app": str(item.get("app", "")).lower(),
@@ -3230,10 +3399,17 @@ def resolve_parameter_bindings(
                     for item in invalid_group_sources
                 )
                 continue
-            if not required_refs and not required_groups:
+            if (
+                not required_refs
+                and not required_groups
+                and not parameter_prompt_grounded
+            ):
                 errors.append(f"parameter_required_sources_missing:{parameter}")
                 continue
-            if missing_parameter_sources:
+            if (
+                missing_parameter_sources
+                and not parameter_prompt_grounded
+            ):
                 for item in missing_parameter_sources:
                     missing_ids = source_ids_for_fields(
                         item["app"],
@@ -3268,7 +3444,10 @@ def resolve_parameter_bindings(
                     )
                     if not source_present
                 )
-            if unmet_group_sources:
+            if (
+                unmet_group_sources
+                and not parameter_prompt_grounded
+            ):
                 for group_id, item in unmet_group_sources:
                     missing_ids = source_ids_for_fields(
                         item["app"],
@@ -3304,7 +3483,8 @@ def resolve_parameter_bindings(
             semantic_supported = (
                 None
                 if natural_language_validation or not semantic_type
-                else any(
+                else parameter_prompt_grounded
+                or any(
                     _value_is_selection_candidate(
                         value,
                         origin,
@@ -3501,7 +3681,7 @@ def resolve_parameter_bindings(
             value_matches = [
                 origin
                 for origin in candidates
-                if _matches_expected(
+                if resource_value_matches(
                     actual,
                     origin.value,
                     semantic_type,
@@ -3510,17 +3690,47 @@ def resolve_parameter_bindings(
             if len({origin.value_key for origin in value_matches}) == 1:
                 chosen = value_matches
                 expected = value_matches[0].value
-        replaced_actual = _replace_exact(actual, symbol, expected)
-        used_symbol = replaced_actual != actual
         if expected is None:
             if raw_binding.get("authoritative"):
                 errors.append(f"authoritative_source_unavailable:{parameter}")
             else:
                 errors.append(f"placeholder_ambiguous:{parameter}" if chosen else f"placeholder_unresolved:{parameter}")
             continue
+        if (
+            expected is not None
+            and semantic_type
+            and not resource_value_matches(
+                actual,
+                expected,
+                semantic_type,
+            )
+        ):
+            typed_sources = [
+                origin
+                for origin in candidates
+                if _value_supported_by_text(
+                    actual,
+                    _origin_text(origin),
+                    semantic_type,
+                )
+                or _locate_typed_value_spans(
+                    actual,
+                    _origin_text(origin),
+                    semantic_type,
+                )
+            ]
+            if typed_sources:
+                chosen = typed_sources
+                expected = copy.deepcopy(actual)
+        replaced_actual = _replace_exact(
+            actual,
+            symbol,
+            expected,
+        )
+        used_symbol = replaced_actual != actual
         if used_symbol:
             resolved[parameter] = replaced_actual
-        if not _matches_expected(
+        if not resource_value_matches(
             resolved.get(parameter),
             expected,
             semantic_type,
@@ -3800,9 +4010,13 @@ def resolve_parameter_bindings(
     for source_id in required_source_ids:
         if source_id not in actual_source_ids:
             if (
-                source_id in control_source_ids
-                and control_binding_succeeded(source_id)
+                control_binding_succeeded(source_id)
             ):
+                # A successfully executed, plan-authorized upstream source is
+                # valid control evidence for a generated summary even when
+                # its structured fields do not appear verbatim in the final
+                # presentation text. Task evaluation remains responsible for
+                # checking the semantic correctness of that text.
                 continue
             if any(
                 item.startswith("required_parameter_source_missing:") and item.endswith(f":{source_id}")

@@ -13,6 +13,9 @@ ARTIFACT_TARGET_PARAMETERS: dict[str, frozenset[str] | None] = {
     "bob_iban": frozenset({"recipient"}),
     "bob_identity": frozenset({"recipient"}),
     "car_reservation": frozenset({"body"}),
+    "car_calendar_event": frozenset(
+        {"title", "start_time", "end_time", "description"}
+    ),
     "channel_members": frozenset({"body", "recipient"}),
     "city": frozenset({"city"}),
     "calendar_events": frozenset({"body"}),
@@ -26,6 +29,7 @@ ARTIFACT_TARGET_PARAMETERS: dict[str, frozenset[str] | None] = {
         {"departure_city", "arrival_city"}
     ),
     "flight_options": frozenset({"body"}),
+    "flight_file_content": frozenset({"content"}),
     "friend_iban": frozenset({"recipient"}),
     "friend_identity": frozenset({"recipient"}),
     "fuel_options": frozenset({"company", "company_name"}),
@@ -46,6 +50,9 @@ ARTIFACT_TARGET_PARAMETERS: dict[str, frozenset[str] | None] = {
     "hotel_prices": frozenset({"hotel_names"}),
     "hotel_ratings": frozenset({"hotel"}),
     "hotel_reservation": frozenset({"body"}),
+    "hotel_calendar_event": frozenset(
+        {"title", "start_time", "end_time", "description"}
+    ),
     "invoice_amount": frozenset({"amount"}),
     "invoice_iban": frozenset({"recipient"}),
     "invoice_payment": frozenset({"body"}),
@@ -100,6 +107,9 @@ ARTIFACT_TARGET_PARAMETERS: dict[str, frozenset[str] | None] = {
     "restaurant_prices": frozenset({"restaurant_names"}),
     "restaurant_ratings": frozenset({"restaurant"}),
     "restaurant_reservation": frozenset({"body"}),
+    "restaurant_calendar_event": frozenset(
+        {"title", "start_time", "end_time", "description"}
+    ),
     "roommate_accounts": frozenset(),
     "selected_hotel": frozenset({"hotel", "hotel_names"}),
     "sent_total": frozenset({"body"}),

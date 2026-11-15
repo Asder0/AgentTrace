@@ -133,9 +133,24 @@ def get_llm(provider: str, model: str, model_id: str | None, tool_delimiter: str
         logging.info(f"Using tool delimiter: {tool_delimiter}")
         llm = LocalLLM(client, model_id, tool_delimiter=tool_delimiter)
     elif provider == "deepseek":
+        request_timeout = max(
+            1.0,
+            float(
+                os.getenv(
+                    "LLM_REQUEST_TIMEOUT_SECONDS",
+                    "120",
+                )
+            ),
+        )
+        max_retries = max(
+            0,
+            int(os.getenv("LLM_MAX_RETRIES", "1")),
+        )
         client = openai.OpenAI(
             api_key=os.getenv("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com/v1",
+            timeout=request_timeout,
+            max_retries=max_retries,
         )
         llm = DeepSeekLLM(client, model)
     elif provider == "vllm_parsed":

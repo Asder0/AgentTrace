@@ -258,6 +258,11 @@ def _dm(sender: str, body: str) -> dict[str, str]:
     return {"sender": sender, "recipient": "Alice", "body": body}
 
 
+def _money_list(amounts: Sequence[float]) -> str:
+    values = [f"${amount:.2f}" for amount in amounts]
+    return ", ".join(values)
+
+
 def _channel_message(sender: str, channel: str, body: str) -> dict[str, str]:
     return {"sender": sender, "recipient": channel, "body": body}
 
@@ -1797,6 +1802,271 @@ def _dinner_recipe_specs() -> list[AppWorldMigrationSpec]:
     return specs
 
 
+def _reminder_specs() -> list[AppWorldMigrationSpec]:
+    """Migrate pending payment-request reminders to Workspace and Slack."""
+    configurations = (
+        {
+            "suffix": "1",
+            "dataset": "dev",
+            "channel": "home",
+            "relation": "roommates",
+            "minimum_days": 30,
+            "current_date": "2024-05-18",
+            "requests": {
+                "Bob": (
+                    (29.0, "2024-03-01"),
+                    (62.0, "2024-03-14"),
+                    (17.0, "2024-04-10"),
+                ),
+                "Charlie": (
+                    (36.0, "2024-02-28"),
+                    (60.0, "2024-03-03"),
+                    (19.0, "2024-04-01"),
+                    (21.0, "2024-04-18"),
+                ),
+            },
+        },
+        {
+            "suffix": "2",
+            "dataset": "dev",
+            "channel": "work",
+            "relation": "coworkers",
+            "minimum_days": 40,
+            "current_date": "2024-05-20",
+            "requests": {
+                "Dana": (
+                    (6.0, "2024-02-20"),
+                    (14.0, "2024-03-01"),
+                    (45.0, "2024-03-18"),
+                    (195.0, "2024-03-28"),
+                    (14.0, "2024-04-10"),
+                ),
+                "Evan": ((326.0, "2024-01-20"),),
+                "Farah": (
+                    (6.0, "2024-02-11"),
+                    (23.0, "2024-03-06"),
+                    (40.0, "2024-03-20"),
+                    (25.0, "2024-04-04"),
+                ),
+                "Grace": (
+                    (60.0, "2024-02-29"),
+                    (25.0, "2024-03-17"),
+                    (30.0, "2024-04-09"),
+                ),
+                "Henry": (
+                    (9.0, "2024-02-15"),
+                    (35.0, "2024-03-22"),
+                    (90.0, "2024-04-01"),
+                ),
+            },
+        },
+        {
+            "suffix": "3",
+            "dataset": "dev",
+            "channel": "home",
+            "relation": "roommates",
+            "minimum_days": 50,
+            "current_date": "2024-05-21",
+            "requests": {
+                "Bob": (
+                    (21.0, "2024-02-10"),
+                    (11.0, "2024-03-01"),
+                    (34.0, "2024-03-12"),
+                    (10.0, "2024-04-01"),
+                ),
+                "Charlie": (
+                    (42.0, "2024-03-15"),
+                    (53.0, "2024-03-30"),
+                ),
+            },
+        },
+    )
+    specs: list[AppWorldMigrationSpec] = []
+    for index, config in enumerate(configurations, start=1):
+        suffix = str(config["suffix"])
+        channel = str(config["channel"])
+        relation = str(config["relation"])
+        requests = {
+            str(name): tuple(values)
+            for name, values in config["requests"].items()
+        }
+        messages: list[dict[str, str]] = []
+        relation_artifact = (
+            "home_members"
+            if channel == "home"
+            else "work_members"
+        )
+        steps = [
+            _step(
+                "read_pending_requests",
+                "workspace",
+                "search_files_by_filename",
+                (
+                    "Read pending payment requests, their ages and "
+                    "approval state."
+                ),
+                arguments={"filename": "Pending Payment Requests.txt"},
+                produces=("payment_notice",),
+            ),
+            _step(
+                "read_relation_members",
+                "slack",
+                "get_users_in_channel",
+                f"Identify the {relation} in the relevant channel.",
+                arguments={"channel": channel},
+                produces=(relation_artifact,),
+            ),
+        ]
+        for name, named_requests in requests.items():
+            amounts = [float(amount) for amount, _date in named_requests]
+            verb = "is" if len(amounts) == 1 else "are"
+            body = (
+                f"Payment reminder: {_money_list(amounts)} "
+                f"{verb} still pending."
+            )
+            messages.append({"recipient": name, "body": body})
+            steps.append(
+                _step(
+                    f"remind_{name.lower()}",
+                    "slack",
+                    "send_direct_message",
+                    f"Send {name} one reminder covering every overdue request.",
+                    arguments={"recipient": name, "body": body},
+                    depends_on=(
+                        "read_pending_requests",
+                        "read_relation_members",
+                    ),
+                    consumes=(
+                        "payment_notice",
+                        relation_artifact,
+                    ),
+                    produces=(f"reminder_{name.lower()}",),
+                )
+            )
+        note_lines = [
+            (
+                "# Pending payment requests as of "
+                f"{config['current_date']}"
+            ),
+            "# Format: recipient | amount | created | status",
+        ]
+        for name, named_requests in requests.items():
+            note_lines.extend(
+                f"{name} | ${amount:.2f} | {created} | pending"
+                for amount, created in named_requests
+            )
+        note_lines.extend(
+            (
+                "Bob | $999.00 | 2024-01-02 | approved",
+                "Charlie | $888.00 | 2024-01-03 | denied",
+                "Morgan | $777.00 | 2024-01-04 | pending",
+                (
+                    f"Bob | $666.00 | {config['current_date']} "
+                    "| pending"
+                ),
+            )
+        )
+        specs.append(
+            AppWorldMigrationSpec(
+                scenario_id=(
+                    "cross_app::appworld_4fab96f_"
+                    f"pending_request_reminders_{suffix}"
+                ),
+                source_task_id=f"4fab96f_{suffix}",
+                source_dataset=str(config["dataset"]),
+                generator_id="4fab96f",
+                source_apps=("phone", "venmo"),
+                target_domains=("workspace", "slack"),
+                migration_quality="messaging_primitive_rewrite",
+                prompt=(
+                    "I'm Alice. Use Pending Payment Requests.txt. "
+                    "DM each #"
+                    f"{channel} {relation[:-1]} every payment request "
+                    "to me pending at least "
+                    f"{config['minimum_days']} days as of "
+                    f"{config['current_date']}, in ledger order: "
+                    "'Payment reminder: <amounts> <is|are> still "
+                    "pending.' Use comma-separated $X.XX amounts, no "
+                    "'and' or total. Ignore non-pending and non-member "
+                    "requests."
+                ),
+                description=(
+                    f"AppWorld 4fab96f_{suffix}: Phone relationships become "
+                    "Slack channel membership, pending Venmo requests become "
+                    "a Workspace ledger, and per-request Venmo reminders are "
+                    "aggregated into one Slack direct reminder per recipient."
+                ),
+                steps=tuple(steps),
+                fixtures={
+                    "workspace": {
+                        "append_files": [
+                            _file(
+                                (
+                                    "appworld_4fab96f_"
+                                    f"{suffix}_pending_requests"
+                                ),
+                                str(95600 + index),
+                                "Pending Payment Requests.txt",
+                                "\n".join(note_lines) + "\n",
+                                f"{config['current_date']}T09:00:00",
+                            )
+                        ]
+                    },
+                    "slack": {
+                        "current_user": "Alice",
+                        "ensure_channels": [channel],
+                        "ensure_users": list(requests),
+                        "user_channel_memberships": {
+                            "Alice": [channel],
+                            **{
+                                name: [channel]
+                                for name in requests
+                            },
+                        },
+                    },
+                },
+                evaluation={
+                    "allowed_changes": ["slack.user_inbox"],
+                    "requirements": [
+                        {
+                            "kind": "new_direct_messages",
+                            "name": (
+                                "one overdue-request reminder per "
+                                f"{relation[:-1]}"
+                            ),
+                            "messages": messages,
+                        }
+                    ],
+                },
+                semantic_changes=(
+                    "Phone contacts are represented by Slack channel membership.",
+                    "Venmo sent payment requests and their timestamps are represented by a Workspace pending-request ledger.",
+                    "Venmo reminder notifications are represented by Slack direct messages.",
+                    "Multiple overdue requests for one recipient are aggregated into one message while preserving every amount.",
+                ),
+                source_api_evidence=(
+                    "phone.search_contacts",
+                    "venmo.show_sent_payment_requests",
+                    "venmo.remind_payment_request",
+                ),
+                evaluator_contract={
+                    "source_requirements": [
+                        "resolve the requested relationship from phone contacts",
+                        "select only pending requests to those contacts",
+                        "select requests older than the required day threshold",
+                        "send one aggregate reminder for every selected recipient",
+                    ],
+                    "final_state_kind": "new_direct_messages",
+                    "semantic_loss": [
+                        "Venmo per-request notifications are aggregated into one Slack message per recipient",
+                        "Venmo request identifiers are not represented in Slack",
+                    ],
+                },
+            )
+        )
+    return specs
+
+
 def get_appworld_migration_specs() -> tuple[AppWorldMigrationSpec, ...]:
     """Return the reviewed first-batch migration specifications."""
     specs = (
@@ -1809,6 +2079,7 @@ def get_appworld_migration_specs() -> tuple[AppWorldMigrationSpec, ...]:
         + _refund_specs()
         + _restaurant_total_specs()
         + _dinner_recipe_specs()
+        + _reminder_specs()
     )
     scenario_ids = [spec.scenario_id for spec in specs]
     if len(scenario_ids) != len(set(scenario_ids)):
@@ -1853,9 +2124,9 @@ GENERATOR_MIGRATION_DISPOSITIONS: dict[str, dict[str, Any]] = {
         "reason": "Payment requests become Slack requests while bill and membership evidence are preserved.",
     },
     "4fab96f": {
-        "status": "excluded",
+        "status": "migrated_with_rewrite",
         "instances": 3,
-        "reason": "Unanswered Venmo request reminders have no supported APP primitive.",
+        "reason": "Pending request reminders map to Workspace request ledgers and Slack direct messages.",
     },
     "530b157": {
         "status": "migrated_with_rewrite",

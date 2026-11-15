@@ -2979,6 +2979,7 @@ def _execute_with_real_llm(
         final_plan=ctx.task_data_plan,
         execution_contract=ctx.task_execution_contract,
         events=ctx.events,
+        user_prompt=prompt,
     )
 
     # Actual APP usage means the tool executed, not merely that a blocked
@@ -3155,6 +3156,19 @@ def _execute_with_real_llm(
         "untrusted_views": untrusted_views,
         "execution_error": execution_error,
         "trace_error": trace_error,
+        "tool_call_count": tool_activity["tool_call_count"],
+        "successful_tool_call_count": (
+            tool_activity["successful_tool_call_count"]
+        ),
+        "failed_tool_call_count": (
+            tool_activity["failed_tool_call_count"]
+        ),
+        "blocked_tool_call_count": (
+            tool_activity["blocked_tool_call_count"]
+        ),
+        "any_tool_blocked": bool(
+            tool_activity["blocked_tool_call_count"]
+        ),
         "action": f"LLM自主决策: {', '.join(actual_tools) if actual_tools else '未知'}",
         "blocked": blocked,
         "block_reason": block_reason,

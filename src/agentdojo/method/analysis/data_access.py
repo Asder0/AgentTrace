@@ -32,8 +32,15 @@ from .plan_actions import find_plan_action
 
 SENSITIVE_REFERENCE_PREFIX = "[[SENSITIVE_REF:"
 SENSITIVE_REFERENCE_PATTERN = re.compile(r"\[\[SENSITIVE_REF:.+?\]\]")
-
-
+SEARCH_SELECTOR_PARAMETERS = frozenset(
+    {
+        "query",
+        "search",
+        "search_query",
+        "keyword",
+        "keywords",
+    }
+)
 def canonicalize_resource_value(
     value: Any,
     semantic_type: str = "",
@@ -791,11 +798,166 @@ def value_occurs_in_origin(
     )
 
 
+def composed_value_supports_origin(
+    value: Any,
+    origin: ValueOrigin,
+) -> bool:
+    """Recognize a generated value that preserves distinctive source tokens."""
+    if not isinstance(value, str) or not isinstance(origin.value, str):
+        return False
+    generated = unicodedata.normalize("NFKC", value)
+    source = unicodedata.normalize("NFKC", origin.value)
+    if not generated.strip() or not source.strip():
+        return False
+    generated_folded = generated.casefold()
+    source_folded = source.casefold()
+    if (
+        len(source_folded) >= 2
+        and source_folded in generated_folded
+    ):
+        return True
+
+    strong_token_pattern = re.compile(
+        r"(?<![\w])(?:"
+        r"[A-Za-z]{1,6}\d{2,}[A-Za-z0-9-]*"
+        r"|\d{2,}[A-Za-z]{1,6}[A-Za-z0-9-]*"
+        r"|(?:19|20)\d{2}-\d{1,2}-\d{1,2}"
+        r"|(?:19|20)\d{2}[-/]\d{1,2}[-/]\d{1,2}"
+        r"|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"
+        r"|https?://\S+"
+        r")(?![\w])",
+        flags=re.IGNORECASE,
+    )
+    source_tokens = {
+        token.casefold()
+        for token in strong_token_pattern.findall(source)
+    }
+    if not source_tokens:
+        return False
+    generated_tokens = {
+        token.casefold()
+        for token in strong_token_pattern.findall(generated)
+    }
+    return bool(source_tokens & generated_tokens)
+
+
+def value_occurs_in_trusted_text(
+    value: Any,
+    text: str,
+    semantic_type: str = "",
+) -> bool:
+    """Return whether a selector value is explicitly grounded in trusted text."""
+    if value in (None, "") or not str(text).strip():
+        return False
+    normalized_value = unicodedata.normalize(
+        "NFKC",
+        str(value),
+    ).strip()
+    normalized_semantic = str(semantic_type).strip().lower()
+    if normalized_semantic == "email" and not re.fullmatch(
+        r"[^@\s]+@[^@\s]+\.[^@\s]+",
+        normalized_value,
+    ):
+        return False
+    if normalized_semantic == "iban" and not re.fullmatch(
+        r"[A-Za-z]{2}\d{2}[A-Za-z0-9]{10,30}",
+        normalized_value,
+    ):
+        return False
+    if (
+        normalized_semantic in {"slack_user", "user"}
+        and (
+            "@" in normalized_value
+            or re.fullmatch(
+                r"[A-Za-z]{2}\d{2}[A-Za-z0-9]{10,30}",
+                normalized_value,
+            )
+        )
+    ):
+        return False
+    if normalized_semantic in {"date", "datetime"}:
+        return _temporal_value_occurs_in_origin(
+            str(value),
+            str(text),
+        )
+    needle = " ".join(
+        unicodedata.normalize("NFKC", str(value))
+        .casefold()
+        .split()
+    )
+    if len(needle) < 2:
+        return False
+    haystack = " ".join(
+        unicodedata.normalize("NFKC", str(text))
+        .casefold()
+        .split()
+    )
+    return bool(
+        re.search(
+            rf"(?<![\w]){re.escape(needle)}(?![\w])",
+            haystack,
+        )
+    )
+
+
+def _clock_occurrences(
+    text: str,
+) -> list[tuple[int, int, int]]:
+    """Extract clock values and source offsets from natural-language text."""
+    result: list[tuple[int, int, int]] = []
+    source = unicodedata.normalize("NFKC", text)
+    for match in re.finditer(
+        r"\b(noon|midnight)\b",
+        source,
+        flags=re.IGNORECASE,
+    ):
+        result.append(
+            (
+                match.start(),
+                match.end(),
+                12 * 60
+                if match.group(1).lower() == "noon"
+                else 0,
+            )
+        )
+    for match in re.finditer(
+        r"(?<![\w])(\d{1,2})(?::(\d{2}))?"
+        r"\s*(AM|PM)(?![\w])",
+        source,
+        flags=re.IGNORECASE,
+    ):
+        hour = int(match.group(1)) % 12
+        minute = int(match.group(2) or 0)
+        if match.group(3).upper() == "PM":
+            hour += 12
+        result.append(
+            (
+                match.start(),
+                match.end(),
+                hour * 60 + minute,
+            )
+        )
+    for match in re.finditer(
+        r"(?<![\w])([01]?\d|2[0-3]):([0-5]\d)(?![\w])",
+        source,
+    ):
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        result.append(
+            (
+                match.start(),
+                match.end(),
+                hour * 60 + minute,
+            )
+        )
+    return result
+
+
 def _temporal_value_occurs_in_origin(
     value: str,
     origin_text: str,
 ) -> bool:
-    """Match an ISO date against ISO or natural-language source dates."""
+    """Match an ISO temporal value against natural-language source text."""
     raw_value = str(value).strip()
     try:
         target = datetime.fromisoformat(
@@ -816,6 +978,23 @@ def _temporal_value_occurs_in_origin(
     }
     if years and target.year not in years:
         return False
+    matched_dates: set[date] = set()
+    matched_date_windows: dict[
+        date,
+        list[tuple[int, int]],
+    ] = {}
+
+    def remember_date(
+        matched_date: date,
+        start: int,
+        end: int,
+    ) -> None:
+        matched_dates.add(matched_date)
+        matched_date_windows.setdefault(
+            matched_date,
+            [],
+        ).append((start, end))
+
     for match in re.finditer(
         r"\b(?:19|20)\d{2}-\d{1,2}-\d{1,2}\b",
         source,
@@ -824,8 +1003,11 @@ def _temporal_value_occurs_in_origin(
             parsed = date.fromisoformat(match.group(0))
         except ValueError:
             continue
-        if parsed == target.date():
-            return True
+        remember_date(
+            parsed,
+            match.start(),
+            match.end(),
+        )
     month_numbers = {
         "jan": 1,
         "feb": 2,
@@ -852,10 +1034,150 @@ def _temporal_value_occurs_in_origin(
         month = month_numbers[
             match.group(1)[:3].casefold()
         ]
-        if (
-            month == target.month
-            and int(match.group(2)) == target.day
+        day = int(match.group(2))
+        if month and 1 <= day <= 31:
+            try:
+                parsed = date(
+                    target.year,
+                    month,
+                    day,
+                )
+                remember_date(
+                    parsed,
+                    match.start(),
+                    match.end(),
+                )
+            except ValueError:
+                pass
+    for match in re.finditer(
+        r"\b("
+        r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+        r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
+        r"Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+        r")\.?\s+(\d{1,2})(?:st|nd|rd|th)?"
+        r"(?:\s*,?\s*(?:19|20)\d{2})?"
+        r"\s*(?:to|through|until|and|-|–)\s*"
+        r"(?:(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+        r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
+        r"Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+        r")\s+)?"
+        r"(\d{1,2})(?:st|nd|rd|th)?"
+        r"(?:\s*,?\s*((?:19|20)\d{2}))?",
+        source,
+        flags=re.IGNORECASE,
+    ):
+        start_month = month_numbers[
+            match.group(1)[:3].casefold()
+        ]
+        end_month = (
+            month_numbers[match.group(3)[:3].casefold()]
+            if match.group(3)
+            else start_month
+        )
+        year = (
+            int(match.group(5))
+            if match.group(5)
+            else target.year
+        )
+        try:
+            range_start = date(
+                year,
+                start_month,
+                int(match.group(2)),
+            )
+            range_end = date(
+                year,
+                end_month,
+                int(match.group(4)),
+            )
+        except ValueError:
+            continue
+        if range_end < range_start:
+            continue
+        for range_date in (
+            range_start,
+            range_end,
         ):
+            remember_date(
+                range_date,
+                match.start(),
+                match.end(),
+            )
+
+    if target.date() not in matched_dates:
+        return False
+    value_has_time = bool(
+        re.search(
+            r"[T ]\d{2}:\d{2}",
+            raw_value,
+        )
+    )
+    if not value_has_time:
+        return True
+    target_minutes = target.hour * 60 + target.minute
+    clock_occurrences = _clock_occurrences(source)
+    source_minutes = {
+        minutes
+        for _start, _end, minutes in clock_occurrences
+    }
+    if target_minutes == 0:
+        # A date-only source grounds midnight for a date-only operation.
+        # Once the source states a clock time, midnight must match exactly.
+        return not source_minutes or 0 in source_minutes
+    if target_minutes not in source_minutes:
+        return False
+    if len(matched_dates) == 1:
+        return True
+    target_windows = matched_date_windows.get(
+        target.date(),
+        [],
+    )
+    all_date_windows = [
+        window
+        for windows in matched_date_windows.values()
+        for window in windows
+    ]
+
+    def window_distance(
+        clock_start: int,
+        clock_end: int,
+        date_start: int,
+        date_end: int,
+    ) -> int:
+        if clock_start >= date_start and clock_end <= date_end:
+            return 0
+        if clock_end < date_start:
+            return date_start - clock_end
+        return clock_start - date_end
+
+    for clock_start, clock_end, clock_minutes in clock_occurrences:
+        if clock_minutes != target_minutes:
+            continue
+        target_distance = min(
+            (
+                window_distance(
+                    clock_start,
+                    clock_end,
+                    date_start,
+                    date_end,
+                )
+                for date_start, date_end in target_windows
+            ),
+            default=len(source) + 1,
+        )
+        nearest_distance = min(
+            (
+                window_distance(
+                    clock_start,
+                    clock_end,
+                    date_start,
+                    date_end,
+                )
+                for date_start, date_end in all_date_windows
+            ),
+            default=len(source) + 1,
+        )
+        if target_distance <= nearest_distance:
             return True
     return False
 
@@ -1300,6 +1622,7 @@ def validate_resource_access(
     event: Mapping[str, Any],
     *,
     source_registry: Mapping[str, Any] | None = None,
+    user_instruction: str = "",
 ) -> list[str]:
     """Validate concrete selector arguments against the data_access grant."""
     if not isinstance(contract, Mapping):
@@ -1331,7 +1654,29 @@ def validate_resource_access(
                 for item in raw_rule.get("allowed_values", [])
                 if item not in (None, "")
             }
-            if any(canonicalize_resource_value(item, semantic_type) not in allowed for item in values):
+            if (
+                str(parameter).strip().casefold()
+                in SEARCH_SELECTOR_PARAMETERS
+            ):
+                # A search term is a discovery selector, not the identity of
+                # the record being accessed. The APP, entity and visible-field
+                # grant still bound what the search is allowed to expose.
+                continue
+            unauthorized_values = [
+                item
+                for item in values
+                if canonicalize_resource_value(
+                    item,
+                    semantic_type,
+                )
+                not in allowed
+                and not value_occurs_in_trusted_text(
+                    item,
+                    user_instruction,
+                    semantic_type,
+                )
+            ]
+            if unauthorized_values:
                 failures.append(f"resource_not_authorized:{parameter}")
             continue
 
@@ -1436,7 +1781,15 @@ def validate_resource_access(
                 for allowed in allowed_refs
             )
 
-        source_authorized = not (
+        prompt_grounded = bool(user_instruction.strip()) and all(
+            value_occurs_in_trusted_text(
+                item,
+                user_instruction,
+                semantic_type,
+            )
+            for item in values
+        )
+        source_authorized = prompt_grounded or not (
             resolution.get("status") != "resolved"
             or int(resolution.get("unresolved_value_count", 0) or 0) > 0
             or int(resolution.get("ambiguous_value_count", 0) or 0) > 0
@@ -1454,6 +1807,12 @@ def validate_resource_access(
         if not source_authorized:
             failures.append(f"resource_source_not_authorized:{parameter}")
         else:
+            if prompt_grounded:
+                # The immutable user instruction is a trusted source. When a
+                # normalized selector is explicitly present there, it is
+                # already grounded and need not also be copied verbatim from
+                # one planned APP field.
+                continue
             required = {str(item) for item in raw_rule.get("required_sources", []) if str(item).strip()}
             observed_source_ids = {str(item.get("source_id", "")) for item in source_refs if item.get("source_id")}
             observed_source_ids.update(str(item) for item in resolution.get("used_source_ids", []) if item)
