@@ -94,17 +94,34 @@ def _tool_call_count(messages: Sequence[Any]) -> int:
 def evaluate_capture_completeness(
     messages: Sequence[Any],
     events: Sequence[Mapping[str, Any]],
+    *,
+    execution_stopped: bool = False,
 ) -> dict[str, Any]:
     """Match each requested tool call to one complete captured event bundle."""
     observed_calls = _tool_call_records(messages)
     starts: dict[str, Mapping[str, Any]] = {}
     ends: dict[str, Mapping[str, Any]] = {}
+    start_call_ids: set[str] = set()
+    start_identities: set[tuple[str, str]] = set()
+    start_base_names: set[str] = set()
     for event in events:
         activity_id = str(event.get("activity_id", "") or "")
         if not activity_id:
             continue
         if event.get("type") == "api_call_start":
             starts[activity_id] = event
+            call_id = str(event.get("tool_call_id", "") or "")
+            if call_id:
+                start_call_ids.add(call_id)
+            raw_tool_name = str(event.get("tool_intent", "") or "")
+            suite = str(
+                event.get("tool_suite")
+                or event.get("target_app")
+                or event.get("app_domain")
+                or ""
+            )
+            start_identities.add(_tool_identity(raw_tool_name, suite))
+            start_base_names.add(base_tool_name(raw_tool_name))
         elif event.get("type") == "api_call_end":
             ends[activity_id] = event
 
@@ -149,7 +166,19 @@ def evaluate_capture_completeness(
 
     matched_ids: list[str] = []
     unmatched_calls: list[dict[str, str]] = []
+    not_dispatched_calls: list[dict[str, str]] = []
     for call in observed_calls:
+        if execution_stopped:
+            started = (
+                bool(call["call_id"])
+                and call["call_id"] in start_call_ids
+            ) or (
+                bool(call["suite"])
+                and call["identity"] in start_identities
+            ) or call["name"] in start_base_names
+            if not started:
+                not_dispatched_calls.append(call)
+                continue
         activity_id = ""
         id_was_provided = bool(call["call_id"])
         if call["call_id"]:
@@ -234,8 +263,12 @@ def evaluate_capture_completeness(
             complete_fields += 1
 
     complete_bundles = len(matched_ids)
+    dispatched_calls = len(observed_calls) - len(not_dispatched_calls)
     return {
-        "observed_tool_calls": len(observed_calls),
+        "observed_tool_calls": dispatched_calls,
+        "proposed_tool_calls": len(observed_calls),
+        "not_dispatched_tool_calls": len(not_dispatched_calls),
+        "not_dispatched_call_details": not_dispatched_calls,
         "captured_start_events": len(starts),
         "captured_end_events": len(ends),
         "complete_event_bundles": complete_bundles,
@@ -245,9 +278,15 @@ def evaluate_capture_completeness(
         "orphan_start_events": len(set(starts) - complete_ids),
         "orphan_end_events": len(set(ends) - complete_ids),
         "unmatched_event_bundles": len(complete_ids - set(matched_ids)),
-        "capture_completeness": (complete_bundles / len(observed_calls) if observed_calls else 1.0),
+        "capture_completeness": (
+            complete_bundles / dispatched_calls
+            if dispatched_calls
+            else 1.0
+        ),
         "event_field_completeness": (
-            complete_fields / complete_bundles if complete_bundles else (1.0 if not observed_calls else 0.0)
+            complete_fields / complete_bundles
+            if complete_bundles
+            else (1.0 if not dispatched_calls else 0.0)
         ),
     }
 

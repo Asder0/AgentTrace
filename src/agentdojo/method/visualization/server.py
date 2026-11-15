@@ -2967,6 +2967,7 @@ def _execute_with_real_llm(
     capture_audit = evaluate_capture_completeness(
         messages,
         ctx.events,
+        execution_stopped=task_stopped,
     )
 
     # 统一节点 APP 域：unified 模式按工具注册表路由，单 suite 模式直接使用 suite 名
