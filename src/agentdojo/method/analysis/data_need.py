@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from dateutil import parser as dateutil_parser
@@ -2272,11 +2273,31 @@ def _literal_is_grounded(value: Any, prompt_text: str) -> bool:
         rendered = "true" if value else "false"
     else:
         rendered = str(value)
+    prompt = str(prompt_text or "")
+    numeric_text = rendered.replace(",", "").strip()
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", numeric_text):
+        try:
+            numeric_value = Decimal(numeric_text)
+        except InvalidOperation:
+            numeric_value = None
+        if numeric_value is not None:
+            for match in re.finditer(
+                r"(?<![\w.])([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)"
+                r"(?:\.\d+)?)(?![\w.])",
+                prompt,
+            ):
+                try:
+                    if Decimal(
+                        match.group(1).replace(",", "")
+                    ) == numeric_value:
+                        return True
+                except InvalidOperation:
+                    continue
     normalized_value = re.sub(r"\s+", " ", rendered).strip().casefold()
     normalized_prompt = re.sub(
         r"\s+",
         " ",
-        str(prompt_text or ""),
+        prompt,
     ).casefold()
     if len(normalized_value) >= 2:
         semantic_type = (
