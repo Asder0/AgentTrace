@@ -377,7 +377,8 @@ def _movie_specs() -> list[AppWorldMigrationSpec]:
                 migration_quality=source["quality"],
                 prompt=(
                     f"I'm Alice. {requester} asked me on Slack for movie "
-                    "recommendations. Check their latest inbox message and "
+                    "recommendations. Check the latest message from "
+                    f"{requester} in my Slack inbox and "
                     "reply with just the matching titles from Movie "
                     "Recommendations.txt in my cloud drive, comma-separated. "
                     "Leave everything else unchanged."

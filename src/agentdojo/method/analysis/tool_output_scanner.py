@@ -37,6 +37,9 @@ NON_LANGUAGE_CATEGORIES = {
     "email",
     "phone",
     "iban",
+    "slack_channel",
+    "slack_user",
+    "file_sharing_permission",
     "financial_amount",
     "government_identifier",
     "passport_number",
@@ -64,6 +67,11 @@ def _should_scan(text: Any) -> bool:
         return True
     if re.search(r"https?://|www\.", value, re.IGNORECASE):
         return True
+    cjk_characters = len(re.findall(r"[\u4e00-\u9fff]", value))
+    if not re.search(r"\s", value):
+        # A single token or a structured one-line value is metadata unless
+        # it contains enough CJK text or one of the control phrases above.
+        return cjk_characters >= 4
     machine_identifier = re.fullmatch(
         r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)+",
         value,
@@ -519,13 +527,22 @@ def scan_tool_output(
                 result.field_statuses[path] = "scanned_clean"
                 return item
 
+            language_chunks = [
+                chunk
+                for chunk in scan.chunks
+                if _should_scan(chunk.text)
+            ]
+            if scan.chunks and not language_chunks:
+                result.field_statuses[path] = "scanned_clean"
+                return item
+
             result.source_flagged = True
             result.field_statuses[path] = "quarantined"
             result.flagged_fields.append(path)
             result.quarantined_fields.append(path)
             expanded_spans = _expand_injection_spans(
                 item,
-                scan.chunks,
+                language_chunks or scan.chunks,
             )
             if not expanded_spans:
                 expanded_spans = [

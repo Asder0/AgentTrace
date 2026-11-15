@@ -75,7 +75,10 @@
         "$.content": {"level": "confidential"},
         "$.owner": {"level": "internal", "categories": ["email"]},
         "$.last_modified": {"level": "internal"},
-        "$.shared_with": {"level": "internal"},
+        "$.shared_with": {
+          "level": "internal",
+          "categories": ["file_sharing_permission"]
+        },
         "$.size": {"level": "internal"}
       },
       "calendar_event": {
@@ -129,8 +132,8 @@
     },
     "slack": {
       "message": {
-        "$.sender": {"level": "internal"},
-        "$.recipient": {"level": "internal"},
+        "$.sender": {"level": "internal", "categories": ["slack_user"]},
+        "$.recipient": {"level": "internal", "categories": ["slack_user"]},
         "$.body": {"level": "confidential"}
       },
       "channel": {

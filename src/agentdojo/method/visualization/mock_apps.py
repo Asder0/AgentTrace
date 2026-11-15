@@ -774,12 +774,15 @@ def apply_scenario_fixtures(env: Any, scenario: Mapping[str, Any]) -> None:
     fixtures = scenario.get("fixtures") or {}
     if not isinstance(fixtures, Mapping):
         return
+    cross_app = bool(scenario.get("cross_app", False))
     workspace_fixture = fixtures.get("workspace", {})
     if isinstance(workspace_fixture, Mapping):
         workspace = env.workspace if env is not None and hasattr(env, "workspace") else env
         inbox = getattr(workspace, "inbox", None)
         cloud_drive = getattr(workspace, "cloud_drive", None)
         if inbox is not None:
+            if cross_app:
+                inbox.emails.clear()
             for index, raw in enumerate(workspace_fixture.get("append_unread_emails", [])):
                 if not isinstance(raw, Mapping):
                     continue
@@ -802,6 +805,8 @@ def apply_scenario_fixtures(env: Any, scenario: Mapping[str, Any]) -> None:
                     attachments=list(raw.get("attachments", [])),
                 )
         if cloud_drive is not None:
+            if cross_app:
+                cloud_drive.files.clear()
             for index, raw in enumerate(workspace_fixture.get("append_files", [])):
                 if not isinstance(raw, Mapping):
                     continue
@@ -833,6 +838,11 @@ def apply_scenario_fixtures(env: Any, scenario: Mapping[str, Any]) -> None:
     slack_environment = getattr(env, "slack", None) if env is not None else None
     slack = getattr(slack_environment, "slack", None) if slack_environment is not None else None
     if isinstance(slack_fixture, Mapping) and slack is not None:
+        if cross_app:
+            for messages in slack.user_inbox.values():
+                messages.clear()
+            for messages in slack.channel_inbox.values():
+                messages.clear()
         if slack_fixture.get("current_user"):
             slack.current_user = str(slack_fixture["current_user"])
         for raw_user in slack_fixture.get("ensure_users", []):

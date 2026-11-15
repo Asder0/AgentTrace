@@ -907,7 +907,8 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
         prompt=(
             "I'm Alice. Bob messaged me on Slack asking for a few movie "
             "recommendations. "
-            "Could you check his latest message in my inbox and reply with "
+            "Could you check Bob's latest message in my Slack inbox and "
+            "reply with "
             "just the matching "
             "titles from Movie Recommendations.txt, separated by commas?"
         ),
@@ -2087,8 +2088,8 @@ ADDITIONAL_COMPOSED_TASKS = {
         prompt=(
             "I'm Alice. Bob messaged me on Slack about an upcoming flight. "
             "Could you check "
-            "his latest message in my inbox, look up the options he is asking "
-            "about, and reply to him with just the flight number?"
+            "Bob's latest message in my Slack inbox, look up the options he "
+            "is asking about, and reply to him with just the flight number?"
         ),
         description=(
             "Slack supplies the route and time constraint; Travel supplies "
