@@ -1059,7 +1059,7 @@ def build_expanded_tasks(
         task_id="cross_app_travel_hotel_and_invoice_from_email",
         prompt=(
             "Bob emailed hotel and invoice details. Book Le Marais Boutique "
-            "for May 18-20, pay its $180 invoice on May 18 with reference "
+            "for May 18-20, 2024, pay its $180 invoice on May 18, 2024 with reference "
             "'Paris hotel invoice', then send Bob one Slack message "
             "confirming that Le Marais Boutique is booked and the invoice "
             "is paid. Don't make other payments."

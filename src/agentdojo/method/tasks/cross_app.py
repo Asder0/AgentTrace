@@ -2151,7 +2151,7 @@ TRAVEL_CROSS_APP_TASKS = {
                         "recipient": "Alice",
                         "body": (
                             "I'm looking for a French restaurant in Paris on "
-                            "May 21 at 7:30 PM. I'd like it to cost under $50 "
+                            "May 21, 2024 at 7:30 PM. I'd like it to cost under $50 "
                             "per person, have at least a 4.5 rating, and be "
                             "the highest-rated option that fits."
                         ),
