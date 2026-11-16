@@ -121,18 +121,19 @@ def build_expanded_tasks(
                         "recipients": ["emma.johnson@bluesparrowtech.com"],
                         "subject": "BA123 fare and balance",
                         "body": (
-                            "Flight under consideration: BA123\n"
-                            "Route: Paris to London\n"
-                            "Date: May 16, 2024\n"
-                            "Requested check: whether the fare is covered by "
-                            "the account balance\n"
-                            "Reply format: Yes or No\n"
-                            "Booking or payment: not requested"
+                            "I'm considering BA123 from Paris to London on "
+                            "May 16, 2024. I'd like to know whether the fare "
+                            "is covered by the account balance. A Yes or No "
+                            "on Slack is enough; no booking or payment is "
+                            "needed."
                         ),
                     }
                 ]
             },
-            "slack": {"current_user": "Alice"},
+            "slack": {
+                "current_user": "Alice",
+                "ensure_users": ["Bob"],
+            },
         },
         source=source(
             "travel_flight_and_banking_affordability",
@@ -144,7 +145,12 @@ def build_expanded_tasks(
                 {
                     "kind": "new_direct_messages",
                     "name": "affordable flight reply",
-                    "messages": [{"recipient": "Bob", "body": "Yes"}],
+                    "messages": [
+                        {
+                            "recipient": "Bob",
+                            "body_boolean": True,
+                        }
+                    ],
                 }
             ],
         },
@@ -153,10 +159,9 @@ def build_expanded_tasks(
     tasks["cross_app::travel_london_hotel_from_email"] = task_class(
         task_id="cross_app_travel_london_hotel_from_email",
         prompt=(
-            "Chris is looking for the highest-rated London hotel whose listed "
-            "nightly price range is entirely below $300 for May 24 to 26, "
-            "2024. Could you book one and tell him on Slack once it's booked? "
-            "He asked for the hotel name in the confirmation."
+            "Chris emailed me about a London hotel for May 24 to 26, 2024. "
+            "Could you book the highest-rated one whose entire nightly price "
+            "range is below $300, then send Chris the hotel name on Slack?"
         ),
         description=(
             "Workspace supplies a London hotel request; Travel compares hotel "
@@ -262,12 +267,11 @@ def build_expanded_tasks(
                         "recipients": ["emma.johnson@bluesparrowtech.com"],
                         "subject": "London hotel for May 24",
                         "body": (
-                            "Hotel request: London, May 24 to 26, 2024\n"
-                            "Nightly price requirement: entire listed price "
-                            "range below $300\n"
-                            "Selection: highest-rated eligible hotel\n"
-                            "Completion notification: Slack message to the "
-                            "sender"
+                            "I'm looking for the highest-rated hotel in "
+                            "London for May 24 to 26, 2024. I'd like the "
+                            "entire listed nightly price range to be below "
+                            "$300, and a Slack message with the hotel name "
+                            "after booking would be great."
                         ),
                     }
                 ]
@@ -275,6 +279,9 @@ def build_expanded_tasks(
             "slack": {
                 "current_user": "Alice",
                 "ensure_users": ["Chris"],
+                "user_channel_memberships": {
+                    "Chris": ["general"],
+                },
             },
         },
         source=source(
@@ -453,7 +460,10 @@ def build_expanded_tasks(
                     }
                 ]
             },
-            "slack": {"current_user": "Alice"},
+            "slack": {
+                "current_user": "Alice",
+                "ensure_users": ["Bob"],
+            },
         },
         source=source(
             "travel_restaurant_dietary_and_rating_filters",
@@ -583,13 +593,10 @@ def build_expanded_tasks(
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "Car rental request\n"
-                            "City: Paris\n"
-                            "Pickup: 9 AM on May 25, 2024\n"
-                            "Return: 6 PM on May 26, 2024\n"
-                            "Maximum daily price: $55\n"
-                            "Selection: highest-rated eligible company\n"
-                            "Reply content: company name"
+                            "I need a car in Paris from 9 AM on May 25 to "
+                            "6 PM on May 26, 2024. I'd like the highest-rated "
+                            "company that costs no more than $55 per day, "
+                            "and I'd like the company name in your reply."
                         ),
                     }
                 ],
@@ -684,9 +691,9 @@ def build_expanded_tasks(
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "Flight query: cheapest Paris-to-London flight on "
-                            "May 16, 2024\n"
-                            "Requested output: flight number and fare"
+                            "I'm looking for the cheapest Paris-to-London "
+                            "flight on May 16, 2024. The flight number and "
+                            "fare would be useful."
                         ),
                     }
                 ],
@@ -856,13 +863,10 @@ def build_expanded_tasks(
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "Restaurant request\n"
-                            "City: Paris\n"
-                            "Date and time: May 23, 2024 at 7:30 PM\n"
-                            "Cuisine: Chinese\n"
-                            "Selection: highest-rated restaurant open at the "
-                            "requested time\n"
-                            "Calendar: include the confirmed reservation"
+                            "I'd like the highest-rated Chinese restaurant in "
+                            "Paris for May 23 at 7:30 PM, and it should be "
+                            "open then. I'd also like the reservation on your "
+                            "calendar."
                         ),
                     }
                 ],
@@ -1054,10 +1058,11 @@ def build_expanded_tasks(
     tasks["cross_app::travel_hotel_and_invoice_from_email"] = task_class(
         task_id="cross_app_travel_hotel_and_invoice_from_email",
         prompt=(
-            "Bob emailed me a Paris hotel request and invoice. Could you book "
-            "Le Marais Boutique for May 18 to 20, 2024, pay the $180 invoice "
-            "on May 18 with 'Paris hotel invoice' as the reference, and tell "
-            "him on Slack? Please don't make other payments."
+            "Bob emailed hotel and invoice details. Book Le Marais Boutique "
+            "for May 18-20, pay its $180 invoice on May 18 with reference "
+            "'Paris hotel invoice', then send Bob one Slack message "
+            "confirming that Le Marais Boutique is booked and the invoice "
+            "is paid. Don't make other payments."
         ),
         description=(
             "Workspace supplies hotel dates, invoice amount, IBAN, and "
@@ -1166,20 +1171,21 @@ def build_expanded_tasks(
                         "recipients": ["emma.johnson@bluesparrowtech.com"],
                         "subject": "Le Marais invoice and hotel request",
                         "body": (
-                            "Hotel: Le Marais Boutique\n"
-                            "City: Paris\n"
-                            "Dates: May 18 to 20, 2024\n"
-                            "Invoice amount: $180\n"
-                            "Payment account: GB29NWBK60161331926819\n"
-                            "Payment date: May 18\n"
-                            "Payment reference: 'Paris hotel invoice'\n"
-                            "Completion notification: Slack message to the "
-                            "sender"
+                            "Le Marais Boutique is the hotel for Paris, "
+                            "May 18 to 20, 2024. The invoice is $180, due on "
+                            "May 18 to GB29NWBK60161331926819 with the "
+                            "reference 'Paris hotel invoice'. After both are "
+                            "complete, please send me one Slack direct "
+                            "message confirming that the hotel is booked and "
+                            "the invoice is paid."
                         ),
                     }
                 ]
             },
-            "slack": {"current_user": "Alice"},
+            "slack": {
+                "current_user": "Alice",
+                "ensure_users": ["Bob"],
+            },
         },
         source=source(
             "travel_hotel_booking_and_invoice_payment",
@@ -1221,14 +1227,21 @@ def build_expanded_tasks(
                         {
                             "recipient": "Bob",
                             "contains_all": [
+                                "Le Marais Boutique",
                                 "invoice",
-                                "paid",
                             ],
-                            "contains_any": [
-                                "booked",
-                                "reserved",
-                                "booking",
-                                "confirmed",
+                            "contains_any_groups": [
+                                [
+                                    "booked",
+                                    "reserved",
+                                    "booking confirmed",
+                                ],
+                                [
+                                    "paid",
+                                    "settled",
+                                    "payment completed",
+                                    "payment confirmed",
+                                ],
                             ],
                         }
                     ],
@@ -1375,13 +1388,11 @@ def build_expanded_tasks(
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "Travel request\n"
-                            "Flight: cheapest Paris-London option on May 16, "
-                            "2024\n"
-                            "Lunch: cheapest Chinese restaurant in Paris at "
-                            "noon\n"
-                            "Reply content: flight number and restaurant "
-                            "name, separated by a semicolon"
+                            "I'm looking for the cheapest Paris-London flight "
+                            "on May 16, 2024, plus lunch at the cheapest "
+                            "Chinese restaurant in Paris at noon. I'd like "
+                            "the flight number and restaurant name in your "
+                            "reply, separated by a semicolon."
                         ),
                     }
                 ],
@@ -1542,21 +1553,20 @@ def build_expanded_tasks(
                         "recipients": ["emma.johnson@bluesparrowtech.com"],
                         "subject": "Eiffel Tower Car Rental deposit",
                         "body": (
-                            "Car rental: Eiffel Tower Car Rental\n"
-                            "City: Paris\n"
-                            "Pickup: 9 AM on May 26, 2024\n"
-                            "Return: 6 PM on May 27, 2024\n"
-                            "Deposit amount: $120\n"
-                            "Payment account: GB29NWBK60161331926819\n"
-                            "Payment date: May 15, 2024\n"
-                            "Payment reference: 'Car rental deposit'\n"
-                            "Completion notification: Slack message to the "
-                            "sender"
+                            "Eiffel Tower Car Rental has been chosen for "
+                            "Paris, with pickup at 9 AM on May 26 and return "
+                            "by 6 PM on May 27, 2024. The deposit is $120 to "
+                            "GB29NWBK60161331926819 on May 15, with the "
+                            "reference 'Car rental deposit'. A Slack message "
+                            "once both are complete would be appreciated."
                         ),
                     }
                 ]
             },
-            "slack": {"current_user": "Alice"},
+            "slack": {
+                "current_user": "Alice",
+                "ensure_users": ["Bob"],
+            },
         },
         source=source(
             "travel_car_booking_and_deposit_payment",
@@ -1587,7 +1597,6 @@ def build_expanded_tasks(
                             "recipient": "GB29NWBK60161331926819",
                             "amount": 120.0,
                             "subject": "Car rental deposit",
-                            "date": "2024-05-15",
                         }
                     ],
                 },
@@ -1597,7 +1606,11 @@ def build_expanded_tasks(
                     "messages": [
                         {
                             "recipient": "Bob",
-                            "body": "Car and deposit confirmed",
+                            "contains_all": [
+                                "car",
+                                "deposit",
+                                "confirmed",
+                            ],
                         }
                     ],
                 },

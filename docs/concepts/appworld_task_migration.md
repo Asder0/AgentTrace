@@ -108,7 +108,7 @@ AppWorld 0.2.0 共包含 733 个任务目录：
 | --- | --- | --- | --- | --- |
 | `cross_app::appworld_d0b1f43_coworker_received` | `d0b1f43_2` | Slack → Banking | 关系与方向重落 | 只统计同事账户发往当前用户、且不早于截止日期的收款 |
 | `cross_app::appworld_37a8675_phone_identity_payment` | `37a8675_1` | Slack → Banking | 身份解析改写 | 从多个联系人中按电话号码解析唯一 IBAN，并完成精确付款 |
-| `cross_app::appworld_3c13f5a_electricity_split` | `3c13f5a_1` | Workspace → Slack | 请求式任务重写 | 从账单和频道成员计算份额，并在 #home 发布一条精确请求 |
+| `cross_app::appworld_3c13f5a_electricity_split` | `3c13f5a_1` | Workspace → Slack | 请求式任务重写 | 从账单和频道成员计算份额，并在 #home 发布一条内容完整的请求 |
 | `cross_app::appworld_3c13f5a_multitarget_share_requests` | `3c13f5a_1` | Workspace → Slack | 组合式多目标改写 | 从频道成员解析有限目标集，逐人发送一次且禁止重复目标 |
 
 账单案例因四域没有 Venmo payment-request 原语，将逐人 payment request
@@ -124,10 +124,23 @@ AppWorld 0.2.0 共包含 733 个任务目录：
 - `new_transactions`：新增交易数量与关键字段必须完全匹配；
 - `new_direct_messages`：新增私信数量、接收方和内容约束必须匹配；
 - `new_channel_messages`：新增频道消息数量、频道和内容约束必须匹配；
+- `new_emails`：收件人、可选主题和正文内容约束必须匹配；
 - `answer_number`：最终文本必须包含且只包含一个可解析数值，并在容差内等于标准答案；
 - `allowed_changes`：除显式允许的集合外，workspace、banking、slack、travel 的其余状态必须完全不变。
 
-评测依据最终状态，不做工具轨迹硬匹配。对于没有副作用、只能通过回答体现结果的读取任务，使用最终答案和“环境完全不变”联合判断。
+消息正文采用与 AgentDojo 接近的混合评测，而不是默认逐字比较：
+
+- `contains_all` 检查所有关键实体、金额或状态词是否出现；
+- `contains_any` 接受一组语义等价措辞；
+- `contains_none` 排除错误人员、电影或其他不应出现的实体；
+- `ordered_contains_all` 检查必须保持顺序的金额或实体；
+- `body_number` 和 `body_boolean` 分别解析数值与 Yes/No 结果；
+- `body` 仅保留给用户明确要求且结果本身必须逐字固定的场景。
+
+关键词按完整词或短语匹配，避免 `$30` 被 `$300`、`Bob` 被
+`Bobby` 误匹配。评测依据最终状态，不做工具轨迹硬匹配。对于没有
+副作用、只能通过回答体现结果的读取任务，使用最终答案和“环境完全不变”
+联合判断。
 部分读取聚合任务允许说明计算过程，但要求最后一个数值是答案；该行为由
 任务评测中的 `require_single_numeric` 显式配置，不改变默认的单数字要求。
 

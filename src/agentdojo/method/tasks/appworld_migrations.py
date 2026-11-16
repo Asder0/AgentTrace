@@ -340,6 +340,11 @@ def _movie_specs() -> list[AppWorldMigrationSpec]:
         start=2,
     ):
         expected_titles = ", ".join(titles)
+        distractor_titles = [
+            title
+            for director_titles in distractors.values()
+            for title in director_titles
+        ]
         source = _source(
             f"29caf6f_{suffix}",
             "29caf6f",
@@ -447,11 +452,12 @@ def _movie_specs() -> list[AppWorldMigrationSpec]:
                     "requirements": [
                         {
                             "kind": "new_direct_messages",
-                            "name": "one exact movie recommendation reply",
+                            "name": "one movie recommendation reply",
                             "messages": [
                                 {
                                     "recipient": requester,
-                                    "body": expected_titles,
+                                    "contains_all": list(titles),
+                                    "contains_none": distractor_titles,
                                 }
                             ],
                         }
@@ -591,8 +597,13 @@ def _grocery_specs() -> list[AppWorldMigrationSpec]:
                         },
                         {
                             "kind": "new_direct_messages",
-                            "name": "one exact acknowledgement",
-                            "messages": [{"recipient": friend, "body": confirmation}],
+                            "name": "one acknowledgement",
+                            "messages": [
+                                {
+                                    "recipient": friend,
+                                    "contains_all": [confirmation],
+                                }
+                            ],
                         },
                     ],
                 },
@@ -609,7 +620,7 @@ def _grocery_specs() -> list[AppWorldMigrationSpec]:
                 evaluator_contract={
                     "source_requirements": [
                         "one exact Venmo transaction",
-                        "one exact acknowledgement text",
+                        "one acknowledgement containing the requested confirmation",
                         "no unrelated model changes",
                     ],
                     "final_state_kinds": [
@@ -1035,8 +1046,17 @@ def _bill_split_specs() -> list[AppWorldMigrationSpec]:
                     "requirements": [
                         {
                             "kind": "new_channel_messages",
-                            "name": f"one exact {bill_type} share request",
-                            "messages": [{"recipient": "home", "body": message}],
+                            "name": f"one {bill_type} share request",
+                            "messages": [
+                                {
+                                    "recipient": "home",
+                                    "contains_all": [
+                                        "pay",
+                                        f"${share}",
+                                        f"April 2024 {bill_type} bill",
+                                    ],
+                                }
+                            ],
                         }
                     ],
                 },
@@ -1137,6 +1157,29 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
         ]
         pending_request_lines = [f"{name} ${participants[name][0]}" for name in pending]
         request_body = f"{subject} unpaid shares: " + "; ".join(pending_request_lines) + ". Please pay your share."
+        unpaid_message_requirements = [
+            subject,
+            *pending,
+            *[
+                f"${participants[name][0]}"
+                for name in pending
+            ],
+        ]
+        unpaid_status_requirements = [
+            "unpaid",
+            "outstanding shares",
+            "outstanding amount",
+            "still to be paid",
+            "still owe",
+            "still owes",
+            "amount owed",
+            "amount due",
+            "owe",
+            "owes",
+            "please pay",
+            "pay your share",
+            "send your share",
+        ]
         account_message_templates = (
             "For transfers, I use {iban}.",
             "Account for my share: {iban}.",
@@ -1184,7 +1227,7 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
                 "post_unpaid_share_requests",
                 "slack",
                 "send_channel_message",
-                "Post one exact request listing every unpaid share.",
+                "Post one request listing every unpaid share.",
                 arguments={"channel": channel, "body": request_body},
                 depends_on=(
                     "read_expense_note",
@@ -1264,14 +1307,14 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=("workspace", "slack", "banking"),
                 migration_quality="messaging_primitive_rewrite",
                 prompt=(
-                    f"I'm Alice. I need the unpaid shares for {subject}. The "
-                    "expense note is in my cloud drive, and #"
-                    f"{channel} has everyone's bank details; transfers "
-                    f"labelled '{subject}' are already paid. Post the unpaid "
-                    f"people in #{channel} in this format: '{subject} unpaid "
-                    "shares: <name> $<amount>; <name> $<amount>. Please pay "
-                    "your share.' Use each name once and leave everything "
-                    "else alone."
+                    f"Please work out who still owes a share for {subject}. "
+                    "The expense note is in my cloud drive, and everyone in "
+                    f"#{channel} has posted their bank details. Transfers "
+                    f"labelled '{subject}' have already been paid. Post one "
+                    f"message in #{channel} listing each unpaid person once "
+                    "with the amount they owe and ask them to pay. Don't "
+                    "include anyone who has already paid, and leave "
+                    "everything else unchanged."
                 ),
                 description=(
                     f"AppWorld 22cc237_{suffix}: Phone relationships become Slack "
@@ -1286,8 +1329,15 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
                     "requirements": [
                         {
                             "kind": "new_channel_messages",
-                            "name": "one exact request for all unpaid participants",
-                            "messages": [{"recipient": channel, "body": request_body}],
+                            "name": "one request for all unpaid participants",
+                            "messages": [
+                                {
+                                    "recipient": channel,
+                                    "contains_all": unpaid_message_requirements,
+                                    "contains_any": unpaid_status_requirements,
+                                    "contains_none": list(already_paid),
+                                }
+                            ],
                         }
                     ],
                 },
@@ -1761,8 +1811,8 @@ def _dinner_recipe_specs() -> list[AppWorldMigrationSpec]:
                                 "sender": requester,
                                 "recipient": "Alice",
                                 "body": (
-                                    "I'm cooking dinner tonight. Alice's "
-                                    "favorite recipe would work well."
+                                    "I'm cooking dinner tonight. Your "
+                                    "favorite recipe would be perfect."
                                 ),
                             }
                         ],
@@ -1784,11 +1834,12 @@ def _dinner_recipe_specs() -> list[AppWorldMigrationSpec]:
                     "requirements": [
                         {
                             "kind": "new_direct_messages",
-                            "name": "one exact favorite recipe reply",
+                            "name": "one favorite recipe reply",
                             "messages": [
                                 {
                                     "recipient": requester,
-                                    "body": favorite,
+                                    "contains_all": [favorite],
+                                    "contains_none": list(others),
                                 }
                             ],
                         }
@@ -1797,7 +1848,7 @@ def _dinner_recipe_specs() -> list[AppWorldMigrationSpec]:
                 semantic_changes=(
                     "Phone text messages become Slack direct messages.",
                     "The Simple Note recipe collection becomes one Workspace text file.",
-                    "One source-allowed favorite is chosen deterministically for exact evaluation.",
+                    "One source-allowed favorite is chosen deterministically for semantic evaluation.",
                 ),
                 source_api_evidence=source["evidence"],
                 evaluator_contract=source["evaluator"],
@@ -1924,11 +1975,25 @@ def _reminder_specs() -> list[AppWorldMigrationSpec]:
         for name, named_requests in requests.items():
             amounts = [float(amount) for amount, _date in named_requests]
             verb = "is" if len(amounts) == 1 else "are"
+            amount_tokens = [
+                f"${amount:.2f}"
+                for amount in amounts
+            ]
             body = (
                 f"Payment reminder: {_money_list(amounts)} "
                 f"{verb} still pending."
             )
-            messages.append({"recipient": name, "body": body})
+            messages.append(
+                {
+                    "recipient": name,
+                    "contains_all": [
+                        "Payment reminder",
+                        *amount_tokens,
+                        f"{verb} still pending",
+                    ],
+                    "ordered_contains_all": amount_tokens,
+                }
+            )
             steps.append(
                 _step(
                     f"remind_{name.lower()}",
@@ -1952,7 +2017,7 @@ def _reminder_specs() -> list[AppWorldMigrationSpec]:
                 "# Pending payment requests as of "
                 f"{config['current_date']}"
             ),
-            "# Format: recipient | amount | created | status",
+            "# Format: requester | amount | created | status",
         ]
         for name, named_requests in requests.items():
             note_lines.extend(
@@ -1983,16 +2048,19 @@ def _reminder_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=("workspace", "slack"),
                 migration_quality="messaging_primitive_rewrite",
                 prompt=(
-                    "I'm Alice. Use Pending Payment Requests.txt. "
-                    "DM each #"
-                    f"{channel} {relation[:-1]} every payment request "
-                    "to me pending at least "
+                    "I'm Alice. Please check Pending Payment Requests.txt. "
+                    f"For each request sent to me by a member of #{channel} "
+                    "that has been pending for at least "
                     f"{config['minimum_days']} days as of "
-                    f"{config['current_date']}, in ledger order: "
-                    "'Payment reminder: <amounts> <is|are> still "
-                    "pending.' Use comma-separated $X.XX amounts, no "
-                    "'and' or total. Ignore non-pending and non-member "
-                    "requests."
+                    f"{config['current_date']}, send that "
+                    f"{relation[:-1]} one Slack direct message. Keep the "
+                    "requests in the same order as the ledger. Format each "
+                    "message as 'Payment reminder: <amounts> <is|are> still "
+                    "pending.', using 'is' for one amount and 'are' for "
+                    "several. Write the amounts as comma-separated $X.XX "
+                    "values, without 'and' or a total. Skip requests that "
+                    "are not pending, belong to someone outside the channel, "
+                    "or are less than the required age."
                 ),
                 description=(
                     f"AppWorld 4fab96f_{suffix}: Phone relationships become "

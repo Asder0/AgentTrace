@@ -93,6 +93,11 @@ completed_defense_on_runs / all_defense_on_normal_runs
 
 执行错误、模型提前停止、计划失败或最终状态不匹配都会计为未完成。
 
+运行期不再额外调用 LLM 执行 `completion_audit` 或
+`final_response_audit`。完成状态直接来自确定性任务 evaluator；
+没有 evaluator 的调试动作只表示执行是否正常结束，不表示语义任务完成。
+这两项审计不属于 Ring 0–3，也不会影响捕获完整性、过程认证或正式指标。
+
 ## 正常任务完成率下降
 
 同一任务必须分别运行防御关闭和防御开启，并按任务 ID 配对。

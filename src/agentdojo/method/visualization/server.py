@@ -70,7 +70,6 @@ from ..analysis.defense_config import (
 )
 from ..analysis.execution_contract import build_task_execution_contract
 from ..analysis.l2_chain import ConfirmationBroker
-from ..analysis.outcome_audit import audit_task_outcomes
 from ..capture import interceptor as interceptor_module
 from ..capture.interceptor import (
     PromptInjectionBlockedError,
@@ -2581,55 +2580,47 @@ def _final_assistant_response(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def _merge_execution_stop(
-    completion_audit: dict[str, Any],
-    plan: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Preserve an online stop decision in the final structured audit."""
-    if not isinstance(completion_audit, dict) or not isinstance(plan, dict):
-        return completion_audit
-    execution_stop = plan.get("execution_stop")
-    if not isinstance(execution_stop, dict):
-        return completion_audit
-    stop_id = str(execution_stop.get("id") or "")
-    if not stop_id:
-        return completion_audit
-    stops = completion_audit.get("stop_conditions", [])
-    if not isinstance(stops, list):
-        stops = []
-    if any(isinstance(item, dict) and str(item.get("id") or "") == stop_id for item in stops):
-        completion_audit["stop_conditions"] = stops
-        return completion_audit
-    stops.append(
-        {
-            "id": stop_id,
-            "reason": str(execution_stop.get("reason") or ""),
-            "behavior": str(execution_stop.get("behavior") or ""),
-            "step_ids": list(execution_stop.get("step_ids", []) or []),
-            "evidence_activity_ids": list(execution_stop.get("evidence_activity_ids", []) or []),
-            "source": "online_execution_stop",
-        }
-    )
-    completion_audit["stop_conditions"] = stops
-    return completion_audit
-
-
 def _reconcile_completion_with_evaluation(
     completion_audit: Mapping[str, Any] | None,
     task_evaluation: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Keep the semantic audit consistent with deterministic task checks."""
     audit = dict(completion_audit or {})
-    if (
-        not isinstance(task_evaluation, Mapping)
-        or bool(task_evaluation.get("passed"))
-        or audit.get("overall") != "completed"
-    ):
+    if not isinstance(task_evaluation, Mapping):
         return audit
+
+    if bool(task_evaluation.get("passed")):
+        if audit.get("overall") != "completed":
+            audit.setdefault("schema_version", 1)
+            audit["overall_before_deterministic_evaluation"] = (
+                audit.get("overall") or "not_run"
+            )
+            audit["semantic_summary_before_deterministic_evaluation"] = (
+                audit.get("summary") or ""
+            )
+            audit["overall"] = "completed"
+            audit["summary"] = (
+                "确定性任务校验通过；语义审计中的未确认项仅作诊断。"
+            )
+            warnings = list(audit.get("warnings", []))
+            warnings.append(
+                "semantic_audit_downgraded_by_deterministic_evaluation"
+            )
+            audit["warnings"] = list(dict.fromkeys(warnings))
+        audit["assessed"] = True
+        audit["semantic_audit_advisory"] = True
+        return audit
+
+    if audit.get("overall") == "completed":
+        audit["overall_before_deterministic_evaluation"] = "completed"
+    else:
+        audit.setdefault(
+            "overall_before_deterministic_evaluation",
+            audit.get("overall") or "not_run",
+        )
     failed_checks = [
         dict(item) for item in task_evaluation.get("checks", []) if isinstance(item, Mapping) and not item.get("passed")
     ]
-    audit["overall_before_deterministic_evaluation"] = "completed"
     audit["overall"] = "incomplete"
     audit["summary"] = "确定性任务校验未通过：" + "；".join(
         str(item.get("detail") or item.get("name") or "unknown") for item in failed_checks
@@ -2641,25 +2632,54 @@ def _reconcile_completion_with_evaluation(
     return audit
 
 
-def _deterministic_failed_completion_audit(
-    task_evaluation: Mapping[str, Any],
+def _deterministic_completion_audit(
+    task_evaluation: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Build an incomplete audit without spending a redundant LLM call."""
-    failed_checks = [
-        dict(item) for item in task_evaluation.get("checks", []) if isinstance(item, Mapping) and not item.get("passed")
+    """Build the completion view from the deterministic task evaluator."""
+    if not isinstance(task_evaluation, Mapping):
+        return {
+            "schema_version": 1,
+            "assessed": False,
+            "overall": "not_applicable",
+            "summary": "No deterministic task evaluator is available.",
+            "outcomes": [],
+            "warnings": ["deterministic_task_evaluation_unavailable"],
+        }
+    checks = [
+        dict(item)
+        for item in task_evaluation.get("checks", [])
+        if isinstance(item, Mapping)
     ]
+    failed_checks = [item for item in checks if not item.get("passed")]
+    passed = bool(task_evaluation.get("passed"))
+    if passed:
+        summary = "确定性任务校验通过。"
+    else:
+        summary = "确定性任务校验未通过：" + "；".join(
+            str(item.get("detail") or item.get("name") or "unknown")
+            for item in failed_checks
+        )
     return {
         "schema_version": 1,
         "assessed": True,
-        "overall": "incomplete",
-        "summary": (
-            "确定性任务校验未通过："
-            + "；".join(str(item.get("detail") or item.get("name") or "unknown") for item in failed_checks)
-        ),
+        "overall": "completed" if passed else "incomplete",
+        "summary": summary,
         "outcomes": [],
-        "warnings": ["completion_audit_skipped_after_deterministic_failure"],
+        "warnings": [],
+        "deterministic_evaluation_checks": checks,
         "deterministic_evaluation_failed_checks": failed_checks,
     }
+
+
+def _deterministic_failed_completion_audit(
+    task_evaluation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Backward-compatible wrapper for the deterministic failed view."""
+    audit = _deterministic_completion_audit(task_evaluation)
+    audit["warnings"] = [
+        "completion_audit_skipped_after_deterministic_failure"
+    ]
+    return audit
 
 
 def _audit_completion(
@@ -2668,17 +2688,32 @@ def _audit_completion(
     *,
     blocked: bool,
     execution_error: str,
+    task_evaluation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Verify plan outcomes after a non-failed execution."""
-    if blocked or execution_error or not isinstance(ctx.task_data_plan, dict):
-        return {}
-    completion = audit_task_outcomes(
-        plan=ctx.task_data_plan,
-        events=ctx.events,
-        final_response=_final_assistant_response(messages),
-        provider=ctx.task_data_plan_provider,
-    )
-    return _merge_execution_stop(completion, ctx.task_data_plan)
+    """Return deterministic completion data without an extra LLM call."""
+    del ctx, messages
+    if isinstance(task_evaluation, Mapping):
+        return _deterministic_completion_audit(task_evaluation)
+    return {
+        "schema_version": 1,
+        "assessed": False,
+        "overall": (
+            "not_applicable"
+            if blocked or execution_error
+            else "completed"
+        ),
+        "summary": (
+            "Execution ended before semantic completion could be assessed."
+            if blocked or execution_error
+            else (
+                "Execution finished successfully; no deterministic task "
+                "evaluator is available."
+            )
+        ),
+        "outcomes": [],
+        "warnings": ["semantic_completion_audit_disabled"],
+        "completion_basis": "execution_finished_without_evaluator",
+    }
 
 
 def _record_execution_outcome(
@@ -2935,16 +2970,7 @@ def _execute_with_real_llm(
                     "checks": [],
                     "evaluation_error": (f"{type(exc).__name__}: {exc}"),
                 }
-    completion_audit = (
-        _deterministic_failed_completion_audit(task_evaluation)
-        if (isinstance(task_evaluation, Mapping) and not task_evaluation.get("passed"))
-        else _audit_completion(
-            ctx,
-            messages,
-            blocked=blocked,
-            execution_error=execution_error,
-        )
-    )
+    completion_audit = _deterministic_completion_audit(task_evaluation)
     completion_audit = _reconcile_completion_with_evaluation(
         completion_audit,
         task_evaluation,

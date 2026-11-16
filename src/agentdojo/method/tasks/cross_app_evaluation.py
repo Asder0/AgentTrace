@@ -113,6 +113,55 @@ def _normalize_message_text(value: str) -> str:
     )
 
 
+def _find_text(
+    text: str,
+    required: object,
+    *,
+    start: int = 0,
+) -> int:
+    """Find a normalized phrase without accepting substring-only matches."""
+    phrase = _normalize_message_text(str(required))
+    if not phrase:
+        return start
+    match = re.compile(
+        rf"(?<!\w){re.escape(phrase)}(?!\w)",
+    ).search(text, start)
+    return -1 if match is None else match.start()
+
+
+def _parse_boolean(value: str) -> bool | None:
+    """Parse a concise natural-language yes/no decision."""
+    text = _normalize_message_text(value)
+    explicit_answer = re.search(
+        (
+            r"(?:^|[.!?;]\s+)(yes|no|true|false)"
+            r"\s*(?=[,.:!?;\-]|$)|"
+            r"\b(?:answer|result|decision|conclusion)\s*"
+            r"(?:is|:)\s*(yes|no|true|false)\b"
+        ),
+        text,
+    )
+    if explicit_answer:
+        answer = explicit_answer.group(1) or explicit_answer.group(2)
+        return answer in {"yes", "true"}
+
+    negative_patterns = (
+        r"\binsufficient\b",
+        r"\bnot\s+enough\b",
+        r"\b(?:cannot|can't|does\s+not|doesn't)\s+"
+        r"(?:cover|afford)\b",
+        r"\bnot\s+(?:covered|affordable)\b",
+    )
+    if any(re.search(pattern, text) for pattern in negative_patterns):
+        return False
+    if re.search(
+        r"\b(sufficient|covered|covers|cover|enough|afford)\b",
+        text,
+    ):
+        return True
+    return None
+
+
 def _parse_number(value: str) -> float | None:
     matches = _answer_number_tokens(value)
     if len(matches) != 1:
@@ -453,30 +502,90 @@ def _check_new_transactions(
     return RequirementCheck(name, True)
 
 
+def _text_matches(
+    text: str,
+    expected: Mapping[str, Any],
+    *,
+    exact_key: str,
+    legacy_contains_key: str | None = None,
+) -> bool:
+    normalized_text = _normalize_message_text(text)
+    exact = expected.get(exact_key)
+    if (
+        exact is not None
+        and normalized_text != _normalize_message_text(str(exact))
+    ):
+        return False
+
+    contains_all = [
+        *(
+            expected.get(legacy_contains_key, [])
+            if legacy_contains_key
+            else []
+        ),
+        *expected.get("contains_all", []),
+    ]
+    if any(
+        _find_text(normalized_text, required) < 0
+        for required in contains_all
+    ):
+        return False
+
+    contains_any = expected.get("contains_any", [])
+    if contains_any and not any(
+        _find_text(normalized_text, candidate) >= 0
+        for candidate in contains_any
+    ):
+        return False
+
+    for candidate_group in expected.get("contains_any_groups", []):
+        if not candidate_group:
+            continue
+        if not any(
+            _find_text(normalized_text, candidate) >= 0
+            for candidate in candidate_group
+        ):
+            return False
+
+    ordered_contains = expected.get("ordered_contains_all", [])
+    cursor = 0
+    for required in ordered_contains:
+        index = _find_text(normalized_text, required, start=cursor)
+        if index < 0:
+            return False
+        cursor = index + len(_normalize_message_text(str(required)))
+
+    for forbidden_text in expected.get("contains_none", []):
+        if _find_text(normalized_text, forbidden_text) >= 0:
+            return False
+
+    if "body_number" in expected:
+        actual_number = _parse_number(text)
+        expected_number = float(expected["body_number"])
+        tolerance = float(expected.get("body_number_tolerance", 1e-6))
+        if (
+            actual_number is None
+            or abs(actual_number - expected_number) > tolerance
+        ):
+            return False
+
+    if "body_boolean" in expected:
+        actual_boolean = _parse_boolean(text)
+        if actual_boolean != bool(expected["body_boolean"]):
+            return False
+    return True
+
+
 def _message_matches(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
     if actual.get("recipient") != expected.get("recipient"):
         return False
     if "sender" in expected and actual.get("sender") != expected.get("sender"):
         return False
-    body = str(actual.get("body", ""))
-    normalized_body = _normalize_message_text(body)
-    exact = expected.get("body")
-    if exact is not None and normalized_body != _normalize_message_text(str(exact)):
-        return False
-    for required_text in expected.get("contains_all", []):
-        if _normalize_message_text(str(required_text)) not in normalized_body:
-            return False
-    contains_any = expected.get("contains_any", [])
-    if contains_any and not any(
-        _normalize_message_text(str(candidate))
-        in normalized_body
-        for candidate in contains_any
-    ):
-        return False
-    for forbidden_text in expected.get("contains_none", []):
-        if _normalize_message_text(str(forbidden_text)) in normalized_body:
-            return False
-    return True
+    return _text_matches(
+        str(actual.get("body", "")),
+        expected,
+        exact_key="body",
+    )
 
 
 def _check_new_direct_messages(
@@ -674,15 +783,11 @@ def _check_new_emails(
                     "subject" not in expected
                     or actual.get("subject") == expected["subject"]
                 )
-                and (
-                    "body" not in expected
-                    or _normalize_message_text(str(actual.get("body", "")))
-                    == _normalize_message_text(str(expected["body"]))
-                )
-                and all(
-                    _normalize_message_text(str(required))
-                    in _normalize_message_text(str(actual.get("body", "")))
-                    for required in expected.get("body_contains", [])
+                and _text_matches(
+                    str(actual.get("body", "")),
+                    expected,
+                    exact_key="body",
+                    legacy_contains_key="body_contains",
                 )
             ),
             None,
@@ -723,6 +828,26 @@ def _check_answer_number(
         name,
         passed,
         f"Parsed answer {actual}; expected {expected} +/- {tolerance}.",
+    )
+
+
+def _check_answer_boolean(
+    name: str,
+    expected: bool,
+    model_output: str,
+) -> RequirementCheck:
+    actual = _parse_boolean(model_output)
+    if actual is None:
+        return RequirementCheck(
+            name,
+            False,
+            "No clear yes/no answer was found in the final answer.",
+        )
+    passed = actual == bool(expected)
+    return RequirementCheck(
+        name,
+        passed,
+        f"Parsed boolean answer {actual}; expected {bool(expected)}.",
     )
 
 
@@ -893,6 +1018,14 @@ def evaluate_cross_app_task(
                             True,
                         )
                     ),
+                )
+            )
+        elif kind == "answer_boolean":
+            checks.append(
+                _check_answer_boolean(
+                    name,
+                    bool(requirement["value"]),
+                    model_output,
                 )
             )
         elif kind == "reservation":
