@@ -798,7 +798,14 @@ class InjectionScanner:
         value: str,
         covered_spans: Sequence[tuple[int, int]],
     ) -> tuple[list[InjectionChunk], bool]:
-        """Block-review unprotected sentence units near a native span hit."""
+        """Recursively expand a native span through fallback-positive units.
+
+        The primary detector determines the initial span. The fallback
+        detector reviews only the immediately following semantic unit. A
+        positive neighbour joins the span and becomes the new frontier; the
+        expansion stops at the first negative neighbour and never walks
+        towards the previous sentence.
+        """
         if self.fallback_classifier is None or not covered_spans:
             return [], False
         units = [
@@ -818,70 +825,159 @@ class InjectionScanner:
                 right[0],
             )
 
-        candidate_indices: set[int] = set()
-        covered_indices: set[int] = set()
+        initial_indices: set[int] = set()
+        included_indices: set[int] = set()
+        visited_indices: set[int] = set()
+        frontier: set[int] = set()
         for covered in covered_spans:
-            paragraph_start = value.rfind(
-                "\n\n",
-                0,
-                covered[0],
-            )
-            paragraph_start = (
-                paragraph_start + 2
-                if paragraph_start >= 0
-                else 0
-            )
-            paragraph_end = value.find("\n\n", covered[1])
-            if paragraph_end < 0:
-                paragraph_end = len(value)
-            paragraph_units = {
-                index
-                for index, unit in enumerate(units)
-                if unit[0] < paragraph_end
-                and unit[1] > paragraph_start
-            }
             local_covered = {
                 index
-                for index in paragraph_units
-                if overlaps(units[index], covered)
+                for index, unit in enumerate(units)
+                if overlaps(unit, covered)
             }
-            covered_indices.update(local_covered)
-            candidate_indices.update(
-                paragraph_units - local_covered
-            )
-        candidate_indices -= covered_indices
-        if not candidate_indices:
+            included_indices.update(local_covered)
+            initial_indices.update(local_covered)
+            visited_indices.update(local_covered)
+            frontier.update(local_covered)
+        if not frontier:
             return [], False
 
-        ordered_indices = sorted(candidate_indices)
-        texts = [
-            _mask_nonlinguistic_tokens(
-                value[units[index][0] : units[index][1]]
+        scores_by_index: dict[int, float] = {}
+        while frontier:
+            candidates = sorted(
+                {
+                    neighbour
+                    for unit_index in frontier
+                    for neighbour in (unit_index + 1,)
+                    if 0 <= neighbour < len(units)
+                    and neighbour not in visited_indices
+                }
             )
-            for index in ordered_indices
-        ]
-        scores = self.fallback_classifier.classify_many(texts)
+            if not candidates:
+                break
+            visited_indices.update(candidates)
+            scores = self.fallback_classifier.classify_many(
+                [
+                    _mask_nonlinguistic_tokens(
+                        value[
+                            units[index][0] : units[index][1]
+                        ]
+                    )
+                    for index in candidates
+                ]
+            )
+            next_frontier: set[int] = set()
+            for unit_index, raw_score in zip(
+                candidates,
+                scores,
+                strict=True,
+            ):
+                score = min(
+                    1.0,
+                    max(0.0, float(raw_score or 0.0)),
+                )
+                scores_by_index[unit_index] = score
+                if score >= self.fallback_threshold:
+                    included_indices.add(unit_index)
+                    next_frontier.add(unit_index)
+            frontier = next_frontier
+
+        expanded_indices = included_indices - initial_indices
         chunks = [
             InjectionChunk(
                 index=index,
                 start=units[unit_index][0],
                 end=units[unit_index][1],
-                score=min(
-                    1.0,
-                    max(0.0, float(score or 0.0)),
-                ),
+                score=scores_by_index[unit_index],
                 text=value[
                     units[unit_index][0] : units[unit_index][1]
                 ],
             )
-            for index, (unit_index, score) in enumerate(
-                zip(ordered_indices, scores, strict=True)
+            for index, unit_index in enumerate(
+                sorted(expanded_indices)
             )
-            if float(score or 0.0)
-            >= self.fallback_threshold
         ]
         return (
             _merge_injection_chunks(chunks, value),
+            True,
+        )
+
+    def localize_injection_spans(
+        self,
+        value: str,
+        covered_spans: Sequence[tuple[int, int]],
+    ) -> tuple[list[InjectionChunk], bool]:
+        """Refine a broad primary span to fallback-positive sentences.
+
+        Unplug can return one span that starts in benign context and crosses
+        several sentences before reaching the injected instruction. Classify
+        only the sentences overlapped by that broad span. If at least one is
+        positive, those sentences become the attack frontier and subsequent
+        expansion is forward-only. If every covered sentence is negative, the
+        caller keeps the primary detector result.
+        """
+        if self.fallback_classifier is None or not covered_spans:
+            return [], False
+        units = [
+            (start, end)
+            for start, end in self._semantic_unit_spans(value)
+            if start < end and value[start:end].strip()
+        ]
+        if not units:
+            return [], False
+
+        def overlaps(
+            left: tuple[int, int],
+            right: tuple[int, int],
+        ) -> bool:
+            return min(left[1], right[1]) > max(
+                left[0],
+                right[0],
+            )
+
+        covered_indices = sorted(
+            {
+                index
+                for index, unit in enumerate(units)
+                if any(overlaps(unit, covered) for covered in covered_spans)
+            }
+        )
+        if not covered_indices:
+            return [], False
+        scores = self.fallback_classifier.classify_many(
+            [
+                _mask_nonlinguistic_tokens(
+                    value[units[index][0] : units[index][1]]
+                )
+                for index in covered_indices
+            ]
+        )
+        positive: list[InjectionChunk] = []
+        for index, raw_score in zip(
+            covered_indices,
+            scores,
+            strict=True,
+        ):
+            score = min(1.0, max(0.0, float(raw_score or 0.0)))
+            if score >= self.fallback_threshold:
+                positive.append(
+                    InjectionChunk(
+                        index=len(positive),
+                        start=units[index][0],
+                        end=units[index][1],
+                        score=score,
+                        text=value[units[index][0] : units[index][1]],
+                    )
+                )
+        if not positive:
+            return [], True
+
+        following, _ = self.review_adjacent_units(
+            value,
+            [(item.start, item.end) for item in positive],
+        )
+        return (
+            _merge_injection_chunks([*positive, *following], value),
             True,
         )
 

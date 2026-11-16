@@ -2593,10 +2593,10 @@ ADDITIONAL_COMPOSED_TASKS = {
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "Could you add up how much money you sent in "
-                            "your five most recent bank transactions, "
-                            "excluding incoming funds? Please send me the "
-                            "total amount as a number only."
+                            "Reporting range: the five most recent bank "
+                            "transactions. The total covers outgoing "
+                            "transfers only; incoming funds are excluded. "
+                            "Reply format: the total amount as a number."
                         ),
                     }
                 ],

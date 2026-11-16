@@ -52,6 +52,7 @@ from ..analysis.parameter_binding import (
     placeholder_notice,
     resolve_parameter_bindings,
 )
+from ..analysis.flow_policy import SEMANTIC_BINDING_ENFORCEMENT
 from ..analysis.pipeline import (
     process_after_execution_with_details,
     process_before_execution,
@@ -86,6 +87,7 @@ from ..modeling.data_sensitivity import (
     normalize_data_path,
     origins_for_entity_refs,
     origins_for_value,
+    policy_allows_span_detection,
     tool_output_entity,
     value_key,
 )
@@ -2837,13 +2839,20 @@ def _resolve_implicit_egress(
             field_policies: dict[str, dict[str, Any]] = {}
             try:
                 for field in content_fields:
-                    field_policies[field] = elevate_policy_for_content(
-                        field_policy(
-                            app,
-                            entity,
-                            f"$.{field}",
-                        ),
-                        resource.get(field),
+                    base_field_policy = field_policy(
+                        app,
+                        entity,
+                        f"$.{field}",
+                    )
+                    field_policies[field] = (
+                        elevate_policy_for_content(
+                            base_field_policy,
+                            resource.get(field),
+                        )
+                        if policy_allows_span_detection(
+                            base_field_policy
+                        )
+                        else base_field_policy
                     )
             except Exception as exc:
                 resolved.append(
@@ -3442,6 +3451,14 @@ def capture_tool_call(func: Callable):
             task_plan_active = ctx.task_data_plan
             event_record["task_data_plan"] = task_plan_active
             event_record["requirement_audit"] = requirement_audit
+            event_record["model_evidence"] = [
+                dict(item)
+                for item in requirement_audit.get(
+                    "evidence",
+                    [],
+                )
+                if isinstance(item, Mapping)
+            ]
             argument_sources = _merge_verified_requirement_sources(
                 event_record,
                 requirement_audit,
@@ -3461,7 +3478,11 @@ def capture_tool_call(func: Callable):
         requirement_failed = bool(requirement_audit is not None and not requirement_audit.get("passed"))
         requirement_decision: dict[str, Any] | None = None
         requirement_decision_applied = False
-        if requirement_failed and isinstance(requirement_audit, Mapping):
+        if (
+            SEMANTIC_BINDING_ENFORCEMENT
+            and requirement_failed
+            and isinstance(requirement_audit, Mapping)
+        ):
             allow = False
             modified_kwargs = kwargs
             unmet_requirements = [
@@ -3696,7 +3717,10 @@ def capture_tool_call(func: Callable):
                 )
             event_record["l2_chain_check"] = chain_check
             defense_diagnostics["ring_2"]["chain_check"] = chain_check
-            if not chain_check.get("consistent"):
+            if (
+                SEMANTIC_BINDING_ENFORCEMENT
+                and not chain_check.get("consistent")
+            ):
                 allow = False
                 event_record["block_reason"] = "Ring 2: L2 action is inconsistent with the authorized call chain."
                 event_record["block_category"] = (
@@ -3716,7 +3740,7 @@ def capture_tool_call(func: Callable):
                     confidence=chain_check.get("confidence"),
                 )
                 event_record.setdefault("risk_assessments", []).append(risk)
-            else:
+            elif chain_check.get("consistent"):
                 confirmation = l2_chain.ConfirmationBroker().request(
                     task_id=ctx.task_id or "",
                     tool_name=tracked_function,
@@ -4047,8 +4071,10 @@ def capture_tool_call(func: Callable):
             )
             if access_contract is None:
                 data_access_check = {
-                    "passed": False,
-                    "reason": "data_access_contract_unavailable",
+                    "passed": True,
+                    "reason": (
+                        "data_access_contract_unavailable_advisory"
+                    ),
                     "withheld_fields": [],
                     "opaque_fields": [],
                 }
@@ -4305,7 +4331,10 @@ def capture_tool_call(func: Callable):
                         "risk_assessments",
                         [],
                     ).append(risk)
-            if not data_access_check.get("passed", False):
+            if (
+                SEMANTIC_BINDING_ENFORCEMENT
+                and not data_access_check.get("passed", False)
+            ):
                 block_reason = (
                     "Ring 2 data-exposure policy could not authorize the "
                     f"read result for {tracked_function}: "

@@ -13,6 +13,7 @@ source of truth; risks are attached to the activity and rendered by the graph.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from ..modeling.data_sensitivity import tool_output_entity
@@ -135,6 +136,69 @@ def process_before_execution(
                 "small_model_chunked",
                 "main_llm_judge",
             }
+            effective_injection_scan = copy.deepcopy(
+                event.get("injection_scan") or {}
+            )
+            if detected:
+                raw_chunks = effective_injection_scan.get(
+                    "chunks",
+                    [],
+                )
+                covered_spans = [
+                    (
+                        int(chunk.get("start", 0) or 0),
+                        int(chunk.get("end", 0) or 0),
+                    )
+                    for chunk in raw_chunks
+                    if isinstance(chunk, dict)
+                    and int(chunk.get("end", 0) or 0)
+                    > int(chunk.get("start", 0) or 0)
+                ]
+                localized_chunks, fallback_executed = (
+                    get_direct_injection_scanner().localize_injection_spans(
+                        prompt,
+                        covered_spans,
+                    )
+                )
+                adjacent_chunks: list[Any] = []
+                if localized_chunks:
+                    adjacent_chunks = list(localized_chunks)
+                    effective_injection_scan["chunks"] = [
+                        {
+                            "start": chunk.start,
+                            "end": chunk.end,
+                            "score": chunk.score,
+                            "text": chunk.text,
+                        }
+                        for chunk in adjacent_chunks
+                    ]
+                elif fallback_executed:
+                    following_chunks, _ = (
+                        get_direct_injection_scanner().review_adjacent_units(
+                            prompt,
+                            covered_spans,
+                        )
+                    )
+                    adjacent_chunks = list(following_chunks)
+                    if following_chunks:
+                        effective_injection_scan["chunks"] = [
+                            *raw_chunks,
+                            *[
+                                {
+                                    "start": chunk.start,
+                                    "end": chunk.end,
+                                    "score": chunk.score,
+                                    "text": chunk.text,
+                                }
+                                for chunk in following_chunks
+                            ],
+                        ]
+                if adjacent_chunks:
+                    details[
+                        "fallback_adjacent_expansion"
+                    ] = len(adjacent_chunks)
+                if fallback_executed:
+                    details["fallback_adjacent_reviewed"] = True
             details["mode"] = mode
             details["raw_prompt"] = prompt
             sanitized_prompt = prompt
@@ -146,7 +210,7 @@ def process_before_execution(
                 if mode == "quarantine":
                     sanitized_prompt, quarantine_metrics = redact_injection_chunks_with_metrics(
                         prompt,
-                        event.get("injection_scan") or {},
+                        effective_injection_scan,
                     )
                     residual_scan = get_direct_injection_scanner().scan(sanitized_prompt)
                     quarantine_metrics.update(

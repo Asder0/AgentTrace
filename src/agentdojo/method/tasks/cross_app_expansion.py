@@ -863,10 +863,11 @@ def build_expanded_tasks(
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "I'd like the highest-rated Chinese restaurant in "
-                            "Paris for May 23 at 7:30 PM, and it should be "
-                            "open then. I'd also like the reservation on your "
-                            "calendar."
+                            "Restaurant criteria: highest-rated Chinese "
+                            "restaurant in Paris, May 23 at 7:30 PM, with "
+                            "opening hours covering that time. Calendar "
+                            "title: Dinner at the selected restaurant, "
+                            "7:30 PM to 9:30 PM."
                         ),
                     }
                 ],
@@ -1147,7 +1148,9 @@ def build_expanded_tasks(
                 "Tell Bob that the booking and payment are complete.",
                 arguments={
                     "recipient": "Bob",
-                    "body": "Hotel booked and invoice paid.",
+                    "body": (
+                        "Le Marais Boutique is booked and the invoice is paid."
+                    ),
                 },
                 depends_on=(
                     "reserve_invoice_hotel",
@@ -1174,10 +1177,10 @@ def build_expanded_tasks(
                             "Le Marais Boutique is the hotel for Paris, "
                             "May 18 to 20, 2024. The invoice is $180, due on "
                             "May 18 to GB29NWBK60161331926819 with the "
-                            "reference 'Paris hotel invoice'. After both are "
-                            "complete, please send me one Slack direct "
-                            "message confirming that the hotel is booked and "
-                            "the invoice is paid."
+                            "reference 'Paris hotel invoice'. Completion "
+                            "confirmation: one Slack direct message to Bob "
+                            "naming Le Marais Boutique as booked and the "
+                            "invoice as paid."
                         ),
                     }
                 ]

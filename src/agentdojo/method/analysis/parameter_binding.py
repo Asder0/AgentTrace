@@ -258,11 +258,13 @@ def placeholder_notice(plan: Mapping[str, Any] | None) -> str:
         (
             "Each listed parameter has a controller-owned provenance "
             "constraint. Fill the tool argument with the concrete business "
-            "value obtained from the available source data; do not put a "
-            "controller reference symbol in the argument instead of the "
-            "value. Do not invent or substitute facts. The controller will "
-            "verify the concrete value against the cited source entities "
-            "before policy checks and execution."
+            "value obtained from the available source data. When a value "
+            "exists as a controller reference and only needs to be passed "
+            "unchanged to another tool, copy the exact reference token into "
+            "the argument or into the relevant position of a text value. Do "
+            "not reconstruct or guess the hidden value. The controller "
+            "verifies the source and resolves the reference before policy "
+            "checks and execution."
         ),
         (
             "Values formatted as [[SENSITIVE_REF:...]] are opaque "
@@ -1151,12 +1153,79 @@ def resolve_parameter_bindings(
                     "source_path": "sources",
                     "symbol": "",
                 }
+    sensitive_references = sensitive_references or {}
     if not bindings:
-        unresolved = contains_placeholder(args)
+        resolved = copy.deepcopy(dict(args))
+        resolutions: list[dict[str, Any]] = []
+        errors: list[str] = []
+        content_fields = tool_effect(base_tool_name(tool_name)).content_fields
+        for parameter, actual in list(resolved.items()):
+            references = _collect_sensitive_references(actual)
+            if not references:
+                continue
+            if parameter not in content_fields:
+                errors.append(f"sensitive_reference_without_binding:{parameter}")
+                continue
+            replacements: dict[str, Any] = {}
+            metadata_items: list[Mapping[str, Any]] = []
+            for reference in references:
+                metadata = sensitive_references.get(reference)
+                if not isinstance(metadata, Mapping):
+                    errors.append(f"sensitive_reference_not_authorized:{parameter}")
+                    continue
+                value = copy.deepcopy(metadata.get("value"))
+                if value in (None, ""):
+                    errors.append(f"sensitive_reference_empty:{parameter}")
+                    continue
+                replacements[reference] = value
+                metadata_items.append(
+                    {
+                        **dict(metadata),
+                        "controller_reference": reference,
+                    }
+                )
+            if len(replacements) != len(set(references)):
+                continue
+            resolved[parameter] = _replace_sensitive_references(
+                actual,
+                replacements,
+            )
+            resolutions.append(
+                {
+                    "parameter": parameter,
+                    "status": "resolved",
+                    "used_symbol": True,
+                    "generation_kind": "copy_with_sensitive_references",
+                    "parameter_role": "content",
+                    "explanation": (
+                        "Controller-owned sensitive references were copied "
+                        "into the text payload and resolved before execution."
+                    ),
+                    "confidence": 1.0,
+                    "semantic_supported": True,
+                    "source_paths": sorted(
+                        {
+                            str(item.get("source_path", ""))
+                            for item in metadata_items
+                            if item.get("source_path")
+                        }
+                    ),
+                    "source_refs": [
+                        {
+                            "app": str(item.get("app", "")),
+                            "entity": str(item.get("entity", "")),
+                            "source_action": str(item.get("source_action", "")),
+                        }
+                        for item in metadata_items
+                    ],
+                }
+            )
+        if contains_placeholder(resolved):
+            errors.append("unregistered_placeholder")
         return (
-            dict(args),
-            [],
-            ["unregistered_placeholder"] if unresolved else [],
+            resolved,
+            resolutions,
+            list(dict.fromkeys(errors)),
             [],
         )
 
@@ -1258,8 +1327,6 @@ def resolve_parameter_bindings(
         str,
         list[Mapping[str, Any]],
     ] = {}
-    sensitive_references = sensitive_references or {}
-
     def resource_value_matches(
         actual: Any,
         expected: Any,
@@ -1317,7 +1384,109 @@ def resolve_parameter_bindings(
             continue
         raw_binding = bindings.get(parameter)
         if not isinstance(raw_binding, Mapping):
-            errors.append(f"sensitive_reference_without_binding:{parameter}")
+            parameter_effect = tool_effect(base_tool_name(tool_name))
+            if parameter not in parameter_effect.content_fields:
+                errors.append(f"sensitive_reference_without_binding:{parameter}")
+                continue
+            replacements: dict[str, Any] = {}
+            metadata_items: list[Mapping[str, Any]] = []
+            for reference in references:
+                metadata = sensitive_references.get(reference)
+                if not isinstance(metadata, Mapping):
+                    errors.append(f"sensitive_reference_not_authorized:{parameter}")
+                    continue
+                replacement_value = copy.deepcopy(metadata.get("value"))
+                if replacement_value in (None, ""):
+                    errors.append(f"sensitive_reference_empty:{parameter}")
+                    continue
+                replacements[reference] = replacement_value
+                metadata_items.append(
+                    {
+                        **dict(metadata),
+                        "controller_reference": reference,
+                    }
+                )
+            if len(replacements) != len(set(references)):
+                continue
+            actual = _replace_sensitive_references(actual, replacements)
+            resolved[parameter] = actual
+            refs = [
+                {
+                    "app": str(item.get("app", "")),
+                    "entity": str(item.get("entity", "")),
+                    "source_action": str(item.get("source_action", "")),
+                }
+                for item in metadata_items
+            ]
+            resolution = {
+                "parameter": parameter,
+                "status": "resolved",
+                "used_symbol": True,
+                "generation_kind": "copy_with_sensitive_references",
+                "parameter_role": "content",
+                "explanation": (
+                    "Controller-owned sensitive references were copied into "
+                    "the text payload and resolved to their authorized source "
+                    "values before execution."
+                ),
+                "confidence": 1.0,
+                "semantic_supported": True,
+                "source_paths": sorted(
+                    {
+                        str(item.get("source_path", ""))
+                        for item in metadata_items
+                        if item.get("source_path")
+                    }
+                ),
+                "source_refs": refs,
+                "provenance_refs": [
+                    {
+                        "ref_id": _provenance_ref_id(
+                            source_id=str(
+                                item.get("controller_reference", "")
+                                or f"opaque:{parameter}"
+                            ),
+                            activity_id=str(item.get("source_activity_id", "")),
+                            entity_id=str(
+                                item.get("source_entity_id", "")
+                                or item.get("entity_id", "")
+                            ),
+                            source_path=str(item.get("source_path", "")),
+                            start=item.get("span_start"),
+                            end=item.get("span_end"),
+                        ),
+                        "source_id": str(
+                            item.get("controller_reference", "")
+                            or f"opaque:{parameter}"
+                        ),
+                        "app": str(item.get("app", "")),
+                        "entity": str(item.get("entity", "")),
+                        "source_action": str(item.get("source_action", "")),
+                        "activity_id": str(item.get("source_activity_id", "")),
+                        "entity_id": str(
+                            item.get("source_entity_id", "")
+                            or item.get("entity_id", "")
+                        ),
+                        "source_path": str(item.get("source_path", "")),
+                        "start": item.get("span_start"),
+                        "end": item.get("span_end"),
+                        "confidentiality": str(
+                            item.get("confidentiality", "secret")
+                        ),
+                        "categories": list(item.get("categories", [])),
+                    }
+                    for item in metadata_items
+                ],
+                "used_source_ids": sorted(
+                    {
+                        str(item.get("controller_reference", ""))
+                        for item in metadata_items
+                        if item.get("controller_reference")
+                    }
+                ),
+            }
+            reference_resolutions[parameter] = resolution
+            resolutions.append(resolution)
             continue
         allowed_paths = {
             normalize_source_path(str(item))
@@ -1447,13 +1616,21 @@ def resolve_parameter_bindings(
                 errors.append(f"sensitive_reference_not_authorized:{parameter}")
                 continue
             try:
-                policy = elevate_policy_for_content(
-                    {
-                        "level": str(metadata.get("confidentiality", "secret")),
-                        "categories": list(metadata.get("categories", [])),
-                        "source": "sensitive_reference",
-                    },
-                    metadata.get("value"),
+                base_policy = {
+                    "level": str(metadata.get("confidentiality", "secret")),
+                    "categories": list(metadata.get("categories", [])),
+                    "span_detection": (
+                        metadata.get("span_detection") is True
+                    ),
+                    "source": "sensitive_reference",
+                }
+                policy = (
+                    elevate_policy_for_content(
+                        base_policy,
+                        metadata.get("value"),
+                    )
+                    if base_policy["span_detection"]
+                    else base_policy
                 )
             except Exception as exc:
                 errors.append(f"sensitive_reference_scan_failed:{parameter}:{exc}")
@@ -1515,9 +1692,6 @@ def resolve_parameter_bindings(
             )
             continue
         if not replacements or len(replacements) != len(set(references)):
-            continue
-        if binding_mode == "derived_sources" and parameter not in read_resource_parameters:
-            deferred_sensitive_references[parameter] = metadata_items
             continue
         actual = _replace_sensitive_references(actual, replacements)
         resolved[parameter] = actual

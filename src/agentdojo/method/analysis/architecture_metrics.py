@@ -1939,6 +1939,55 @@ def evaluate_plan_execution_conformance(
         if reference_hash:
             plan_hashes.add(reference_hash)
 
+    plan_source_registry: dict[str, Mapping[str, Any]] = {}
+    if isinstance(reference_plan, Mapping):
+        registered_sources = reference_plan.get("source_refs")
+        if isinstance(registered_sources, Mapping):
+            for source_id, source in registered_sources.items():
+                if isinstance(source, Mapping):
+                    plan_source_registry[str(source_id)] = source
+        for step in reference_plan.get("steps", []) or []:
+            if not isinstance(step, Mapping):
+                continue
+            for action in step.get("actions", []) or []:
+                if not isinstance(action, Mapping):
+                    continue
+                for contract_name in (
+                    "flow_contract",
+                    "data_flow_bindings",
+                    "data_access",
+                ):
+                    contract = action.get(contract_name)
+                    source_bindings = (
+                        contract.get("source_bindings")
+                        if isinstance(contract, Mapping)
+                        else None
+                    )
+                    if not isinstance(source_bindings, Mapping):
+                        continue
+                    for source_id, source in source_bindings.items():
+                        if isinstance(source, Mapping):
+                            plan_source_registry[str(source_id)] = source
+        for outcome in reference_plan.get(
+            "required_outcomes",
+            [],
+        ) or []:
+            if not isinstance(outcome, Mapping):
+                continue
+            for source in outcome.get(
+                "required_source_refs",
+                [],
+            ) or []:
+                if not isinstance(source, Mapping):
+                    continue
+                source_id = str(
+                    source.get("source_id")
+                    or source.get("id")
+                    or ""
+                )
+                if source_id:
+                    plan_source_registry[source_id] = source
+
     required_edges: list[dict[str, Any]] = []
     allowed_by_parameter: dict[
         tuple[int, str, str, str],
@@ -2101,10 +2150,93 @@ def evaluate_plan_execution_conformance(
                 edge["plan_revision"] = reference_revision
                 actual_edge_list.append(edge)
 
+    hydrated_actual_edges: list[dict[str, Any]] = []
+    for edge in actual_edge_list:
+        hydrated = dict(edge)
+        if str(hydrated.get("source_action", "") or ""):
+            hydrated_actual_edges.append(hydrated)
+            continue
+        actual_app = str(hydrated.get("source_app", "") or "").lower()
+        actual_entity = canonical_entity_name(
+            actual_app,
+            str(hydrated.get("source_entity", "") or ""),
+        )
+        candidates = [
+            plan_source_registry[str(source_id)]
+            for source_id in edge.get("source_ids", []) or []
+            if isinstance(
+                plan_source_registry.get(str(source_id)),
+                Mapping,
+            )
+        ]
+        if not candidates and actual_app and actual_entity:
+            candidates = [
+                source
+                for source in plan_source_registry.values()
+                if (
+                    str(source.get("app", "") or "").lower()
+                    == actual_app
+                    and canonical_entity_name(
+                        actual_app,
+                        str(source.get("entity", "") or ""),
+                    )
+                    == actual_entity
+                )
+            ]
+        source = next(
+            (
+                candidate
+                for candidate in candidates
+                if (
+                    str(candidate.get("app", "") or "").lower()
+                    == actual_app
+                    and canonical_entity_name(
+                        actual_app,
+                        str(candidate.get("entity", "") or ""),
+                    )
+                    == actual_entity
+                )
+            ),
+            candidates[0] if candidates else None,
+        )
+        if isinstance(source, Mapping):
+            if not hydrated.get("source_ids"):
+                matching_source_ids = [
+                    source_id
+                    for source_id, registered in plan_source_registry.items()
+                    if registered is source
+                ]
+                if matching_source_ids:
+                    hydrated["source_ids"] = matching_source_ids
+            source_app = str(
+                source.get("app")
+                or hydrated.get("source_app")
+                or ""
+            ).lower()
+            if not actual_app:
+                hydrated["source_app"] = source_app
+            if not actual_entity:
+                hydrated["source_entity"] = (
+                    canonical_entity_name(
+                        source_app,
+                        str(source.get("entity", "") or ""),
+                    )
+                )
+            if not str(hydrated.get("source_action", "") or ""):
+                hydrated["source_action"] = str(
+                    source.get("source_action")
+                    or source.get("source_tool")
+                    or ""
+                )
+            if not str(hydrated.get("source_step_id", "") or ""):
+                hydrated["source_step_id"] = str(
+                    source.get("producer_step", "") or ""
+                )
+        hydrated_actual_edges.append(hydrated)
     actual_edge_list = list(
         {
             _actual_edge_key(item): item
-            for item in actual_edge_list
+            for item in hydrated_actual_edges
         }.values()
     )
     concrete_data_sources: set[tuple[str, ...]] = {

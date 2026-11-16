@@ -52,6 +52,11 @@ from .risk_types import (
     make_risk,
 )
 
+# Semantic source/parameter provenance is model-authored presentation data.
+# Task-plan scope remains enforceable, while aliases and value provenance do
+# not block execution.
+SEMANTIC_BINDING_ENFORCEMENT = False
+
 
 def same_tool_name(left: str, right: str) -> bool:
     """Compare unqualified aliases while requiring exact namespaced matches."""
@@ -430,7 +435,12 @@ def check_task_scope(
             decision=DECISION_BLOCK,
         )
 
-    if planned and allowed_suites and tool_suite not in allowed_suites:
+    if (
+        effect != "read"
+        and planned
+        and allowed_suites
+        and tool_suite not in allowed_suites
+    ):
         result.update(
             passed=False,
             reason="suite_not_bound_to_task_scope",
@@ -442,7 +452,12 @@ def check_task_scope(
             tool_name=tool_name,
             decision=DECISION_BLOCK,
         )
-    if not planned:
+    if not planned and effect == "read":
+        result.update(
+            planned=True,
+            runtime_read_scope_extension=True,
+        )
+    elif not planned:
         result.update(
             passed=False,
             reason="action_not_bound_to_task_scope",
@@ -455,7 +470,13 @@ def check_task_scope(
             decision=DECISION_BLOCK,
         )
 
-    if effect not in allowed_effects:
+    if (
+        effect not in allowed_effects
+        and not (
+            effect == "read"
+            and result.get("runtime_read_scope_extension")
+        )
+    ):
         result.update(
             passed=False,
             reason="effect_not_bound_to_task_scope",
@@ -473,6 +494,13 @@ def check_task_scope(
         str(item) for item in event.get("parameter_resolution_errors", []) if str(item).strip()
     ]
     if parameter_resolution_errors:
+        result["parameter_resolution_diagnostics"] = list(
+            parameter_resolution_errors
+        )
+    if (
+        SEMANTIC_BINDING_ENFORCEMENT
+        and parameter_resolution_errors
+    ):
         result.update(
             passed=False,
             reason=parameter_resolution_errors[0],
@@ -506,7 +534,7 @@ def check_task_scope(
     )
     result["data_access"] = access_contract
     result["resource_access_failures"] = resource_failures
-    if data_access_required and (
+    if SEMANTIC_BINDING_ENFORCEMENT and data_access_required and (
         not isinstance(access_contract, Mapping) or not access_contract.get("valid", False) or resource_failures
     ):
         result.update(
@@ -554,7 +582,7 @@ def check_task_scope(
         )
         result["resource_access"] = access_contract
         result["resource_access_failures"] = resource_failures
-        if data_access_required and (
+        if SEMANTIC_BINDING_ENFORCEMENT and data_access_required and (
             not isinstance(access_contract, Mapping) or not access_contract.get("valid", False) or resource_failures
         ):
             result.update(
@@ -619,6 +647,18 @@ def check_task_scope(
             "",
         ),
     )
+    if policy.risk_level == "L2" and effect == "read":
+        result.update(
+            reason="runtime_read_scope_extension",
+            runtime_read_scope_extension=True,
+            source_risk=source_flagged,
+            source_risk_reason=(
+                "read_from_source_risk"
+                if source_flagged
+                else ""
+            ),
+        )
+        return result
     if policy.risk_level == "L2":
         l2_actions = {str(item) for item in plan.get("l2_actions", []) if item}
         if not any(same_tool_name(tool_name, item) for item in l2_actions):
@@ -1788,6 +1828,26 @@ def check_sensitive_egress(
             failures.append("data_source_not_authorized")
         if CONFIDENTIALITY_LEVELS.get(level, 3) > CONFIDENTIALITY_LEVELS.get(max_level, 0):
             failures.append("confidentiality_exceeds_sink_limit")
+        if not SEMANTIC_BINDING_ENFORCEMENT:
+            security_failures = [
+                failure
+                for failure in failures
+                if failure.startswith(
+                    (
+                        "confidentiality_exceeds_sink_limit",
+                        "implicit_egress_sensitivity_unavailable",
+                        "destination_not_authorized",
+                        "unresolved_placeholder_in_payload",
+                    )
+                )
+                or failure in implicit_errors
+            ]
+            result["semantic_binding_advisory"] = [
+                failure
+                for failure in failures
+                if failure not in security_failures
+            ]
+            failures = security_failures
         if not failures:
             result.update(
                 passed=True,

@@ -59,7 +59,7 @@
         "$.cc[*]": {"level": "internal", "categories": ["email"]},
         "$.bcc[*]": {"level": "internal", "categories": ["email"]},
         "$.subject": {"level": "internal"},
-        "$.body": {"level": "confidential"},
+        "$.body": {"level": "confidential", "span_detection": true},
         "$.status": {"level": "internal"},
         "$.read": {"level": "internal"},
         "$.timestamp": {"level": "internal"},
@@ -72,7 +72,7 @@
       "cloud_drive_file": {
         "$.id_": {"level": "internal"},
         "$.filename": {"level": "internal"},
-        "$.content": {"level": "confidential"},
+        "$.content": {"level": "confidential", "span_detection": true},
         "$.owner": {"level": "internal", "categories": ["email"]},
         "$.last_modified": {"level": "internal"},
         "$.shared_with": {
@@ -84,7 +84,7 @@
       "calendar_event": {
         "$.id_": {"level": "internal"},
         "$.title": {"level": "internal"},
-        "$.description": {"level": "confidential"},
+        "$.description": {"level": "confidential", "span_detection": true},
         "$.start_time": {"level": "internal", "categories": ["calendar"]},
         "$.end_time": {"level": "internal", "categories": ["calendar"]},
         "$.location": {"level": "confidential", "categories": ["location"]},
@@ -134,7 +134,7 @@
       "message": {
         "$.sender": {"level": "internal", "categories": ["slack_user"]},
         "$.recipient": {"level": "internal", "categories": ["slack_user"]},
-        "$.body": {"level": "confidential"}
+        "$.body": {"level": "confidential", "span_detection": true}
       },
       "channel": {
         "$": {"level": "internal"}
@@ -176,7 +176,7 @@
         "$.cc[*]": {"level": "internal", "categories": ["email"]},
         "$.bcc[*]": {"level": "internal", "categories": ["email"]},
         "$.subject": {"level": "internal"},
-        "$.body": {"level": "confidential"},
+        "$.body": {"level": "confidential", "span_detection": true},
         "$.status": {"level": "internal"},
         "$.read": {"level": "internal"},
         "$.timestamp": {"level": "internal"},
@@ -185,7 +185,7 @@
       "calendar_event": {
         "$.id_": {"level": "internal"},
         "$.title": {"level": "internal"},
-        "$.description": {"level": "confidential"},
+        "$.description": {"level": "confidential", "span_detection": true},
         "$.start_time": {"level": "internal", "categories": ["calendar"]},
         "$.end_time": {"level": "internal", "categories": ["calendar"]},
         "$.location": {"level": "confidential", "categories": ["location"]},

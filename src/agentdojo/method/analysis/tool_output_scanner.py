@@ -540,53 +540,89 @@ def scan_tool_output(
             result.field_statuses[path] = "quarantined"
             result.flagged_fields.append(path)
             result.quarantined_fields.append(path)
-            expanded_spans = _expand_injection_spans(
-                item,
-                language_chunks or scan.chunks,
-            )
-            if not expanded_spans:
-                expanded_spans = [
-                    {
-                        "start": 0,
-                        "end": len(item),
-                        "score": float(scan.score),
-                    }
-                ]
-            reviewed_spans, fallback_reviewed = (
-                scanner.review_adjacent_units(
+            source_chunks = language_chunks or scan.chunks
+            source_spans = [
+                (
+                    int(span["start"])
+                    if isinstance(span, Mapping)
+                    else int(getattr(span, "start", 0) or 0),
+                    int(span["end"])
+                    if isinstance(span, Mapping)
+                    else int(getattr(span, "end", 0) or 0),
+                )
+                for span in source_chunks
+            ]
+            localized_spans, fallback_reviewed = (
+                scanner.localize_injection_spans(
                     item,
-                    [
-                        (
-                            int(span["start"]),
-                            int(span["end"]),
-                        )
-                        for span in expanded_spans
-                    ],
+                    source_spans,
                 )
             )
             if fallback_reviewed:
                 result.fallback_executed = True
                 scan.fallback_executed = True
-            if reviewed_spans:
-                result.detector = (
-                    f"{scan.detector}+{scan.fallback_detector}"
-                )
-                scan.detector = result.detector
-                expanded_spans.extend(
+            if localized_spans:
+                expanded_spans = [
                     {
                         "start": int(span.start),
                         "end": int(span.end),
                         "score": float(span.score),
                     }
-                    for span in reviewed_spans
+                    for span in localized_spans
+                ]
+                result.detector = (
+                    f"{scan.detector}+{scan.fallback_detector}"
                 )
+                scan.detector = result.detector
                 result.max_score = max(
                     result.max_score,
                     max(
                         float(span.score)
-                        for span in reviewed_spans
+                        for span in localized_spans
                     ),
                 )
+            else:
+                expanded_spans = _expand_injection_spans(
+                    item,
+                    source_chunks,
+                )
+                if not expanded_spans:
+                    expanded_spans = [
+                        {
+                            "start": 0,
+                            "end": len(item),
+                            "score": float(scan.score),
+                        }
+                    ]
+                if fallback_reviewed:
+                    following_spans, _ = (
+                        scanner.review_adjacent_units(
+                            item,
+                            source_spans,
+                        )
+                    )
+                else:
+                    following_spans = []
+                if following_spans:
+                    result.detector = (
+                        f"{scan.detector}+{scan.fallback_detector}"
+                    )
+                    scan.detector = result.detector
+                    expanded_spans.extend(
+                        {
+                            "start": int(span.start),
+                            "end": int(span.end),
+                            "score": float(span.score),
+                        }
+                        for span in following_spans
+                    )
+                    result.max_score = max(
+                        result.max_score,
+                        max(
+                            float(span.score)
+                            for span in following_spans
+                        ),
+                    )
                 expanded_spans.sort(
                     key=lambda span: (
                         int(span["start"]),
@@ -668,7 +704,7 @@ def scan_tool_output(
     residual_paths = {
         path
         for path, metrics in field_metrics.items()
-        if (metrics.get("sanitized_residual_suspected", False) or metrics.get("sanitized_rescan_unavailable", False))
+        if metrics.get("sanitized_rescan_unavailable", False)
     }
     if residual_paths:
         result.sanitized_value = _replace_string_paths(

@@ -32,6 +32,8 @@ _LABEL_CATEGORIES = {
     "email address": "email",
     "电子邮件地址": "email",
     "bank account number": "financial_data",
+    "iban": "iban",
+    "international bank account number": "iban",
     "银行账号": "financial_data",
     "credit card number": "credit_card",
     "银行卡号": "credit_card",
@@ -46,6 +48,29 @@ _LABEL_CATEGORIES = {
 }
 _ENGLISH_LABELS = [label for label in _LABEL_CATEGORIES if not any("\u4e00" <= char <= "\u9fff" for char in label)]
 _CJK_LABELS = [label for label in _LABEL_CATEGORIES if any("\u4e00" <= char <= "\u9fff" for char in label)]
+_ENGLISH_LABEL_GROUPS = [
+    [
+        "person name",
+        "full name",
+        "address",
+        "phone number",
+        "email address",
+    ],
+    [
+        "bank account number",
+        "iban",
+        "international bank account number",
+        "credit card number",
+    ],
+    [
+        "password",
+        "verification code",
+    ],
+    [
+        "passport number",
+        "government identifier",
+    ],
+]
 
 
 @dataclass(frozen=True)
@@ -119,9 +144,9 @@ class GLiNERSensitivityDetector:
         if has_cjk:
             label_groups = [_CJK_LABELS]
             if has_latin:
-                label_groups.append(_ENGLISH_LABELS)
+                label_groups.extend(_ENGLISH_LABEL_GROUPS)
         else:
-            label_groups = [_ENGLISH_LABELS]
+            label_groups = list(_ENGLISH_LABEL_GROUPS)
         entities = [
             item
             for labels in label_groups
@@ -208,6 +233,11 @@ def elevate_policy_for_content(
             for item in entities
         ],
     }
+
+
+def detect_sensitive_entities(text: str) -> list[SensitiveEntity]:
+    """Return local, span-level sensitive entities detected in text."""
+    return _DEFAULT_DETECTOR.detect(text)
 
 
 _DEFAULT_DETECTOR = GLiNERSensitivityDetector()

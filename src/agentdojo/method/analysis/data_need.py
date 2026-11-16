@@ -519,6 +519,13 @@ Rules:
   onward belong in opaque_fields and do not need their raw values exposed.
   The controller rechecks content-derived sensitivity before exposure and
   withholds any field that exceeds this limit.
+- The controller detects sensitive spans inside visible natural-language
+  fields. Spans above max_exposure_level are replaced inline with
+  [[SENSITIVE_REF:...]] while surrounding text remains visible; those exact
+  references may later be copied into tool arguments or text payloads and are
+  resolved by the controller before execution. If the Agent truly must read
+  and reason over the sensitive span itself, raise max_exposure_level to the
+  required category level so the span is exposed and visibly tainted.
 - resource_parameters authorizes selector arguments that choose a concrete
   resource, for example file_id, file_path, event_id, channel, user or url.
   Use literal with allowed_values when the user names the resource. Use derived

@@ -176,11 +176,29 @@ def combined_field_policy(
     return {
         "level": level,
         "categories": categories,
+        "span_detection": any(
+            policy.get("span_detection") is True
+            for policy in policies
+        ),
         "content_detection": (
             content_detection and any(policy.get("content_detection") is not False for policy in policies)
         ),
         "source": "dynamic_entity_map",
     }
+
+
+def policy_allows_span_detection(
+    policy: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether a field policy permits content-derived spans."""
+    if not isinstance(policy, Mapping):
+        return False
+    return bool(
+        policy.get("span_detection") is True
+        and policy.get("content_detection") is not False
+        and str(policy.get("level", "secret")).lower()
+        != "public"
+    )
 
 
 def field_categories(app: str, entity: str, path: str) -> list[str]:
@@ -211,6 +229,12 @@ def field_sensitivity_catalog() -> dict[str, dict[str, dict[str, Any]]]:
                 path: {
                     "level": str(policy.get("level", DEFAULT_LEVEL)),
                     "categories": list(policy.get("categories", [])),
+                    "span_detection": bool(
+                        policy_allows_span_detection(policy)
+                    ),
+                    "content_detection": (
+                        policy.get("content_detection") is not False
+                    ),
                 }
                 for path, policy in fields.items()
             }
@@ -487,7 +511,8 @@ def _walk_values(
             "source": "sink_default",
         }
     )
-    policy = elevate_policy_for_content(policy, value)
+    if policy_allows_span_detection(policy):
+        policy = elevate_policy_for_content(policy, value)
     level = str(policy.get("level", fallback_level))
     policy_categories = list(policy.get("categories", []))
     source_entity = entity_source(app, entity) if entity != "unknown" else ""

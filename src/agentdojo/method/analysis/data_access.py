@@ -19,8 +19,12 @@ from ..modeling.data_sensitivity import (
     field_sensitivity_catalog,
     normalize_data_path,
     origins_for_value,
+    policy_allows_span_detection,
 )
-from ..modeling.labels import CONFIDENTIALITY_LEVELS
+from ..modeling.labels import (
+    CONFIDENTIALITY_LEVELS,
+    minimum_level_for_categories,
+)
 from ..modeling.policy import tool_identity
 from ..modeling.sensitive_ner import (
     elevate_policy_for_content,
@@ -32,6 +36,21 @@ from .plan_actions import find_plan_action
 
 SENSITIVE_REFERENCE_PREFIX = "[[SENSITIVE_REF:"
 SENSITIVE_REFERENCE_PATTERN = re.compile(r"\[\[SENSITIVE_REF:.+?\]\]")
+_STRUCTURED_SCALAR_PATTERNS = (
+    re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+"),
+    re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE),
+    re.compile(
+        r"\d{4}-\d{2}-\d{2}"
+        r"(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+        r"(?:Z|[+-]\d{2}:?\d{2})?)?"
+    ),
+    re.compile(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{12}"
+    ),
+    re.compile(r"[+-]?\d+(?:[.,]\d+)?"),
+)
 SEARCH_SELECTOR_PARAMETERS = frozenset(
     {
         "query",
@@ -41,6 +60,21 @@ SEARCH_SELECTOR_PARAMETERS = frozenset(
         "keywords",
     }
 )
+
+
+def _is_structured_scalar(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return bool(
+        text
+        and any(
+            pattern.fullmatch(text)
+            for pattern in _STRUCTURED_SCALAR_PATTERNS
+        )
+    )
+
+
 def canonicalize_resource_value(
     value: Any,
     semantic_type: str = "",
@@ -2050,6 +2084,7 @@ def project_agent_exposure(
     contract_content_detection = contract.get("content_detection", True) is not False
     runtime_hidden: set[str] = set()
     inspected_policies: dict[str, dict[str, Any]] = {}
+    sensitive_entities_by_path: dict[str, list[dict[str, Any]]] = {}
 
     def policy_for_exposure(path: str) -> dict[str, Any]:
         if not dynamic_mapping_policy_paths:
@@ -2092,7 +2127,7 @@ def project_agent_exposure(
         if not isinstance(value, str):
             return False
         policy = policy_for_exposure(path)
-        return str(policy.get("level", "secret")).lower() != "public" and policy.get("content_detection") is not False
+        return policy_allows_span_detection(policy)
 
     detector_required = requires_content_detector(plain, "$")
     if detector_required:
@@ -2122,16 +2157,42 @@ def project_agent_exposure(
             return
         if not permitted_for_inspection(path):
             return
-        policy = elevate_policy_for_content(
-            policy_for_exposure(path),
-            value,
+        base_policy = policy_for_exposure(path)
+        policy = (
+            base_policy
+            if (
+                not policy_allows_span_detection(base_policy)
+                or _is_structured_scalar(value)
+            )
+            else elevate_policy_for_content(base_policy, value)
         )
         inspected_policies[path] = policy
+        entities = [
+            dict(item)
+            for item in policy.get("gliner_entities", [])
+            if isinstance(item, Mapping)
+            and int(item.get("end", 0) or 0)
+            > int(item.get("start", 0) or 0)
+        ]
+        if entities:
+            sensitive_entities_by_path[path] = entities
         if CONFIDENTIALITY_LEVELS.get(
             str(policy.get("level", max_exposure_level)),
             3,
         ) > CONFIDENTIALITY_LEVELS.get(max_exposure_level, 0):
-            runtime_hidden.add(path)
+            sensitive_high_entities = [
+                item
+                for item in entities
+                if CONFIDENTIALITY_LEVELS.get(
+                    minimum_level_for_categories(
+                        [str(item.get("category", ""))]
+                    ),
+                    3,
+                )
+                > CONFIDENTIALITY_LEVELS.get(max_exposure_level, 0)
+            ]
+            if not sensitive_high_entities:
+                runtime_hidden.add(path)
 
     inspect(plain, "$")
     adjusted_projection = copy.deepcopy(dict(projection))
@@ -2144,6 +2205,170 @@ def project_agent_exposure(
         adjusted_projection,
     )
     references: dict[str, dict[str, Any]] = {}
+    sensitive_span_redactions: list[dict[str, Any]] = []
+    sensitive_content_exposed: list[dict[str, Any]] = []
+
+    def apply_sensitive_span_references(
+        text: str,
+        path: str,
+    ) -> str:
+        entities = sensitive_entities_by_path.get(path, [])
+        if not entities:
+            return text
+
+        for entity_item in entities:
+            start = max(
+                0,
+                min(len(text), int(entity_item.get("start", 0) or 0)),
+            )
+            end = max(
+                start,
+                min(
+                    len(text),
+                    int(entity_item.get("end", start) or start),
+                ),
+            )
+            if end <= start:
+                continue
+            category = str(entity_item.get("category", "") or "")
+            entity_level = minimum_level_for_categories([category])
+            details = {
+                "path": path,
+                "start": start,
+                "end": end,
+                "category": category,
+                "level": entity_level,
+                "score": float(entity_item.get("score", 0.0) or 0.0),
+                "text": text[start:end],
+            }
+            if CONFIDENTIALITY_LEVELS.get(
+                entity_level,
+                3,
+            ) <= CONFIDENTIALITY_LEVELS.get(max_exposure_level, 0):
+                sensitive_content_exposed.append(details)
+
+        candidates = [
+            {
+                **entity_item,
+                "start": max(
+                    0,
+                    min(
+                        len(text),
+                        int(entity_item.get("start", 0) or 0),
+                    ),
+                ),
+                "end": max(
+                    0,
+                    min(
+                        len(text),
+                        int(entity_item.get("end", 0) or 0),
+                    ),
+                ),
+            }
+            for entity_item in entities
+        ]
+        candidates = [
+            entity
+            for entity in candidates
+            if int(entity["end"]) > int(entity["start"])
+        ]
+        candidates.sort(
+            key=lambda item: (
+                int(item["start"]),
+                -int(item["end"]),
+            )
+        )
+        grouped: list[dict[str, Any]] = []
+        for entity_item in candidates:
+            category = str(entity_item.get("category", "") or "")
+            level = minimum_level_for_categories([category])
+            if (
+                CONFIDENTIALITY_LEVELS.get(level, 3)
+                <= CONFIDENTIALITY_LEVELS.get(max_exposure_level, 0)
+            ):
+                continue
+            if grouped and int(entity_item["start"]) < int(grouped[-1]["end"]):
+                grouped[-1]["end"] = max(
+                    int(grouped[-1]["end"]),
+                    int(entity_item["end"]),
+                )
+                grouped[-1]["categories"].add(category)
+                grouped[-1]["score"] = max(
+                    float(grouped[-1]["score"]),
+                    float(entity_item.get("score", 0.0) or 0.0),
+                )
+            else:
+                grouped.append(
+                    {
+                        "start": int(entity_item["start"]),
+                        "end": int(entity_item["end"]),
+                        "categories": {category},
+                        "score": float(
+                            entity_item.get("score", 0.0) or 0.0
+                        ),
+                    }
+                )
+        if not grouped:
+            return text
+
+        pieces: list[str] = []
+        cursor = 0
+        for span in grouped:
+            start = int(span["start"])
+            end = int(span["end"])
+            if start < cursor:
+                continue
+            categories = sorted(
+                category
+                for category in span["categories"]
+                if category
+            )
+            level = minimum_level_for_categories(categories)
+            reference = (
+                f"{SENSITIVE_REFERENCE_PREFIX}"
+                f"{app}:{entity}:{activity_id}:{path}"
+                f"#span:{start}-{end}]]"
+            )
+            value = text[start:end]
+            source_policy = inspected_policies.get(
+                path,
+                policy_for_exposure(path),
+            )
+            references[reference] = {
+                "value": value,
+                "app": app,
+                "entity": entity,
+                "source_action": str(contract.get("source_action", "")),
+                "source_path": path,
+                "source_activity_id": activity_id,
+                "start": start,
+                "end": end,
+                "span_start": start,
+                "span_end": end,
+                "confidentiality": level,
+                "categories": categories,
+                "span_detection": policy_allows_span_detection(
+                    source_policy
+                ),
+            }
+            sensitive_span_redactions.append(
+                {
+                    "path": path,
+                    "start": start,
+                    "end": end,
+                    "category": ",".join(categories),
+                    "level": level,
+                    "score": float(span["score"]),
+                    "controller_reference": reference,
+                }
+            )
+            pieces.append(text[cursor:start])
+            pieces.append(reference)
+            cursor = end
+        if not pieces:
+            return text
+        pieces.append(text[cursor:])
+        return "".join(pieces)
 
     def semanticize(
         projected_value: Any,
@@ -2171,8 +2396,20 @@ def project_agent_exposure(
                 "source_activity_id": activity_id,
                 "confidentiality": str(policy.get("level", "secret")),
                 "categories": list(policy.get("categories", [])),
+                "span_detection": policy_allows_span_detection(
+                    policy
+                ),
             }
             return reference
+        if (
+            isinstance(projected_value, str)
+            and path_is_visible(path)
+            and path in sensitive_entities_by_path
+        ):
+            projected_value = apply_sensitive_span_references(
+                projected_value,
+                path,
+            )
         if isinstance(projected_value, dict):
             raw_mapping = raw_value if isinstance(raw_value, Mapping) else {}
             return {
@@ -2209,6 +2446,8 @@ def project_agent_exposure(
         "runtime_sensitive_policies": {
             path: copy.deepcopy(inspected_policies.get(path, {})) for path in sorted(runtime_hidden)
         },
+        "sensitive_span_redactions": sensitive_span_redactions,
+        "sensitive_content_exposed": sensitive_content_exposed,
         "reference_placeholders": sorted(references),
         "_sensitive_references": references,
         "withheld_fields": hidden,

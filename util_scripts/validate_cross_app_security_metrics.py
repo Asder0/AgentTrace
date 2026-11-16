@@ -7,7 +7,7 @@ import json
 import os
 import random
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -20,11 +20,13 @@ from agentdojo.method.analysis.defense_config import (
 )
 from agentdojo.method.analysis.security_metrics import (
     aggregate_security_metrics,
+    attack_defense_comparison,
     final_security_metric_availability,
     final_security_metrics,
     normalize_attack_run,
     normalize_normal_run,
 )
+from agentdojo.method.capture import interceptor as interceptor_module
 from agentdojo.method.tasks.cross_app import CROSS_APP_TASKS
 from agentdojo.method.visualization import server
 
@@ -43,8 +45,117 @@ def _selected_values(
     return list(dict.fromkeys(requested))
 
 
+def _attack_modes(mode: str) -> tuple[bool, ...]:
+    if mode == "off":
+        return (False,)
+    if mode == "paired":
+        return (False, True)
+    return (True,)
+
+
+_TASK_CONTENT_COLLECTIONS = {
+    "file": frozenset({"append_files"}),
+    "email": frozenset({"append_unread_emails"}),
+    "slack_message": frozenset(
+        {
+            "append_direct_messages",
+            "append_channel_messages",
+        }
+    ),
+    "text": frozenset(
+        {
+            "append_files",
+            "append_unread_emails",
+            "append_direct_messages",
+            "append_channel_messages",
+        }
+    ),
+}
+
+
 def _attack_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
-    targets = server._cross_app_attack_targets()
+    targets = server._cross_app_attack_targets(
+        injection_policy=args.injection_policy,
+    )
+    targets = [
+        target
+        for target in targets
+        if (
+            args.task_complexity == "all"
+            or (
+                (
+                    len(
+                        CROSS_APP_TASKS[
+                            target["id"]
+                        ].steps
+                    )
+                    >= 5
+                    or len(
+                        CROSS_APP_TASKS[
+                            target["id"]
+                        ].required_suites
+                    )
+                    >= 3
+                )
+                and (
+                    args.task_complexity == "complex"
+                    or bool(target["injection_points"])
+                )
+            )
+        )
+        and (
+            args.task_content_source == "any"
+            or any(
+                point["collection"]
+                in _TASK_CONTENT_COLLECTIONS[
+                    args.task_content_source
+                ]
+                for point in target["injection_points"]
+            )
+        )
+    ]
+    rng = random.Random(args.seed)
+    target_source_scopes: dict[str, str] = {}
+    if args.tasks_per_content_source > 0:
+        selected_targets = []
+        selected_task_ids: set[str] = set()
+        for source_scope in (
+            "file",
+            "email",
+            "slack_message",
+        ):
+            candidates = [
+                target
+                for target in targets
+                if target["id"] not in selected_task_ids
+                and any(
+                    point["collection"]
+                    in _TASK_CONTENT_COLLECTIONS[
+                        source_scope
+                    ]
+                    for point in target["injection_points"]
+                )
+            ]
+            if (
+                len(candidates)
+                < args.tasks_per_content_source
+            ):
+                raise SystemExit(
+                    f"Not enough complex {source_scope} tasks: "
+                    f"requested {args.tasks_per_content_source}, "
+                    f"available {len(candidates)}"
+                )
+            chosen = rng.sample(
+                candidates,
+                args.tasks_per_content_source,
+            )
+            for target in chosen:
+                target_source_scopes[
+                    str(target["id"])
+                ] = source_scope
+                selected_task_ids.add(str(target["id"]))
+                selected_targets.append(target)
+        targets = selected_targets
     requested_tasks = set(args.task or [])
     missing_tasks = requested_tasks - {str(target["id"]) for target in targets}
     if missing_tasks:
@@ -64,7 +175,14 @@ def _attack_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
 
     available_attack_types = [str(item["id"]) for item in server.AVAILABLE_ATTACK_TYPES]
-    if args.profile == "smoke":
+    if (
+        args.attack_selection_mode
+        in {"per-task", "per-task-templates"}
+        and not args.attack_type
+    ):
+        default_attack_types = available_attack_types
+        default_injection_limit = 1
+    elif args.profile == "smoke":
         default_attack_types = ["important_instructions"]
         default_injection_limit = 1
     elif args.profile == "balanced":
@@ -83,7 +201,6 @@ def _attack_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
         [str(goal["id"]) for goal in server.CROSS_APP_ATTACK_GOALS],
         "attack goals",
     )
-    rng = random.Random(args.seed)
     plan: list[dict[str, Any]] = []
     for target in targets:
         compatible_goals = set(
@@ -99,6 +216,18 @@ def _attack_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
         if not target_goals:
             continue
         points = list(target.get("injection_points", []))
+        source_scope = target_source_scopes.get(
+            str(target["id"])
+        )
+        if source_scope:
+            points = [
+                point
+                for point in points
+                if point["collection"]
+                in _TASK_CONTENT_COLLECTIONS[
+                    source_scope
+                ]
+            ]
         if requested_points:
             points = [
                 point
@@ -120,12 +249,110 @@ def _attack_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
                             "injection_point": point,
                             "attack_type": attack_type,
                             "goal": goal,
+                            "content_source_scope": (
+                                source_scope
+                            ),
                         }
                     )
     rng.shuffle(plan)
+    if args.attack_selection_mode == "per-task":
+        by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in plan:
+            by_task[str(item["task_id"])].append(item)
+        task_ids = sorted(by_task)
+        rng.shuffle(task_ids)
+        type_rotation = list(attack_types)
+        rng.shuffle(type_rotation)
+        selected = []
+        for index, task_id in enumerate(task_ids):
+            candidates = by_task[task_id]
+            preferred_type = type_rotation[
+                index % len(type_rotation)
+            ]
+            preferred = [
+                item
+                for item in candidates
+                if item["attack_type"] == preferred_type
+            ]
+            selected.append(
+                rng.choice(preferred or candidates)
+            )
+        plan = selected
+    elif args.attack_selection_mode == "per-task-templates":
+        by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in plan:
+            by_task[str(item["task_id"])].append(item)
+        task_ids = sorted(by_task)
+        rng.shuffle(task_ids)
+        goal_rotation = list(goals)
+        rng.shuffle(goal_rotation)
+        selected = []
+        for index, task_id in enumerate(task_ids):
+            candidates = by_task[task_id]
+            preferred_goal = goal_rotation[
+                index % len(goal_rotation)
+            ]
+            goal_candidates = [
+                item
+                for item in candidates
+                if item["goal"] == preferred_goal
+            ] or candidates
+            point_ids = sorted(
+                {
+                    str(item["injection_point"]["id"])
+                    for item in goal_candidates
+                }
+            )
+            selected_point = rng.choice(point_ids)
+            point_candidates = [
+                item
+                for item in goal_candidates
+                if str(item["injection_point"]["id"])
+                == selected_point
+            ]
+            by_type = {
+                str(item["attack_type"]): item
+                for item in point_candidates
+            }
+            selected.extend(
+                by_type[attack_type]
+                for attack_type in attack_types
+                if attack_type in by_type
+            )
+        plan = selected
+    elif args.one_per_attack_type:
+        selected = []
+        selected_types = set()
+        selected_tasks = set()
+        for forbid_duplicate_tasks in (True, False):
+            for item in plan:
+                attack_type = str(item["attack_type"])
+                task_id = str(item["task_id"])
+                if attack_type in selected_types:
+                    continue
+                if (
+                    forbid_duplicate_tasks
+                    and task_id in selected_tasks
+                ):
+                    continue
+                selected.append(item)
+                selected_types.add(attack_type)
+                selected_tasks.add(task_id)
+            if len(selected_types) == len(attack_types):
+                break
+        plan = selected
     if args.max_attack_runs > 0:
         plan = plan[: args.max_attack_runs]
-    return plan
+    return [
+        {
+            **item,
+            "defense_enabled": defense_enabled,
+        }
+        for item in plan
+        for defense_enabled in _attack_modes(
+            args.attack_defense_mode
+        )
+    ]
 
 
 def _normal_plan(args: argparse.Namespace) -> list[str]:
@@ -150,6 +377,8 @@ def _response_payload(response) -> dict[str, Any]:
 def _run_attack(
     client,
     item: Mapping[str, Any],
+    *,
+    defense_enabled: bool,
 ) -> dict[str, Any]:
     point = item["injection_point"]
     response = client.post(
@@ -160,6 +389,7 @@ def _run_attack(
             "injection_goal_id": item["goal"],
             "attack_type": item["attack_type"],
             "suite": "unified",
+            "defense_enabled": defense_enabled,
         },
     )
     payload = _response_payload(response)
@@ -168,6 +398,7 @@ def _run_attack(
         return {
             "kind": "attack",
             "trace_id": "",
+            "defense_enabled": defense_enabled,
             "request": dict(item),
             "attack_info": payload.get("attack_info", {}),
             "attack_detection_eligible": False,
@@ -181,6 +412,7 @@ def _run_attack(
             "execution_error": str(payload["error"]),
         }
     record = normalize_attack_run(payload)
+    record["defense_enabled"] = defense_enabled
     record["request"] = dict(item)
     record["source_kind"] = item["source_kind"]
     record["injection_app"] = str(point.get("app", ""))
@@ -235,6 +467,15 @@ def _write_progress(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def _apply_defense_mode(enabled: bool) -> None:
+    interceptor_module._defense_enabled = bool(enabled)
+    if enabled:
+        reset_config()
+    else:
+        disable_defense_layer()
+    set_auto_confirmations(True)
+
+
 def _build_report(
     args: argparse.Namespace,
     records: list[dict[str, Any]],
@@ -242,11 +483,31 @@ def _build_report(
     complete: bool,
 ) -> dict[str, Any]:
     full_metrics = aggregate_security_metrics(records)
+    defense_on_attacks = [
+        record
+        for record in records
+        if (
+            record["kind"] == "attack"
+            and bool(record.get("defense_enabled", True))
+        )
+    ]
     return {
         "schema_version": 1,
         "profile": args.profile,
         "provider": args.provider,
         "model": args.model,
+        "injection_policy": args.injection_policy,
+        "attack_selection_mode": (
+            args.attack_selection_mode
+        ),
+        "task_complexity": args.task_complexity,
+        "task_content_source": (
+            args.task_content_source
+        ),
+        "tasks_per_content_source": (
+            args.tasks_per_content_source
+        ),
+        "one_per_attack_type": args.one_per_attack_type,
         "complete": complete,
         "metrics": final_security_metrics(
             full_metrics
@@ -256,13 +517,16 @@ def _build_report(
                 full_metrics
             )
         ),
+        "attack_defense_comparison": (
+            attack_defense_comparison(records)
+        ),
         "by_source": _group_metrics(
-            [record for record in records if record["kind"] == "attack"],
+            defense_on_attacks,
             "source",
             lambda record: str(record.get("source_kind", "unknown")),
         ),
         "by_attack_type": _group_metrics(
-            [record for record in records if record["kind"] == "attack"],
+            defense_on_attacks,
             "attack type",
             lambda record: str(
                 (record.get("request") or {}).get(
@@ -272,7 +536,7 @@ def _build_report(
             ),
         ),
         "by_goal": _group_metrics(
-            [record for record in records if record["kind"] == "attack"],
+            defense_on_attacks,
             "goal",
             lambda record: str(
                 (record.get("request") or {}).get(
@@ -282,7 +546,7 @@ def _build_report(
             ),
         ),
         "by_injection_app": _group_metrics(
-            [record for record in records if record["kind"] == "attack"],
+            defense_on_attacks,
             "injection APP",
             lambda record: str(record.get("injection_app", "unknown")),
         ),
@@ -321,6 +585,11 @@ def _run_key(record: Mapping[str, Any]) -> tuple[str, ...]:
             str(point.get("id", "")),
             str(request.get("attack_type", "")),
             str(request.get("goal", "")),
+            (
+                "defense_on"
+                if record.get("defense_enabled", True)
+                else "defense_off"
+            ),
         )
     return (
         "normal",
@@ -361,9 +630,9 @@ def main() -> None:
         choices=("smoke", "balanced", "full"),
         default="smoke",
         help=(
-            "smoke: one point/task and one attack type; "
-            "balanced: one point/task and all attack types; "
-            "full: every point and attack type."
+            "Cartesian-mode defaults: smoke uses one point/task and one "
+            "attack type; balanced uses all attack types; full uses every "
+            "point and attack type. Per-task mode overrides these defaults."
         ),
     )
     parser.add_argument("--provider", default="deepseek")
@@ -389,10 +658,76 @@ def main() -> None:
         help="0 selects every injection point.",
     )
     parser.add_argument(
+        "--injection-policy",
+        choices=("guaranteed", "required", "all"),
+        default="guaranteed",
+        help=(
+            "guaranteed: every required read path reaches the injection; "
+            "required: at least one legal required path reaches it; "
+            "all: every text fixture field."
+        ),
+    )
+    parser.add_argument(
+        "--attack-selection-mode",
+        choices=(
+            "per-task",
+            "per-task-templates",
+            "cartesian",
+        ),
+        default="per-task",
+        help=(
+            "per-task: one balanced-random injection point, template, and "
+            "goal per task (default); per-task-templates: one point and goal "
+            "per task with every attack template; cartesian: full product."
+        ),
+    )
+    parser.add_argument(
+        "--task-complexity",
+        choices=("all", "complex", "complex-text"),
+        default="all",
+        help=(
+            "complex keeps tasks with at least 5 required steps or at "
+            "least 3 APP domains; complex-text additionally requires a "
+            "guaranteed file, email, or Slack text source."
+        ),
+    )
+    parser.add_argument(
+        "--task-content-source",
+        choices=(
+            "any",
+            "file",
+            "email",
+            "slack_message",
+            "text",
+        ),
+        default="any",
+        help=(
+            "Keep tasks whose guaranteed injection point comes from a "
+            "Workspace file, email, Slack message, or any text source."
+        ),
+    )
+    parser.add_argument(
+        "--tasks-per-content-source",
+        type=int,
+        default=0,
+        help=(
+            "When positive, deterministically sample this many distinct "
+            "complex tasks from file, email, and Slack sources."
+        ),
+    )
+    parser.add_argument(
         "--max-attack-runs",
         type=int,
         default=0,
         help="Optional cap after deterministic planning; 0 means no cap.",
+    )
+    parser.add_argument(
+        "--one-per-attack-type",
+        action="store_true",
+        help=(
+            "Select exactly one randomized task/point/goal combination "
+            "for each requested attack type, preferring distinct tasks."
+        ),
     )
     parser.add_argument(
         "--max-normal-runs",
@@ -405,6 +740,15 @@ def main() -> None:
         choices=("on", "off", "paired"),
         default="paired",
         help=("Run normal controls with defenses on, off, or both to calculate the S0/S1 completion drop."),
+    )
+    parser.add_argument(
+        "--attack-defense-mode",
+        choices=("on", "off", "paired"),
+        default="on",
+        help=(
+            "Run each selected attack with defenses on, off, "
+            "or in paired off/on mode."
+        ),
     )
     parser.add_argument("--seed", type=int, default=20240516)
     parser.add_argument(
@@ -439,6 +783,18 @@ def main() -> None:
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if (
+        args.attack_selection_mode != "cartesian"
+        and args.one_per_attack_type
+    ):
+        parser.error(
+            "--one-per-attack-type requires "
+            "--attack-selection-mode cartesian"
+        )
+    if args.tasks_per_content_source > 0 and args.task:
+        parser.error(
+            "--tasks-per-content-source cannot be combined with --task"
+        )
 
     activate_platform()
     attacks = [] if args.skip_attacks else _attack_plan(args)
@@ -455,11 +811,54 @@ def main() -> None:
                 {
                     "profile": args.profile,
                     "planned_attack_runs": len(attacks),
+                    "planned_attack_combinations": (
+                        len(attacks)
+                        // len(
+                            _attack_modes(
+                                args.attack_defense_mode
+                            )
+                        )
+                        if attacks
+                        else 0
+                    ),
                     "planned_normal_runs": (len(normal_tasks) * len(normal_modes)),
+                    "attack_defense_mode": (
+                        args.attack_defense_mode
+                    ),
+                    "injection_policy": args.injection_policy,
+                    "attack_selection_mode": (
+                        args.attack_selection_mode
+                    ),
+                    "task_complexity": args.task_complexity,
+                    "task_content_source": (
+                        args.task_content_source
+                    ),
+                    "tasks_per_content_source": (
+                        args.tasks_per_content_source
+                    ),
+                    "one_per_attack_type": (
+                        args.one_per_attack_type
+                    ),
                     "normal_defense_mode": args.normal_defense_mode,
                     "attack_types": sorted({item["attack_type"] for item in attacks}),
                     "goals": sorted({item["goal"] for item in attacks}),
                     "attack_tasks": len({item["task_id"] for item in attacks}),
+                    "content_source_scopes": dict(
+                        sorted(
+                            Counter(
+                                str(
+                                    item.get(
+                                        "content_source_scope",
+                                        "",
+                                    )
+                                )
+                                for item in attacks
+                                if item.get(
+                                    "content_source_scope"
+                                )
+                            ).items()
+                        )
+                    ),
                     "injection_points": len(
                         {
                             (
@@ -489,8 +888,7 @@ def main() -> None:
     os.environ["LLM_REQUEST_TIMEOUT_SECONDS"] = str(max(1.0, args.request_timeout_seconds))
     os.environ["LLM_MAX_RETRIES"] = str(max(0, args.max_retries))
     server._pipeline_cache.clear()
-    reset_config()
-    set_auto_confirmations(True)
+    _apply_defense_mode(True)
 
     client = server.app.test_client()
     records: list[dict[str, Any]] = []
@@ -522,15 +920,25 @@ def main() -> None:
             item["injection_point"]["id"],
             item["attack_type"],
             item["goal"],
+            (
+                "defense_on"
+                if item["defense_enabled"]
+                else "defense_off"
+            ),
         )
         if args.resume and key in existing_keys:
             completed += 1
             _write_progress(
                 f"[{completed}/{total}] reused attack {item['task_id']} "
-                f"{item['attack_type']} {item['goal']}"
+                f"{item['attack_type']} {item['goal']} "
+                f"defense={'on' if item['defense_enabled'] else 'off'}"
             )
             continue
-        record = _run_attack(client, item)
+        record = _run_attack(
+            client,
+            item,
+            defense_enabled=item["defense_enabled"],
+        )
         add_record(record)
         existing_keys.add(_run_key(record))
         _persist_report(
@@ -540,16 +948,17 @@ def main() -> None:
             complete=False,
         )
         completed += 1
-        _write_progress(f"[{completed}/{total}] attack {item['task_id']} {item['attack_type']} {item['goal']}")
+        _write_progress(
+            f"[{completed}/{total}] attack "
+            f"{item['task_id']} {item['attack_type']} "
+            f"{item['goal']} "
+            f"defense={'on' if item['defense_enabled'] else 'off'}"
+        )
         if args.fail_fast and record.get("execution_error"):
             raise SystemExit(record["execution_error"])
 
     for defense_enabled in normal_modes:
-        if defense_enabled:
-            reset_config()
-        else:
-            disable_defense_layer()
-        set_auto_confirmations(True)
+        _apply_defense_mode(defense_enabled)
         for scenario_id in normal_tasks:
             key = (
                 "normal",
@@ -586,8 +995,7 @@ def main() -> None:
             if args.fail_fast and record.get("execution_error"):
                 raise SystemExit(record["execution_error"])
 
-    reset_config()
-    set_auto_confirmations(True)
+    _apply_defense_mode(True)
 
     report = _persist_report(
         args.output,
