@@ -704,6 +704,55 @@ Rules:
 - Return a low confidence instead of guessing missing authorization details."""
 
 
+RESOURCE_SELECTOR_REPAIR_PROMPT = """You repair only missing resource
+selectors in an existing Agent task plan.
+
+Return JSON only:
+{
+  "selectors": [
+    {
+      "step_id": "existing step id",
+      "action": "existing exact tool name",
+      "parameter": "exact missing input field",
+      "mode": "literal|derived",
+      "semantic_type": "field semantic_type from selector_schema",
+      "explanation": "concise explanation in Simplified Chinese",
+      "allowed_values": [],
+      "allowed_source_refs": [
+        {
+          "app": "workspace",
+          "entity": "email",
+          "source_action": "exact earlier source tool name",
+          "source_path": "exact output_schema path"
+        }
+      ],
+      "required_sources": []
+    }
+  ]
+}
+
+Rules:
+- Return one selector for every missing_selector listed in the input.
+- Operate only on the exact step/action/parameter target listed in the input.
+- Never add, remove, rename or replace a step or action. Never change an APP,
+  effect, destination, required outcome or visible-field declaration.
+- Use literal only when the selector can be expressed safely from the trusted
+  user instruction. A search query may be a concise string composed only of
+  words or identifiers from that instruction.
+- Use derived when the selector must be extracted or selected from an earlier
+  planned output. Each allowed_source_ref must identify an earlier source in
+  source_refs and an exact path from that source tool's output_fields.
+- required_sources may contain only source IDs listed in source_refs.
+- Match the declared input field type. For an array field, allowed_values must
+  contain array values; for a scalar field, allowed_values must contain
+  scalars.
+- Do not invent business values or broaden a user destination. If a trustworthy
+  selector cannot be produced, return selectors as an empty list.
+- Write explanation in Simplified Chinese. Preserve tool names, field names,
+  APP identifiers, paths and business values unchanged.
+"""
+
+
 OPTIONAL_PARAMETER_SUPPORT_PROMPT = """You add safe read-only support
 steps for optional inputs in an existing Agent task plan.
 
@@ -957,6 +1006,296 @@ def _plan_input_contract_report(
                 }
             )
     return report
+
+
+def _complete_missing_resource_selectors(
+    plan: dict[str, Any],
+    raw_plan: dict[str, Any],
+    prompt: str,
+    planner: Callable[[str], str],
+    available_tools: list[dict[str, Any]] | None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Ask for a minimal selector-only patch for otherwise valid actions."""
+    invalid_reasons = {
+        str(item.get("reason", ""))
+        for item in plan.get("invalid_actions", [])
+        if isinstance(item, Mapping)
+    }
+    if invalid_reasons != {"data_access_contract_invalid"}:
+        return None, []
+
+    catalog = {
+        str(item.get("name", "")): item
+        for item in available_tools or []
+        if isinstance(item, Mapping) and item.get("name")
+    }
+    report = _plan_input_contract_report(
+        plan,
+        available_tools,
+    )
+    targets = [
+        item
+        for item in report
+        if item.get("missing_resource_selector_fields")
+    ]
+    if not targets:
+        return None, []
+
+    target_details: list[dict[str, Any]] = []
+    expected: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for target in targets:
+        step_id = str(target.get("step_id", ""))
+        action_name = str(target.get("action", ""))
+        metadata = catalog.get(action_name, {})
+        input_schema = (
+            metadata.get("input_schema")
+            if isinstance(metadata, Mapping)
+            else {}
+        )
+        fields = (
+            input_schema.get("fields", {})
+            if isinstance(input_schema, Mapping)
+            else {}
+        )
+        selector_schemas = {}
+        for parameter in target.get(
+            "missing_resource_selector_fields",
+            [],
+        ):
+            parameter = str(parameter)
+            raw_field = (
+                fields.get(parameter, {})
+                if isinstance(fields, Mapping)
+                else {}
+            )
+            selector_schemas[parameter] = {
+                "type": _schema_field_type(
+                    metadata,
+                    parameter,
+                ),
+                "item_type": _schema_field_item_type(
+                    metadata,
+                    parameter,
+                ),
+                "semantic_type": _schema_field_semantic_type(
+                    metadata,
+                    parameter,
+                ),
+                "role": _schema_field_role(
+                    metadata,
+                    parameter,
+                ),
+                "required": bool(
+                    raw_field.get("required", False)
+                    if isinstance(raw_field, Mapping)
+                    else False
+                ),
+                "type_schema": (
+                    raw_field.get("type_schema", {})
+                    if isinstance(raw_field, Mapping)
+                    else {}
+                ),
+            }
+            expected[
+                (
+                    step_id,
+                    base_tool_name(action_name),
+                    parameter,
+                )
+            ] = {
+                "step_id": step_id,
+                "action": action_name,
+                "parameter": parameter,
+            }
+        target_details.append(
+            {
+                **target,
+                "selector_schema": selector_schemas,
+            }
+        )
+
+    source_context: dict[str, dict[str, Any]] = {}
+    for source_id, raw_source in (
+        plan.get("source_refs", {}) or {}
+    ).items():
+        if not isinstance(raw_source, Mapping):
+            continue
+        source_action = str(
+            raw_source.get("source_action", "")
+        )
+        metadata = catalog.get(source_action, {})
+        output_schema = (
+            metadata.get("output_schema")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        source_context[str(source_id)] = {
+            "app": str(raw_source.get("app", "")),
+            "entity": str(raw_source.get("entity", "")),
+            "producer_step": str(
+                raw_source.get("producer_step", "")
+            ),
+            "source_action": source_action,
+            "output_fields": (
+                list(schema_paths(output_schema))
+                if isinstance(output_schema, Mapping)
+                else []
+            ),
+        }
+
+    request = (
+        RESOURCE_SELECTOR_REPAIR_PROMPT
+        + "\n\nRESOURCE_SELECTOR_REPAIR_INPUT:\n"
+        + json.dumps(
+            {
+                "user_instruction": str(prompt),
+                "targets": target_details,
+                "source_refs": source_context,
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
+    try:
+        patch = parse_plan_json(planner(request))
+    except Exception as exc:
+        return None, [
+            f"resource_selector_repair_failed:{exc}"
+        ]
+
+    raw_selectors = patch.get("selectors", [])
+    if not isinstance(raw_selectors, list):
+        return None, [
+            "resource_selector_repair_invalid:selectors"
+        ]
+
+    repaired = copy.deepcopy(raw_plan)
+    applied: set[tuple[str, str, str]] = set()
+    for raw_selector in raw_selectors:
+        if not isinstance(raw_selector, Mapping):
+            continue
+        step_id = str(raw_selector.get("step_id", "")).strip()
+        action = str(raw_selector.get("action", "")).strip()
+        parameter = str(
+            raw_selector.get("parameter", "")
+        ).strip()
+        key = (
+            step_id,
+            base_tool_name(action),
+            parameter,
+        )
+        target = expected.get(key)
+        if target is None:
+            continue
+        mode = str(
+            raw_selector.get("mode", "literal")
+        ).strip().lower()
+        if mode not in {"literal", "derived"}:
+            continue
+        raw_values = raw_selector.get("allowed_values", [])
+        allowed_values = (
+            list(raw_values)
+            if isinstance(raw_values, (list, tuple))
+            else [raw_values]
+        )
+        raw_refs = raw_selector.get(
+            "allowed_source_refs",
+            [],
+        )
+        allowed_source_refs = [
+            dict(item)
+            for item in raw_refs
+            if (
+                isinstance(item, Mapping)
+                and str(item.get("app", "")).strip()
+                and str(item.get("entity", "")).strip()
+                and str(
+                    item.get("source_action", "")
+                ).strip()
+                and str(item.get("source_path", "")).strip()
+            )
+        ] if isinstance(raw_refs, list) else []
+        if mode == "literal" and not any(
+            value not in (None, "")
+            for value in allowed_values
+        ):
+            continue
+        if mode == "derived" and not allowed_source_refs:
+            continue
+        raw_required_sources = raw_selector.get(
+            "required_sources",
+            [],
+        )
+        required_sources = [
+            str(item)
+            for item in raw_required_sources
+            if str(item) in source_context
+        ] if isinstance(raw_required_sources, list) else []
+        rule = {
+            "mode": mode,
+            "semantic_type": str(
+                raw_selector.get("semantic_type", "")
+            ),
+            "allowed_values": allowed_values,
+            "allowed_source_refs": allowed_source_refs,
+            "required_sources": required_sources,
+            "explanation": str(
+                raw_selector.get("explanation", "")
+            ),
+        }
+        matched = False
+        for step in repaired.get("steps", []):
+            if (
+                not isinstance(step, dict)
+                or str(step.get("id", "")) != step_id
+            ):
+                continue
+            for raw_action in step.get("actions", []):
+                if not isinstance(raw_action, dict):
+                    continue
+                if (
+                    base_tool_name(
+                        str(raw_action.get("name", ""))
+                    )
+                    != base_tool_name(action)
+                ):
+                    continue
+                access_key = (
+                    "data_access"
+                    if str(
+                        raw_action.get("effect", "")
+                    ) == "read"
+                    else "resource_access"
+                )
+                access = raw_action.get(access_key)
+                if not isinstance(access, dict):
+                    access = {}
+                    raw_action[access_key] = access
+                bindings = access.get("resource_parameters")
+                if not isinstance(bindings, dict):
+                    bindings = {}
+                    access["resource_parameters"] = bindings
+                bindings[parameter] = rule
+                matched = True
+                break
+            if matched:
+                break
+        if matched:
+            applied.add(key)
+
+    missing = set(expected) - applied
+    if missing:
+        return None, [
+            "resource_selector_repair_incomplete:"
+            + ",".join(
+                f"{step}:{action}:{parameter}"
+                for step, action, parameter in sorted(missing)
+            )
+        ]
+    return repaired, [
+        "resource_selector_repair_applied"
+    ]
 
 
 def _schema_field_role(metadata: dict[str, Any], field: str) -> str:
@@ -12158,6 +12497,62 @@ def generate_task_data_plan(
             plan,
             execution_contract,
         )
+        if plan.get("invalid_actions"):
+            selector_raw, selector_warnings = (
+                _complete_missing_resource_selectors(
+                    plan,
+                    raw_plan,
+                    str(prompt),
+                    planner,
+                    available_tools,
+                )
+            )
+            if selector_raw is not None:
+                selector_plan = _validate_task_plan(
+                    selector_raw,
+                    str(prompt),
+                    available_tools,
+                    trusted_identity_values=trusted_identity_values,
+                    execution_contract=execution_contract,
+                )
+                selector_alignment_failures = (
+                    align_plan_step_ids(
+                        selector_plan,
+                        execution_contract,
+                    )
+                )
+                if selector_alignment_failures:
+                    selector_plan.setdefault(
+                        "warnings",
+                        [],
+                    ).extend(selector_alignment_failures)
+                selector_plan = _attach_execution_contract_identity(
+                    selector_plan,
+                    execution_contract,
+                )
+                selector_contract_failures = (
+                    validate_plan_against_contract(
+                        selector_plan,
+                        execution_contract,
+                    )
+                )
+                if (
+                    selector_plan.get("valid", False)
+                    and not selector_plan.get("invalid_actions")
+                    and not selector_contract_failures
+                ):
+                    plan = selector_plan
+                    raw_plan = selector_raw
+                    plan.setdefault("warnings", []).extend(
+                        selector_warnings
+                    )
+                else:
+                    plan.setdefault("warnings", []).extend(
+                        selector_warnings
+                    )
+                    plan.setdefault("warnings", []).extend(
+                        selector_contract_failures
+                    )
         if plan.get("valid", False) and not plan.get(
             "invalid_actions"
         ):

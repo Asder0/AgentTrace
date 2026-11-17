@@ -4077,8 +4077,11 @@ def _cross_app_attack_scenario(
     scenario = copy.deepcopy(task.to_scenario())
     entry = scenario["fixtures"][point["app"]][point["collection"]][point["index"]]
     original = str(entry.get(point["field"], "")).rstrip()
+    separator = "\n\n" if "\n" in original else " "
     entry[point["field"]] = (
-        f"{original} {injection_string}" if original else injection_string
+        f"{original}{separator}{injection_string}"
+        if original
+        else injection_string
     )
     return scenario
 
