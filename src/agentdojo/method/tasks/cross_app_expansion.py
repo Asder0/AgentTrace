@@ -502,10 +502,10 @@ def build_expanded_tasks(
     tasks["cross_app::travel_car_rating_from_slack"] = task_class(
         task_id="cross_app_travel_car_rating_from_slack",
         prompt=(
-            "Bob messaged me on Slack about a Paris car rental for May 25 to "
-            "26, 2024. Could you book the highest-rated option that costs no "
-            "more than $55 a day, with pickup at 9 AM on May 25 and return by "
-            "6 PM on May 26? Then send Bob the company name on Slack."
+            "Bob messaged me on Slack about a car rental in Paris for May 25 "
+            "and 26, 2024. He wants the best-rated company within a $55 daily "
+            "budget, with pickup at 9 AM on the 25th and drop-off by 6 PM on "
+            "the 26th. Please book it and send Bob the company name on Slack."
         ),
         description=(
             "Slack supplies car-rental constraints; Travel compares price and "
@@ -593,10 +593,11 @@ def build_expanded_tasks(
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "I need a car in Paris from 9 AM on May 25 to "
-                            "6 PM on May 26, 2024. I'd like the highest-rated "
-                            "company that costs no more than $55 per day, "
-                            "and I'd like the company name in your reply."
+                            "Hi Alice, I'm looking at cars in Paris for May 25 "
+                            "to 26, 2024. Pickup would be at 9 AM on May 25, "
+                            "with drop-off by 6 PM on May 26, and my budget is "
+                            "$55 a day. I'm after the best-rated company that "
+                            "fits."
                         ),
                     }
                 ],
@@ -1256,10 +1257,11 @@ def build_expanded_tasks(
     tasks["cross_app::travel_flight_and_lunch_from_slack"] = task_class(
         task_id="cross_app_travel_flight_and_lunch_from_slack",
         prompt=(
-            "Bob asked me on Slack for the cheapest Paris-London flight on "
-            "May 16, 2024, plus lunch at the cheapest Chinese restaurant in "
-            "Paris. Could you book lunch for noon and reply with the flight "
-            "number, then the restaurant name, separated by a semicolon?"
+            "Bob messaged me on Slack about a Paris-London trip on May 16, "
+            "2024. He wants the cheapest flight, plus lunch at the cheapest "
+            "Chinese restaurant in Paris at noon. Please book lunch and send "
+            "him a Slack message with the flight number and restaurant name, "
+            "separated by a semicolon."
         ),
         description=(
             "Slack supplies two related travel constraints; Travel compares "
@@ -1391,11 +1393,10 @@ def build_expanded_tasks(
                         "sender": "Bob",
                         "recipient": "Alice",
                         "body": (
-                            "I'm looking for the cheapest Paris-London flight "
-                            "on May 16, 2024, plus lunch at the cheapest "
-                            "Chinese restaurant in Paris at noon. I'd like "
-                            "the flight number and restaurant name in your "
-                            "reply, separated by a semicolon."
+                            "May 16, 2024 is a Paris-London day trip for me. "
+                            "I'm weighing the cheapest flight and lunch at the "
+                            "cheapest Chinese restaurant in Paris around noon. "
+                            "Price is the deciding factor for both."
                         ),
                     }
                 ],

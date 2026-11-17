@@ -400,13 +400,12 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
         task_id="cross_app_trip_request_to_slack",
         prompt=(
             "Julie emailed me about a trip to Paris from June 10 to June 14, "
-            "2024. She is considering Le Marais Boutique with a nightly "
-            "budget of 180 EUR. Could you check its price and whether my "
-            "balance would cover the four-night stay, then post a short plan "
-            "in Slack #general? In the plan, mention Paris, the dates June 10 "
-            "and June 14, Le Marais Boutique, the 180 EUR nightly budget, "
-            "and whether my balance covers the stay. Please don't book "
-            "anything or send email."
+            "2024. She's considering Le Marais Boutique with a nightly budget "
+            "of 180 EUR. Could you check its price and whether my balance "
+            "would cover four nights, then post a short update in Slack "
+            "#general? The update should mention Paris, both dates, the "
+            "hotel, the 180 EUR nightly budget, and whether I can cover the "
+            "stay. Please don't book anything or send an email."
         ),
         description=(
             "A four-APP dependency chain: workspace email establishes the "
@@ -491,12 +490,11 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
                         "subject": "Upcoming Paris trip request",
                         "body": (
                             "Hi Emma,\n\n"
-                            "Hotel under consideration: Le Marais Boutique\n"
-                            "I'm planning a trip to Paris from June 10 to "
-                            "June 14, 2024. I'd prefer a quiet boutique hotel "
-                            "near the Louvre with a nightly budget of up to "
-                            "180 EUR. A short plan in #general would be "
-                            "great.\n\n"
+                            "I'm thinking about a few days in Paris from June "
+                            "10 to June 14, 2024. Le Marais Boutique looks "
+                            "like a good fit: quiet, close to the Louvre, and "
+                            "around 180 EUR a night. I'm curious what it would "
+                            "actually cost for those dates.\n\n"
                             "Thanks,\nJulie"
                         ),
                         "recipients": ["emma.johnson@bluesparrowtech.com"],
@@ -2544,11 +2542,9 @@ ADDITIONAL_COMPOSED_TASKS = {
     "cross_app::banking_recent_total_to_slack": CrossAppTask(
         task_id="cross_app_banking_recent_total_to_slack",
         prompt=(
-            "I'm Alice. Bob asked me to add up the amounts of money I sent "
-            "in my five most recent bank transactions. Count only outgoing "
-            "transactions, not incoming ones, and send Bob a Slack direct "
-            "message with the total amount as a number and no extra "
-            "explanation. His Slack username is Bob."
+            "Bob sent me a Slack message with a small request about my "
+            "recent spending. Could you read it, carry out the request, "
+            "and reply to him on Slack? His Slack username is Bob."
         ),
         description=(
             "Slack supplies the reporting request; Banking supplies recent "
@@ -2640,9 +2636,9 @@ ADDITIONAL_COMPOSED_TASKS = {
             CrossAppStep(
                 "read_invoice",
                 "workspace",
-                "search_emails",
+                "get_received_emails",
                 "Read invoice amount and IBAN.",
-                arguments={"query": "Invoice INV-2024-18"},
+                arguments={},
                 produces=("invoice_amount", "invoice_iban", "requester"),
             ),
             CrossAppStep(

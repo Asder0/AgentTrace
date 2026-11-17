@@ -68,9 +68,117 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().casefold())
 
 
+_MONTH_NUMBERS = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+_MONTH_NAME_PATTERN = (
+    r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+    r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
+    r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+)
+
+
+def _canonical_date(
+    *,
+    year: str = "",
+    month: int,
+    day: int,
+) -> str:
+    if not 1 <= month <= 12 or not 1 <= day <= 31:
+        return ""
+    if year:
+        return f"{int(year):04d}-{month:02d}-{day:02d}"
+    return f"{month:02d}-{day:02d}"
+
+
+def _canonicalize_dates(value: str) -> str:
+    """Canonicalize common date spellings before phrase matching."""
+
+    def expand_month_day_range(match: re.Match[str]) -> str:
+        month = _MONTH_NUMBERS[match.group("month").casefold()]
+        year = match.group("year") or ""
+        start = _canonical_date(
+            year=year,
+            month=month,
+            day=int(match.group("start")),
+        )
+        end = _canonical_date(
+            year=year,
+            month=month,
+            day=int(match.group("end")),
+        )
+        if not start or not end:
+            return match.group(0)
+        return f"{start} through {end}"
+
+    normalized = re.sub(
+        rf"\b(?P<month>{_MONTH_NAME_PATTERN})\.?\s+"
+        r"(?P<start>\d{1,2})(?:st|nd|rd|th)?"
+        r"\s*(?:-|–|—|\bto\b|\bthrough\b)\s*"
+        r"(?P<end>\d{1,2})(?:st|nd|rd|th)?"
+        r"(?:(?:,\s*|\s+)(?P<year>\d{4}))?\b",
+        expand_month_day_range,
+        value,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"\b(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})\b",
+        lambda match: _canonical_date(
+            year=match.group("year"),
+            month=int(match.group("month")),
+            day=int(match.group("day")),
+        )
+        or match.group(0),
+        normalized,
+    )
+
+    def replace_month_name(match: re.Match[str]) -> str:
+        month = _MONTH_NUMBERS[match.group("month").casefold()]
+        return (
+            _canonical_date(
+                year=match.group("year") or "",
+                month=month,
+                day=int(match.group("day")),
+            )
+            or match.group(0)
+        )
+
+    return re.sub(
+        rf"\b(?P<month>{_MONTH_NAME_PATTERN})\.?\s+"
+        r"(?P<day>\d{1,2})(?:st|nd|rd|th)?"
+        r"(?:(?:,\s*|\s+)(?P<year>\d{4}))?\b",
+        replace_month_name,
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+
 def _normalize_message_text(value: str) -> str:
     """Canonicalize equivalent numeric formatting in message bodies."""
     normalized = _normalize_text(unicodedata.normalize("NFKC", value))
+    normalized = _canonicalize_dates(normalized)
     normalized = re.sub(
         r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
         lambda match: (

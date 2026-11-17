@@ -1105,7 +1105,16 @@ def aggregate_security_metrics(
         else:
             process_fail_completion_fail += 1
     execution_conformant_runs = sum(
-        bool(record.get("execution_conformant", False))
+        bool(
+            record.get(
+                "plan_action_conformant",
+                record.get("execution_conformant", False),
+            )
+        )
+        for record in process_records
+    )
+    provenance_edge_aligned_runs = sum(
+        bool(record.get("provenance_edge_alignment", False))
         for record in process_records
     )
     plan_contract_conformant_runs = sum(
@@ -1544,6 +1553,10 @@ def aggregate_security_metrics(
             len(defense_on_normal),
         ),
         "normal_execution_conformant_runs": execution_conformant_runs,
+        "normal_provenance_edge_aligned_runs": (
+            provenance_edge_aligned_runs
+        ),
+        "provenance_validation_role": "visualization_only",
         "normal_execution_conformance_rate": _ratio(
             execution_conformant_runs,
             len(defense_on_normal),

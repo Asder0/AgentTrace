@@ -31,6 +31,7 @@ from ..modeling.data_sensitivity import (
     field_sensitivity_catalog,
     has_entity,
     max_source_level,
+    normalize_data_path,
     parse_entity_source,
     sensitivity_catalog,
     tool_output_entity,
@@ -330,10 +331,12 @@ Return JSON only:
             "resource_parameters": {
               "file_id": {
                 "mode": "literal",
-                "allowed_values": ["exact resource identifier stated by the user"]
+                "allowed_values": ["resource identifier stated by the user"],
+                "explanation": "short user-facing reason for this selector"
               }
             },
             "visible_fields": ["$.subject", "$.sender", "$.timestamp"],
+            "analysis_fields": [],
             "opaque_fields": [],
             "hidden_fields": []
           },
@@ -341,7 +344,8 @@ Return JSON only:
             "resource_parameters": {
               "file_id": {
                 "mode": "literal",
-                "allowed_values": ["exact resource identifier stated by the user"]
+                "allowed_values": ["resource identifier stated by the user"],
+                "explanation": "short user-facing reason for this selector"
               }
             }
           },
@@ -476,11 +480,14 @@ Rules:
   preserve every enumerated step with its exact ID, or represent the whole
   group with one derived-cardinality action whose step ID is one exact member
   of that group. Do not create an unrelated or ambiguous step identity.
-- Literal resource selectors and destinations must use exact values from the
-  trusted user instruction. The controller may resolve first-person current
-  identities without exposing their values to you. If a selector is discovered
-  through an earlier tool, use a derived source rule with an exact
-  source_action and source_path; never invent or broaden a literal value.
+- Literal resource selectors and destinations must express the business value
+  authorized by the trusted user instruction. Natural-language aliases and
+  equivalent typed values are allowed. The controller checks the declared
+  literal type against the tool input schema and does not require a verbatim
+  string match in the prompt. First-person current identities may be resolved
+  by the controller without exposing their values to you. If a selector is
+  discovered through an earlier tool, use a derived source rule with an exact
+  source_action and source_path; never invent or broaden a data-derived value.
 - A direct identifier accepted by the target tool is sufficient for that
   destination. Do not require a contact, friend, shared-channel or membership
   lookup merely to verify an explicitly supplied email address, Slack user or
@@ -505,27 +512,35 @@ Rules:
   opaque_fields and hidden_fields empty so the result is withheld. Do not use
   wildcards for the whole object when more specific fields are available.
   Unlisted fields are withheld before Agent reasoning.
+- analysis_fields is an optional subset of visible_fields. Include a field
+  there only when the Agent must compare, calculate over, select from or
+  otherwise reason about the actual values in that field. Sensitive spans in
+  analysis_fields are returned as real values to the Agent and recorded as an
+  exposed-sensitive-content risk; they are never converted to
+  [[SENSITIVE_REF:...]]. Fields used only for later transport belong in
+  opaque_fields and must not appear in analysis_fields.
 - When a calculation must distinguish outgoing from incoming money,
   messages, events or ownership, include every field needed to establish that
   direction in visible_fields (normally both sender and recipient, plus the
   filter amount or date). Never hide the field that determines the requested
   direction merely because another field already identifies the target.
-- max_exposure_level is the highest field sensitivity allowed to enter the
-  Agent context for that read. Use public or internal by default. Set
-  confidential or secret only when the user's instruction explicitly requires
-  that data for comparison or analysis. A confidential/secret visible field,
-  or content dynamically elevated to that level, requires explicit user
-  authorization before the read is allowed. Fields that only need to be passed
-  onward belong in opaque_fields and do not need their raw values exposed.
-  The controller rechecks content-derived sensitivity before exposure and
-  withholds any field that exceeds this limit.
+- max_exposure_level is an initial field-sensitivity hint, not a ceiling on the
+  task plan's authority. The task plan is the highest automated authorization
+  below direct user approval. If the action needs to inspect a visible field,
+  choose opaque_fields when the raw value is unnecessary; otherwise the
+  controller automatically raises max_exposure_level to the field's configured
+  sensitivity and routes the read through the standard confirmation/automatic
+  approval flow. Do not omit a required read merely to keep the initial level
+  low, and do not place directly consumed sensitive values in visible_fields.
 - The controller detects sensitive spans inside visible natural-language
   fields. Spans above max_exposure_level are replaced inline with
   [[SENSITIVE_REF:...]] while surrounding text remains visible; those exact
   references may later be copied into tool arguments or text payloads and are
   resolved by the controller before execution. If the Agent truly must read
-  and reason over the sensitive span itself, raise max_exposure_level to the
-  required category level so the span is exposed and visibly tainted.
+  and reason over values in a text field, list that exact field in
+  analysis_fields, keep it in visible_fields, and raise max_exposure_level to
+  the expected category level. analysis_fields always preserves the real
+  sensitive spans for reasoning and records the exposure for user warning.
 - resource_parameters authorizes selector arguments that choose a concrete
   resource, for example file_id, file_path, event_id, channel, user or url.
   Use literal with allowed_values when the user names the resource. Use derived
@@ -534,6 +549,12 @@ Rules:
   exact source_path that produces the selector. Omit resource_parameters only
   when the tool has no resource selector or all returned records are explicitly
   required by the user's task.
+- Every resource parameter rule must include a concise `explanation` in
+  natural language, describing the exact user instruction or earlier source
+  fact that justifies the selector. This explanation is shown to the user and
+  is not treated as a deterministic source-grounding proof. Plan validation
+  checks selector structure and schema type, not word-for-word equivalence
+  between the literal value and the prompt.
 - Read actions can also have search, filter or control parameters such as
   query, sender, subject or date. When one of those values is discovered from
   tool output, declare it as a derived resource parameter with the exact
@@ -674,11 +695,6 @@ Rules:
 - If output_schema is a dynamic object, visible_fields must enumerate exact
   output_entity_fields needed for the task. Do not request "$" as a shortcut
   for all dynamic-object fields.
-- PLANNING_INPUT.execution_contract.expected_flow_edges is a mandatory
-  semantic coverage checklist. For every expected edge, include a legal
-  alternative with the required source entity/action and target action. A
-  plan that omits one of these functional edges is invalid even when its
-  final answer could otherwise be correct.
 - Do not create wildcards for tools, destinations or data sources.
 - Confidence measures whether the user authorized the planned actions,
   destinations and scope. Do not lower it merely because a value is
@@ -814,6 +830,135 @@ def _required_schema_fields(metadata: dict[str, Any]) -> set[str]:
     return {str(name) for name, raw in fields.items() if isinstance(raw, dict) and raw.get("required") is True}
 
 
+def _optional_schema_fields(metadata: dict[str, Any]) -> set[str]:
+    schema = metadata.get("input_schema")
+    fields = schema.get("fields") if isinstance(schema, dict) else {}
+    if not isinstance(fields, dict):
+        return set()
+    return {
+        str(name)
+        for name, raw in fields.items()
+        if isinstance(raw, dict)
+        and raw.get("required") is not True
+        and raw.get("default", None) is None
+    }
+
+
+def _plan_input_contract_report(
+    plan: Mapping[str, Any],
+    available_tools: Sequence[Mapping[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Report exact schema fields an invalid plan failed to cover."""
+    catalog = {
+        str(item.get("name", "")): item
+        for item in available_tools or []
+        if isinstance(item, Mapping) and item.get("name")
+    }
+    invalid_targets = {
+        (
+            str(item.get("step_id", "") or ""),
+            str(item.get("action", "") or ""),
+        )
+        for item in plan.get("invalid_actions", [])
+        if isinstance(item, Mapping)
+    }
+    report: list[dict[str, Any]] = []
+    for step in plan.get("steps", []) or []:
+        if not isinstance(step, Mapping):
+            continue
+        step_id = str(step.get("id", "") or "")
+        for action in step.get("actions", []) or []:
+            if not isinstance(action, Mapping):
+                continue
+            action_name = str(action.get("name", "") or "")
+            if invalid_targets and (step_id, action_name) not in invalid_targets:
+                continue
+            metadata = catalog.get(action_name)
+            if not isinstance(metadata, Mapping):
+                continue
+            effect = str(action.get("effect", "") or "")
+            access = (
+                action.get("data_access")
+                if effect == "read"
+                else action.get("resource_access")
+            )
+            access = access if isinstance(access, Mapping) else {}
+            resource_parameters = access.get("resource_parameters", {})
+            resource_parameters = (
+                resource_parameters
+                if isinstance(resource_parameters, Mapping)
+                else {}
+            )
+            flow = action.get("flow_contract")
+            flow = flow if isinstance(flow, Mapping) else {}
+            parameter_bindings = flow.get("parameter_bindings", {})
+            parameter_bindings = (
+                parameter_bindings
+                if isinstance(parameter_bindings, Mapping)
+                else {}
+            )
+            destination = flow.get("destination", {})
+            destination_parameters = (
+                {
+                    str(item)
+                    for item in destination.get("parameters", [])
+                    if str(item).strip()
+                }
+                if isinstance(destination, Mapping)
+                else set()
+            )
+            covered = {
+                *resource_parameters,
+                *parameter_bindings,
+                *destination_parameters,
+            }
+            required = _required_schema_fields(dict(metadata))
+            optional = _optional_schema_fields(dict(metadata))
+            resource_type_errors = _resource_parameter_type_errors(
+                access,
+                metadata,
+                action_name=action_name,
+            )
+            parameter_type_errors = _plan_parameter_type_errors(
+                action,
+                metadata,
+            )
+            resource_selectors = {
+                str(item)
+                for item in metadata.get("resource_fields", [])
+                if str(item).strip()
+            }
+            missing_required = sorted(required - covered)
+            missing_selectors = sorted(resource_selectors - covered)
+            missing_optional = sorted(optional - covered)
+            if not (
+                missing_required
+                or missing_selectors
+                or missing_optional
+                or resource_type_errors
+                or parameter_type_errors
+            ):
+                continue
+            report.append(
+                {
+                    "step_id": step_id,
+                    "action": action_name,
+                    "effect": effect,
+                    "required_schema_fields": sorted(required),
+                    "resource_selector_fields": sorted(resource_selectors),
+                    "optional_schema_fields": sorted(optional),
+                    "missing_required_schema_fields": missing_required,
+                    "missing_resource_selector_fields": missing_selectors,
+                    "missing_optional_schema_fields": missing_optional,
+                    "resource_value_type_errors": resource_type_errors,
+                    "parameter_value_type_errors": (
+                        parameter_type_errors
+                    ),
+                }
+            )
+    return report
+
+
 def _schema_field_role(metadata: dict[str, Any], field: str) -> str:
     roles = metadata.get("parameter_roles")
     if isinstance(roles, dict) and field in roles:
@@ -832,6 +977,259 @@ def _schema_field_semantic_type(
     fields = schema.get("fields") if isinstance(schema, dict) else {}
     item = fields.get(field) if isinstance(fields, dict) else {}
     return str(item.get("semantic_type", "")) if isinstance(item, dict) else ""
+
+
+def _schema_field_type(
+    metadata: Mapping[str, Any],
+    field: str,
+) -> str:
+    schema = metadata.get("input_schema")
+    fields = schema.get("fields") if isinstance(schema, Mapping) else {}
+    item = fields.get(field) if isinstance(fields, Mapping) else {}
+    value_schema = (
+        item.get("type_schema")
+        if isinstance(item, Mapping)
+        else None
+    )
+    if not isinstance(value_schema, Mapping):
+        return ""
+    return str(value_schema.get("type", "") or "").strip().lower()
+
+
+def _schema_field_item_type(
+    metadata: Mapping[str, Any],
+    field: str,
+) -> str:
+    schema = metadata.get("input_schema")
+    fields = schema.get("fields") if isinstance(schema, Mapping) else {}
+    item = fields.get(field) if isinstance(fields, Mapping) else {}
+    value_schema = (
+        item.get("type_schema")
+        if isinstance(item, Mapping)
+        else None
+    )
+    items = (
+        value_schema.get("items")
+        if isinstance(value_schema, Mapping)
+        else None
+    )
+    return (
+        str(items.get("type", "") or "").strip().lower()
+        if isinstance(items, Mapping)
+        else ""
+    )
+
+
+def _value_matches_schema_type(
+    value: Any,
+    schema_type: str,
+) -> bool:
+    expected = str(schema_type or "").strip().lower()
+    if expected in {"", "unknown", "any"}:
+        return True
+    if expected in {"str", "string", "enum"}:
+        return isinstance(value, str)
+    if expected in {"int", "integer"}:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected in {"float", "number"}:
+        return (
+            isinstance(value, int | float)
+            and not isinstance(value, bool)
+        )
+    if expected in {"bool", "boolean"}:
+        return isinstance(value, bool)
+    if expected in {"array", "list"}:
+        return isinstance(value, list | tuple)
+    if expected in {"object", "dict", "mapping"}:
+        return isinstance(value, Mapping)
+    return True
+
+
+def _resource_parameter_type_errors(
+    contract: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any],
+    *,
+    action_name: str,
+) -> list[str]:
+    """Check planned literal selectors against the tool input schema types."""
+    if not isinstance(contract, Mapping):
+        return []
+    parameters = contract.get("resource_parameters")
+    if not isinstance(parameters, Mapping):
+        return []
+    errors: list[str] = []
+    for parameter, raw_rule in parameters.items():
+        if not isinstance(raw_rule, Mapping):
+            continue
+        if str(raw_rule.get("mode", "literal")).lower() != "literal":
+            continue
+        expected = _schema_field_type(metadata, str(parameter))
+        if expected in {"array", "list"} and isinstance(
+            raw_rule,
+            dict,
+        ):
+            item_type = _schema_field_item_type(
+                metadata,
+                str(parameter),
+            )
+            allowed_values = raw_rule.get("allowed_values", [])
+            if isinstance(allowed_values, list):
+                raw_rule["allowed_values"] = [
+                    [value]
+                    if (
+                        not isinstance(value, list | tuple)
+                        and bool(item_type)
+                        and _value_matches_schema_type(
+                            value,
+                            item_type,
+                        )
+                    )
+                    else value
+                    for value in allowed_values
+                ]
+        for value in raw_rule.get("allowed_values", []):
+            if not _value_matches_schema_type(value, expected):
+                errors.append(
+                    "resource_value_type_invalid:"
+                    f"{action_name}:{parameter}:{value!r}:"
+                    f"expected={expected}"
+                )
+    return errors
+
+
+def _plan_parameter_type_errors(
+    action: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> list[str]:
+    """Validate every concrete tool parameter that the Planner filled."""
+    action_name = str(action.get("name", "") or "")
+    errors: list[str] = []
+
+    def validate_value(
+        parameter: str,
+        value: Any,
+    ) -> str:
+        expected = _schema_field_type(metadata, parameter)
+        item_type = _schema_field_item_type(metadata, parameter)
+        if (
+            expected in {"array", "list"}
+            and not isinstance(value, list | tuple)
+            and item_type
+            and _value_matches_schema_type(value, item_type)
+        ):
+            value = [value]
+        if not _value_matches_schema_type(value, expected):
+            return (
+                "parameter_value_type_invalid:"
+                f"{action_name}:{parameter}:{value!r}:"
+                f"expected={expected or 'any'}"
+            )
+        if (
+            expected in {"array", "list"}
+            and item_type
+            and any(
+                not _value_matches_schema_type(item, item_type)
+                for item in value
+            )
+        ):
+            return (
+                "parameter_item_type_invalid:"
+                f"{action_name}:{parameter}:{value!r}:"
+                f"expected_items={item_type}"
+            )
+        return ""
+
+    flow = action.get("flow_contract")
+    if isinstance(flow, dict):
+        destination = flow.get("destination")
+        if (
+            isinstance(destination, dict)
+            and str(destination.get("mode", "literal")).lower()
+            == "literal"
+        ):
+            raw_values = destination.get("allowed_values", [])
+            values = (
+                list(raw_values)
+                if isinstance(raw_values, list | tuple)
+                else [raw_values]
+            )
+            if (
+                len(values) == 1
+                and isinstance(values[0], list | tuple)
+            ):
+                values = list(values[0])
+                destination["allowed_values"] = values
+            for parameter in destination.get("parameters", []) or []:
+                parameter = str(parameter)
+                expected = _schema_field_type(metadata, parameter)
+                item_type = _schema_field_item_type(metadata, parameter)
+                if expected in {"array", "list"}:
+                    if item_type and any(
+                        not _value_matches_schema_type(
+                            item,
+                            item_type,
+                        )
+                        for item in values
+                    ):
+                        errors.append(
+                            "parameter_item_type_invalid:"
+                            f"{action_name}:{parameter}:{values!r}:"
+                            f"expected_items={item_type}"
+                        )
+                else:
+                    errors.extend(
+                        error
+                        for value in values
+                        if (error := validate_value(parameter, value))
+                    )
+        bindings = flow.get("parameter_bindings")
+        if isinstance(bindings, dict):
+            for parameter, binding in bindings.items():
+                if (
+                    not isinstance(binding, dict)
+                    or str(binding.get("mode", "")).lower()
+                    != "literal"
+                ):
+                    continue
+                literal_value = _literal_binding_value(binding)
+                if literal_value is None:
+                    continue
+                error = validate_value(str(parameter), literal_value)
+                if error:
+                    errors.append(error)
+                    continue
+                expected = _schema_field_type(
+                    metadata,
+                    str(parameter),
+                )
+                if (
+                    expected in {"array", "list"}
+                    and not isinstance(literal_value, list | tuple)
+                ):
+                    binding["value"] = [literal_value]
+    return list(dict.fromkeys(errors))
+
+
+def _complete_resource_parameter_explanations(
+    contract: Mapping[str, Any] | None,
+    action: Mapping[str, Any],
+) -> None:
+    """Fill display-only selector explanations from plan-authored text."""
+    if not isinstance(contract, dict):
+        return
+    parameters = contract.get("resource_parameters")
+    if not isinstance(parameters, dict):
+        return
+    fallback = str(
+        action.get("authorization_evidence")
+        or action.get("purpose")
+        or ""
+    ).strip()
+    for raw_rule in parameters.values():
+        if not isinstance(raw_rule, dict):
+            continue
+        if not str(raw_rule.get("explanation", "") or "").strip():
+            raw_rule["explanation"] = fallback
 
 
 def _trusted_runtime_identity_value(
@@ -2259,6 +2657,382 @@ def _resource_semantic_types(
         if semantic_type:
             result[name] = semantic_type
     return result
+
+
+def _raise_cross_source_analysis_exposure(
+    steps: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Expose compared text sources at the sensitivity needed for analysis."""
+    warnings: list[str] = []
+    read_actions = [
+        action
+        for step in steps
+        if isinstance(step, Mapping)
+        for action in step.get("actions", [])
+        if isinstance(action, dict)
+        and str(action.get("effect", "")) == "read"
+    ]
+    analysis_kinds = {"summary", "selection", "calculation"}
+    for step in steps:
+        if not isinstance(step, Mapping):
+            continue
+        for egress in step.get("actions", []):
+            if (
+                not isinstance(egress, Mapping)
+                or str(egress.get("effect", "")) != "egress"
+            ):
+                continue
+            contract = egress.get("flow_contract")
+            bindings = (
+                contract.get("parameter_bindings", {})
+                if isinstance(contract, Mapping)
+                else {}
+            )
+            if not isinstance(bindings, Mapping):
+                continue
+            for parameter, binding in bindings.items():
+                if (
+                    not isinstance(binding, Mapping)
+                    or str(binding.get("generation_kind", ""))
+                    not in analysis_kinds
+                ):
+                    continue
+                refs: dict[tuple[str, str, str, str], Mapping[str, Any]] = {}
+                required_refs = list(
+                    binding.get("required_source_refs", []) or []
+                )
+                # Older v4 plans may omit required refs when every allowed
+                # source was mandatory. Preserve that compatibility without
+                # treating optional alternatives as analysis dependencies.
+                source_refs_to_check = (
+                    required_refs
+                    or list(
+                        binding.get(
+                            "allowed_source_refs",
+                            [],
+                        )
+                        or []
+                    )
+                )
+                for ref in source_refs_to_check:
+                    if not isinstance(ref, Mapping):
+                        continue
+                    identity = (
+                        str(ref.get("app", "")).lower(),
+                        canonical_entity_name(
+                            str(ref.get("app", "")),
+                            str(ref.get("entity", "")),
+                        ),
+                        base_tool_name(
+                            str(ref.get("source_action", ""))
+                        ),
+                        normalize_source_path(
+                            str(ref.get("source_path", ""))
+                        ),
+                    )
+                    if all(identity):
+                        refs[identity] = ref
+                if not refs:
+                    continue
+                ref_levels = {
+                    identity: field_level(
+                        identity[0],
+                        identity[1],
+                        identity[3],
+                    )
+                    for identity in refs
+                }
+                required_level = max(
+                    ref_levels.values(),
+                    key=lambda item: CONFIDENTIALITY_LEVELS.get(item, 3),
+                    default="internal",
+                )
+                for source_action in read_actions:
+                    access = source_action.get("data_access")
+                    if (
+                        not isinstance(access, dict)
+                        or not bool(access.get("content_detection", True))
+                    ):
+                        continue
+                    app = str(access.get("app", "") or "").lower()
+                    action_tool = base_tool_name(
+                        str(source_action.get("name", ""))
+                    )
+                    matching_levels = [
+                        level
+                        for identity, level in ref_levels.items()
+                        if identity[0] == app
+                        and identity[2] == action_tool
+                    ]
+                    if not matching_levels:
+                        continue
+                    source_entity = str(
+                        access.get("entity", "") or ""
+                    ).strip()
+                    if not source_entity:
+                        continue
+                    source_level = max(
+                        matching_levels,
+                        key=lambda item: CONFIDENTIALITY_LEVELS.get(
+                            item,
+                            3,
+                        ),
+                    )
+                    if CONFIDENTIALITY_LEVELS.get(source_level, 3) < (
+                        CONFIDENTIALITY_LEVELS["confidential"]
+                    ):
+                        continue
+                    projection = access.get("projection")
+                    visible_paths = (
+                        list(projection.get("visible_fields", []))
+                        if isinstance(projection, dict)
+                        else list(access.get("visible_fields", []))
+                    )
+                    for candidate_path in access.get(
+                        "schema_paths",
+                        [],
+                    ):
+                        candidate_path = normalize_source_path(
+                            str(candidate_path)
+                        )
+                        if (
+                            candidate_path in {"", "$", "$[*]"}
+                            or candidate_path in visible_paths
+                            or CONFIDENTIALITY_LEVELS.get(
+                                field_level(
+                                    app,
+                                    source_entity,
+                                    candidate_path,
+                                ),
+                                3,
+                            )
+                            > CONFIDENTIALITY_LEVELS["internal"]
+                        ):
+                            continue
+                        visible_paths.append(candidate_path)
+                    if isinstance(projection, dict):
+                        projection["visible_fields"] = list(
+                            dict.fromkeys(visible_paths)
+                        )
+                    access["visible_fields"] = list(
+                        dict.fromkeys(visible_paths)
+                    )
+                    access["requested_visible_fields"] = list(
+                        dict.fromkeys(
+                            [
+                                *access.get(
+                                    "requested_visible_fields",
+                                    [],
+                                ),
+                                *visible_paths,
+                            ]
+                        )
+                    )
+                    matching_analysis_paths = sorted(
+                        {
+                            normalize_source_path(identity[3])
+                            for identity in refs
+                            if identity[0] == app
+                            and identity[2] == action_tool
+                        }
+                    )
+                    if matching_analysis_paths:
+                        access["analysis_fields"] = list(
+                            dict.fromkeys(
+                                [
+                                    *access.get(
+                                        "analysis_fields",
+                                        [],
+                                    ),
+                                    *matching_analysis_paths,
+                                ]
+                            )
+                        )
+                    exposures = access.get("exposure_modes")
+                    if not isinstance(exposures, dict):
+                        exposures = {}
+                        access["exposure_modes"] = exposures
+                    exposures["inspect"] = list(
+                        dict.fromkeys(
+                            [
+                                *exposures.get("inspect", []),
+                                *visible_paths,
+                            ]
+                        )
+                    )
+                    exposures["analysis"] = list(
+                        dict.fromkeys(
+                            [
+                                *exposures.get(
+                                    "analysis",
+                                    [],
+                                ),
+                                *matching_analysis_paths,
+                            ]
+                        )
+                    )
+                    allowed_refs = list(
+                        binding.get("allowed_source_refs", [])
+                    )
+                    for path in visible_paths:
+                        ref = {
+                            "app": app,
+                            "entity": source_entity,
+                            "source_action": str(
+                                source_action.get("name", "")
+                            ),
+                            "source_path": normalize_source_path(path),
+                        }
+                        if not any(
+                            isinstance(existing, Mapping)
+                            and source_refs_match(existing, ref)
+                            for existing in allowed_refs
+                        ):
+                            allowed_refs.append(ref)
+                        refs[
+                            (
+                                app,
+                                canonical_entity_name(
+                                    app,
+                                    source_entity,
+                                ),
+                                action_tool,
+                                normalize_source_path(path),
+                            )
+                        ] = ref
+                    if isinstance(binding, dict):
+                        binding["allowed_source_refs"] = allowed_refs
+                        binding["allowed_source_paths"] = sorted(
+                            {
+                                normalize_source_path(
+                                    str(item.get("source_path", ""))
+                                )
+                                for item in allowed_refs
+                                if isinstance(item, Mapping)
+                                and str(item.get("source_path", "")).strip()
+                            }
+                        )
+                    current = str(
+                        access.get("max_exposure_level", "internal")
+                    )
+                    if CONFIDENTIALITY_LEVELS.get(required_level, 3) <= (
+                        CONFIDENTIALITY_LEVELS.get(current, 0)
+                    ):
+                        continue
+                    access["max_exposure_level"] = required_level
+                    access["exposure_limit_auto_raised"] = True
+                    access["requires_exposure_authorization"] = True
+                    warnings.append(
+                        "cross_source_analysis_exposure_raised:"
+                        f"{egress.get('name', '')}:{parameter}:"
+                        f"{source_action.get('name', '')}:"
+                        f"{current}->{required_level}"
+                    )
+    return warnings
+
+
+def _restrict_analysis_fields_to_reasoning_sources(
+    steps: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Remove analysis exposure from fields used only for direct transport."""
+    warnings: list[str] = []
+    analysis_kinds = {"summary", "selection", "calculation"}
+    has_egress = any(
+        isinstance(action, Mapping)
+        and str(action.get("effect", "")) == "egress"
+        for step in steps
+        if isinstance(step, Mapping)
+        for action in step.get("actions", [])
+    )
+    if not has_egress:
+        return warnings
+
+    transport_refs: set[tuple[str, str, str]] = set()
+    for step in steps:
+        if not isinstance(step, Mapping):
+            continue
+        for action in step.get("actions", []):
+            if (
+                not isinstance(action, Mapping)
+                or str(action.get("effect", "")) != "egress"
+            ):
+                continue
+            contract = action.get("flow_contract")
+            bindings = (
+                contract.get("parameter_bindings", {})
+                if isinstance(contract, Mapping)
+                else {}
+            )
+            if not isinstance(bindings, Mapping):
+                continue
+            for binding in bindings.values():
+                if not isinstance(binding, Mapping):
+                    continue
+                generation_kind = str(
+                    binding.get("generation_kind", "")
+                ).lower()
+                if generation_kind in analysis_kinds:
+                    continue
+                allowed_refs = binding.get(
+                    "allowed_source_refs",
+                    [],
+                ) or []
+                for ref in allowed_refs:
+                    if not isinstance(ref, Mapping):
+                        continue
+                    app = str(ref.get("app", "")).lower()
+                    tool = base_tool_name(
+                        str(ref.get("source_action", ""))
+                    )
+                    path = normalize_data_path(
+                        str(ref.get("source_path", ""))
+                    )
+                    if app and tool and path:
+                        transport_refs.add((app, tool, path))
+
+    for step in steps:
+        if not isinstance(step, Mapping):
+            continue
+        for action in step.get("actions", []):
+            if (
+                not isinstance(action, Mapping)
+                or str(action.get("effect", "")) != "read"
+            ):
+                continue
+            access = action.get("data_access")
+            if not isinstance(access, dict):
+                continue
+            analysis_fields = list(
+                access.get("analysis_fields", [])
+            )
+            if not analysis_fields:
+                continue
+            app = str(access.get("app", "")).lower()
+            tool = base_tool_name(str(action.get("name", "")))
+            retained: list[str] = []
+            removed: list[str] = []
+            for path in analysis_fields:
+                key = (
+                    app,
+                    tool,
+                    normalize_data_path(path),
+                )
+                if (
+                    key not in transport_refs
+                ):
+                    retained.append(path)
+                else:
+                    removed.append(path)
+            if removed:
+                access["analysis_fields"] = retained
+                exposure_modes = access.get("exposure_modes")
+                if isinstance(exposure_modes, dict):
+                    exposure_modes["analysis"] = list(retained)
+                warnings.append(
+                    "analysis_fields_removed_for_transport_only:"
+                    f"{tool}:{removed}"
+                )
+    return warnings
 
 
 def _literal_binding_value(raw_binding: Mapping[str, Any]) -> Any:
@@ -4711,19 +5485,6 @@ def _validate_task_plan(
                             trusted_identity_values,
                         )
                     )
-                resource_grounding_errors = _resource_authorization_errors(
-                    raw_data_access,
-                    prompt_text=prompt_text,
-                    trusted_identity_values=trusted_identity_values,
-                    action_name=str(action.get("name", "")),
-                    contract_kind="resource",
-                )
-                warnings.extend(resource_grounding_errors)
-                mark_action_invalid(
-                    action,
-                    step_id=str(step.get("id", "")),
-                    reasons=resource_grounding_errors,
-                )
                 compiled_access, access_warnings = compile_data_access(
                     raw_data_access,
                     action_name=str(action.get("name", "")),
@@ -4744,7 +5505,31 @@ def _validate_task_plan(
                             set(),
                         )
                     ),
-                    resource_fields=(metadata.get("resource_fields", []) if action.get("effect") == "read" else ()),
+                    resource_fields=(
+                        tuple(
+                            dict.fromkeys(
+                                [
+                                    *(
+                                        metadata.get(
+                                            "resource_fields",
+                                            [],
+                                        )
+                                        if action.get("effect") == "read"
+                                        else ()
+                                    ),
+                                    *(
+                                        sorted(
+                                            _required_schema_fields(
+                                                metadata
+                                            )
+                                        )
+                                        if action.get("effect") == "read"
+                                        else ()
+                                    ),
+                                ]
+                            )
+                        )
+                    ),
                     input_fields=_top_level_schema_fields(metadata),
                     allowed_output_fields=metadata.get(
                         "output_entity_fields",
@@ -4763,6 +5548,28 @@ def _validate_task_plan(
                     resource_semantic_types=(_resource_semantic_types(metadata)),
                 )
                 warnings.extend(access_warnings)
+                _complete_resource_parameter_explanations(
+                    compiled_access,
+                    action,
+                )
+                resource_type_errors = (
+                    _resource_parameter_type_errors(
+                        compiled_access,
+                        metadata,
+                        action_name=str(action.get("name", "")),
+                    )
+                )
+                warnings.extend(resource_type_errors)
+                mark_action_invalid(
+                    action,
+                    step_id=str(step.get("id", "")),
+                    reasons=resource_type_errors,
+                )
+                if resource_type_errors and isinstance(
+                    compiled_access,
+                    dict,
+                ):
+                    compiled_access["valid"] = False
                 access_group_errors = (
                     finalize_resource_source_groups(
                         compiled_access,
@@ -4805,19 +5612,6 @@ def _validate_task_plan(
                     tool_catalog,
                 )
                 warnings.extend(path_warnings)
-                resource_grounding_errors = _resource_authorization_errors(
-                    raw_resource_access,
-                    prompt_text=prompt_text,
-                    trusted_identity_values=trusted_identity_values,
-                    action_name=str(action.get("name", "")),
-                    contract_kind="resource_access",
-                )
-                warnings.extend(resource_grounding_errors)
-                mark_action_invalid(
-                    action,
-                    step_id=str(step.get("id", "")),
-                    reasons=resource_grounding_errors,
-                )
                 compiled_resource, resource_warnings = compile_resource_access(
                     raw_resource_access,
                     action_name=str(action.get("name", "")),
@@ -4826,6 +5620,28 @@ def _validate_task_plan(
                     resource_semantic_types=(_resource_semantic_types(metadata)),
                 )
                 warnings.extend(resource_warnings)
+                _complete_resource_parameter_explanations(
+                    compiled_resource,
+                    action,
+                )
+                resource_type_errors = (
+                    _resource_parameter_type_errors(
+                        compiled_resource,
+                        metadata,
+                        action_name=str(action.get("name", "")),
+                    )
+                )
+                warnings.extend(resource_type_errors)
+                mark_action_invalid(
+                    action,
+                    step_id=str(step.get("id", "")),
+                    reasons=resource_type_errors,
+                )
+                if resource_type_errors and isinstance(
+                    compiled_resource,
+                    dict,
+                ):
+                    compiled_resource["valid"] = False
                 resource_group_errors = (
                     finalize_resource_source_groups(
                         compiled_resource,
@@ -5623,6 +6439,22 @@ def _validate_task_plan(
                             "reason": reason,
                         }
                     )
+            parameter_type_errors = _plan_parameter_type_errors(
+                action,
+                metadata,
+            )
+            warnings.extend(parameter_type_errors)
+            mark_action_invalid(
+                action,
+                step_id=str(step.get("id", "")),
+                reasons=parameter_type_errors,
+            )
+    warnings.extend(
+        _raise_cross_source_analysis_exposure(steps)
+    )
+    warnings.extend(
+        _restrict_analysis_fields_to_reasoning_sources(steps)
+    )
     planned_actions = list(
         dict.fromkeys(
             str(action.get("name", ""))
@@ -7390,6 +8222,7 @@ Return JSON only:
               "max_exposure_level": "internal",
               "resource_parameters": {},
               "visible_fields": ["$.field_needed_for_the_existing_outcome"],
+              "analysis_fields": ["$.field_needed_for_comparison_or_calculation"],
               "opaque_fields": [],
               "hidden_fields": []
             },
@@ -7475,6 +8308,11 @@ Rules:
   inspect or compare, and opaque_fields for values that may be transported as
   controller references without being shown. A read may use opaque_fields
   without visible_fields when its values only need to flow onward.
+  If the actual value must be compared or calculated, also list that exact
+  field in analysis_fields; such fields expose real sensitive spans to the
+  Agent and create an explicit exposure warning. analysis_fields must be a
+  subset of visible_fields. Do not use analysis_fields for transport-only
+  values.
   When a resource selector such as file_id, file_path, event_id, channel, user
   or url is required, declare its literal or derived source authorization.
 - When a calculation must distinguish outgoing from incoming money,
@@ -7813,16 +8651,6 @@ def compile_runtime_plan_update(
                     catalog,
                 )
                 warnings.extend(path_warnings)
-                grounding_errors = _resource_authorization_errors(
-                    raw_data_access,
-                    prompt_text=runtime_prompt_text,
-                    trusted_identity_values=trusted_identity_values,
-                    action_name=tool_name,
-                    contract_kind="runtime_resource",
-                )
-                warnings.extend(grounding_errors)
-                if grounding_errors:
-                    continue
                 compiled_access, access_warnings = compile_data_access(
                     raw_data_access,
                     action_name=tool_name,
@@ -7845,6 +8673,20 @@ def compile_runtime_plan_update(
                     resource_semantic_types=(_resource_semantic_types(metadata)),
                 )
                 warnings.extend(access_warnings)
+                _complete_resource_parameter_explanations(
+                    compiled_access,
+                    raw_action,
+                )
+                resource_type_errors = (
+                    _resource_parameter_type_errors(
+                        compiled_access,
+                        metadata,
+                        action_name=tool_name,
+                    )
+                )
+                warnings.extend(resource_type_errors)
+                if resource_type_errors:
+                    continue
                 if compiled_access is None or not compiled_access.get(
                     "valid",
                     False,
@@ -7878,16 +8720,6 @@ def compile_runtime_plan_update(
                     catalog,
                 )
                 warnings.extend(path_warnings)
-                grounding_errors = _resource_authorization_errors(
-                    raw_resource_access,
-                    prompt_text=runtime_prompt_text,
-                    trusted_identity_values=trusted_identity_values,
-                    action_name=tool_name,
-                    contract_kind="runtime_resource_access",
-                )
-                warnings.extend(grounding_errors)
-                if grounding_errors:
-                    continue
                 compiled_resource, resource_warnings = compile_resource_access(
                     raw_resource_access,
                     action_name=tool_name,
@@ -7896,6 +8728,20 @@ def compile_runtime_plan_update(
                     resource_semantic_types=(_resource_semantic_types(metadata)),
                 )
                 warnings.extend(resource_warnings)
+                _complete_resource_parameter_explanations(
+                    compiled_resource,
+                    raw_action,
+                )
+                resource_type_errors = (
+                    _resource_parameter_type_errors(
+                        compiled_resource,
+                        metadata,
+                        action_name=tool_name,
+                    )
+                )
+                warnings.extend(resource_type_errors)
+                if resource_type_errors:
+                    continue
                 if compiled_resource is None or not compiled_resource.get("valid", False):
                     continue
             actions.append(
@@ -9038,6 +9884,53 @@ def compile_runtime_binding_sync(
     warnings: list[str] = []
     updates: list[dict[str, Any]] = []
 
+    def source_identity(value: Mapping[str, Any]) -> tuple[str, str, str]:
+        app = str(value.get("app", "") or "").lower()
+        return (
+            app,
+            canonical_entity_name(
+                app,
+                str(value.get("entity", "") or ""),
+            ),
+            tool_identity(
+                str(
+                    value.get("source_action")
+                    or value.get("source_tool")
+                    or ""
+                ),
+                app,
+            ),
+        )
+
+    runtime_step_ids: set[str] = set()
+    for update in updated.get("runtime_updates", []) or []:
+        if not isinstance(update, Mapping):
+            continue
+        if str(update.get("operation", "")) in {
+            "add_step",
+            "add_runtime_scope_step",
+            "add_runtime_step",
+        }:
+            runtime_step_ids.update(
+                str(item)
+                for item in (
+                    update.get("step_id"),
+                    *(
+                        update.get("step_ids", [])
+                        if isinstance(update.get("step_ids"), list)
+                        else []
+                    ),
+                )
+                if str(item or "").strip()
+            )
+    runtime_source_identities = {
+        source_identity(source)
+        for source in source_refs.values()
+        if isinstance(source, Mapping)
+        and str(source.get("producer_step", "") or "")
+        in runtime_step_ids
+    }
+
     event_by_activity: dict[str, dict[str, Any]] = {}
     event_order: dict[str, int] = {}
     for index, raw_event in enumerate(events):
@@ -9247,11 +10140,29 @@ def compile_runtime_binding_sync(
         target_step_id = str(target_step.get("id", ""))
         target_effect = str(target_action.get("effect", "") or "")
         metadata = catalog.get(requested_tool, {})
-        resource_fields = [
+        call_args = (
+            call.get("args", {})
+            if isinstance(call.get("args"), Mapping)
+            else {}
+        )
+        resource_fields = {
             str(item)
             for item in metadata.get("resource_fields", [])
             if str(item).strip()
-        ]
+        }
+        if target_effect == "read":
+            # Read filters and search selectors are ordinary schema inputs in
+            # many tools. Include every concrete input that already has an
+            # earlier tool-output origin so a runtime read cannot feed a
+            # downstream planned read without a matching plan binding.
+            resource_fields.update(
+                str(parameter)
+                for parameter, value in call_args.items()
+                if value not in (None, "", [], {})
+                and str(parameter)
+                in _top_level_schema_fields(metadata)
+            )
+        resource_fields = sorted(resource_fields)
         if not resource_fields:
             continue
         if target_effect == "read":
@@ -9265,11 +10176,6 @@ def compile_runtime_binding_sync(
             continue
         bindings = contract.get("resource_parameters")
         bindings = dict(bindings) if isinstance(bindings, Mapping) else {}
-        call_args = (
-            call.get("args", {})
-            if isinstance(call.get("args"), Mapping)
-            else {}
-        )
         changed_parameters: list[str] = []
         for parameter in resource_fields:
             parameter_values = flattened(call_args.get(parameter))
@@ -9304,6 +10210,7 @@ def compile_runtime_binding_sync(
             accepted: list[
                 tuple[Any, str, str, str, str]
             ] = []
+            unresolved_values: list[Any] = []
             for value in parameter_values:
                 candidates: list[
                     tuple[int, Any, str, str, str, str]
@@ -9317,17 +10224,6 @@ def compile_runtime_binding_sync(
                             semantic_type,
                         ):
                             continue
-                    label = getattr(origin, "label", {})
-                    injection = (
-                        label.get("injection", {})
-                        if isinstance(label, Mapping)
-                        else {}
-                    )
-                    if isinstance(injection, Mapping) and (
-                        injection.get("source_flagged")
-                        or injection.get("risky_entities")
-                    ):
-                        continue
                     source_action = canonical_tool(
                         str(getattr(origin, "source_tool", "") or "")
                     )
@@ -9432,6 +10328,7 @@ def compile_runtime_binding_sync(
                         )
                     )
                 if not candidates:
+                    unresolved_values.append(value)
                     continue
                 candidates.sort(
                     key=lambda item: item[0],
@@ -9452,7 +10349,14 @@ def compile_runtime_binding_sync(
                         ),
                         base_tool_name(item[2]),
                         item[3],
-                        item[5],
+                        str(
+                            getattr(
+                                item[1],
+                                "source_activity_id",
+                                "",
+                            )
+                            or ""
+                        ),
                     )
                     for item in latest
                 }
@@ -9463,9 +10367,222 @@ def compile_runtime_binding_sync(
                         f"{value_key(value)}"
                     )
                     continue
-                accepted.append(latest[0][1:])
+                accepted.extend(item[1:] for item in latest)
+            if not accepted and target_effect == "read":
+                composite_candidates: list[
+                    tuple[Any, str, str, str, str]
+                ] = []
+                for origin in value_origins:
+                    origin_value = getattr(
+                        origin,
+                        "value",
+                        None,
+                    )
+                    if not all(
+                        value_occurs_in_origin(
+                            value,
+                            origin,
+                            semantic_type,
+                        )
+                        for value in parameter_values
+                    ):
+                        continue
+                    source_action = canonical_tool(
+                        str(
+                            getattr(
+                                origin,
+                                "source_tool",
+                                "",
+                            )
+                            or ""
+                        )
+                    )
+                    if (
+                        not source_action
+                        or same_tool(
+                            source_action,
+                            requested_tool,
+                        )
+                    ):
+                        continue
+                    source_step_id = source_step_for_origin(
+                        origin,
+                        source_action,
+                    )
+                    if (
+                        not source_step_id
+                        or source_step_id == target_step_id
+                    ):
+                        continue
+                    source_event = event_by_activity.get(
+                        str(
+                            getattr(
+                                origin,
+                                "source_activity_id",
+                                "",
+                            )
+                            or ""
+                        ),
+                        {},
+                    )
+                    if (
+                        str(
+                            source_event.get("status", "")
+                            or ""
+                        ).lower()
+                        in {"blocked", "error", "failed"}
+                        or source_event.get("error")
+                    ):
+                        continue
+                    source_metadata = catalog.get(
+                        source_action,
+                        {},
+                    )
+                    source_suite = str(
+                        source_metadata.get("suite", "")
+                        or ""
+                    ).lower()
+                    source_entity = canonical_entity_name(
+                        source_suite,
+                        str(
+                            getattr(
+                                origin,
+                                "entity",
+                                "",
+                            )
+                            or ""
+                        ),
+                    )
+                    if (
+                        not source_suite
+                        or not source_entity
+                        or not has_entity(
+                            source_suite,
+                            source_entity,
+                        )
+                    ):
+                        continue
+                    source_path = _canonicalize_source_path(
+                        str(
+                            getattr(
+                                origin,
+                                "source_path",
+                                "",
+                            )
+                            or "$"
+                        ),
+                        (
+                            source_metadata.get(
+                                "output_schema"
+                            )
+                            if isinstance(
+                                source_metadata.get(
+                                    "output_schema"
+                                ),
+                                Mapping,
+                            )
+                            else None
+                        ),
+                    )
+                    if not source_path:
+                        source_path = "$"
+                    composite_candidates.append(
+                        (
+                            origin,
+                            source_action,
+                            source_step_id,
+                            source_suite,
+                            source_path,
+                        )
+                    )
+                composite_instances = {
+                    (
+                        item[0].app.lower(),
+                        canonical_entity_name(
+                            item[0].app,
+                            item[0].entity,
+                        ),
+                        base_tool_name(item[1]),
+                        str(
+                            getattr(
+                                item[0],
+                                "source_activity_id",
+                                "",
+                            )
+                            or ""
+                        ),
+                    )
+                    for item in composite_candidates
+                }
+                if len(composite_instances) == 1:
+                    accepted.append(composite_candidates[0])
             if not accepted:
+                runtime_origin_present = False
+                for value in parameter_values:
+                    for origin in value_origins:
+                        origin_value = getattr(origin, "value", None)
+                        if not (
+                            value_key(origin_value) == value_key(value)
+                            or value_occurs_in_origin(
+                                value,
+                                origin,
+                                semantic_type,
+                            )
+                        ):
+                            continue
+                        origin_identity = source_identity(
+                            {
+                                "app": getattr(origin, "app", ""),
+                                "entity": getattr(
+                                    origin,
+                                    "entity",
+                                    "",
+                                ),
+                                "source_action": getattr(
+                                    origin,
+                                    "source_tool",
+                                    "",
+                                ),
+                            }
+                        )
+                        if (
+                            origin_identity
+                            in runtime_source_identities
+                        ):
+                            runtime_origin_present = True
+                            break
+                    if runtime_origin_present:
+                        break
+                if runtime_origin_present:
+                    warnings.append(
+                        "runtime_binding_unresolved:"
+                        f"{requested_tool}:{parameter}"
+                    )
                 continue
+            truly_unresolved = [
+                value
+                for value in unresolved_values
+                if not any(
+                    value_occurs_in_origin(
+                        value,
+                        item[0],
+                        semantic_type,
+                    )
+                    for item in accepted
+                )
+            ]
+            if truly_unresolved:
+                warnings.append(
+                    "runtime_binding_unresolved:"
+                    f"{requested_tool}:{parameter}"
+                )
+                continue
+            if unresolved_values:
+                warnings.append(
+                    "runtime_binding_partial_source_coverage:"
+                    f"{requested_tool}:{parameter}:"
+                    f"{len(unresolved_values)}"
+                )
             if str(existing_binding.get("mode", "")).lower() != "derived":
                 existing_binding = {
                     "mode": "derived",
@@ -11015,15 +12132,11 @@ def generate_task_data_plan(
             )
         )
         raw_plan = parse_plan_json(planner(request))
-        # Contract edges are keyed by stable task step IDs. Align
-        # unambiguous model step IDs before filling contract-derived flows.
+        # Align unambiguous model step IDs with stable task step IDs.
+        # Data-flow bindings must be authored by the plan itself; they are
+        # not synthesized from a pre-authored edge template.
         align_plan_step_ids(
             raw_plan,
-            execution_contract,
-        )
-        _complete_egress_contract_from_edges(
-            raw_plan,
-            available_tools or [],
             execution_contract,
         )
         plan = _validate_task_plan(
@@ -11074,6 +12187,10 @@ def generate_task_data_plan(
                     {
                         "rejected_plan": raw_plan,
                         "warnings": plan.get("warnings", []),
+                        "input_contracts": _plan_input_contract_report(
+                            plan,
+                            available_tools,
+                        ),
                         "repair_rules": [
                             ("Return one complete corrected plan, not a partial patch."),
                             (
@@ -11124,11 +12241,6 @@ def generate_task_data_plan(
                                 "of '$'."
                             ),
                             (
-                                "Cover every expected_flow_edges entry from "
-                                "execution_contract with one of its declared "
-                                "legal source alternatives."
-                            ),
-                            (
                                 "Perform a best-effort completion pass for every "
                                 "optional input field. Bind it when its value is "
                                 "grounded in the trusted user instruction or an "
@@ -11140,6 +12252,17 @@ def generate_task_data_plan(
                                 "already known selectors, add that getter and bind "
                                 "the optional field. Omission must use the tool "
                                 "default and must not invalidate the plan."
+                            ),
+                            (
+                                "For every input_contracts entry, cover all "
+                                "missing_required_schema_fields and "
+                                "missing_resource_selector_fields. Use a literal "
+                                "rule when the trusted user instruction supplies "
+                                "the value, or a derived rule from an earlier "
+                                "planned output when the value is discovered at "
+                                "runtime. Fill missing_optional_schema_fields "
+                                "only when a trustworthy value is available; "
+                                "otherwise leave them to the tool default."
                             ),
                             (
                                 "Verification-only reads such as checking a "
@@ -11174,11 +12297,6 @@ def generate_task_data_plan(
                 repaired_raw,
                 execution_contract,
             )
-            _complete_egress_contract_from_edges(
-                repaired_raw,
-                available_tools or [],
-                execution_contract,
-            )
             repaired = _validate_task_plan(
                 repaired_raw,
                 str(prompt),
@@ -11198,6 +12316,116 @@ def generate_task_data_plan(
                 repaired,
                 execution_contract,
             )
+            structural_report = _plan_input_contract_report(
+                repaired,
+                available_tools,
+            )
+            structural_failures = [
+                item
+                for item in structural_report
+                if item.get("missing_required_schema_fields")
+                or item.get("missing_resource_selector_fields")
+                or item.get("resource_value_type_errors")
+                or item.get("parameter_value_type_errors")
+            ]
+            if (
+                structural_failures
+                and (
+                    not repaired.get("valid", False)
+                    or repaired.get("invalid_actions")
+                )
+            ):
+                focused_request = (
+                    TASK_DATA_PLAN_PROMPT
+                    + "\n\nSTRUCTURAL_PLAN_REPAIR:\n"
+                    + json.dumps(
+                        {
+                            "user_instruction": str(prompt),
+                            "rejected_plan": repaired_raw,
+                            "input_contracts": structural_failures,
+                            "repair_rules": [
+                                (
+                                    "Return one complete corrected plan."
+                                ),
+                                (
+                                    "Preserve the existing authorized "
+                                    "actions, destinations, APP scope and "
+                                    "required steps."
+                                ),
+                                (
+                                    "For every missing required schema "
+                                    "field and missing resource selector, "
+                                    "add the corresponding "
+                                    "data_access.resource_parameters or "
+                                    "resource_access.resource_parameters "
+                                    "rule."
+                                ),
+                                (
+                                    "Use a literal rule when the trusted "
+                                    "instruction or task goal supplies a "
+                                    "usable value. Otherwise use a derived "
+                                    "rule from an earlier planned source. "
+                                    "Do not omit a required field."
+                                ),
+                                (
+                                    "Correct every resource_value_type_errors "
+                                    "entry so each literal value matches the "
+                                    "declared input schema type."
+                                ),
+                                (
+                                    "Correct every parameter_value_type_errors "
+                                    "entry. Preserve the intended business "
+                                    "value while changing only its JSON type "
+                                    "or simple scalar-to-array container."
+                                ),
+                            ],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                )
+                focused_raw = parse_plan_json(
+                    planner(focused_request)
+                )
+                align_plan_step_ids(
+                    focused_raw,
+                    execution_contract,
+                )
+                focused = _validate_task_plan(
+                    focused_raw,
+                    str(prompt),
+                    available_tools,
+                    trusted_identity_values=trusted_identity_values,
+                    execution_contract=execution_contract,
+                )
+                focused_alignment_failures = align_plan_step_ids(
+                    focused,
+                    execution_contract,
+                )
+                if focused_alignment_failures:
+                    focused.setdefault("warnings", []).extend(
+                        focused_alignment_failures
+                    )
+                focused = _attach_execution_contract_identity(
+                    focused,
+                    execution_contract,
+                )
+                focused_contract_failures = validate_plan_against_contract(
+                    focused,
+                    execution_contract,
+                )
+                if (
+                    focused.get("valid", False)
+                    and not focused.get("invalid_actions")
+                    and not focused_contract_failures
+                ):
+                    repaired = focused
+                    repaired_raw = focused_raw
+                else:
+                    repaired.setdefault("warnings", []).append(
+                        "structural_plan_repair_still_invalid"
+                    )
             repaired_contract_failures = validate_plan_against_contract(
                 repaired,
                 execution_contract,

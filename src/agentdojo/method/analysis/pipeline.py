@@ -14,6 +14,7 @@ source of truth; risks are attached to the activity and rendered by the graph.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
 
 from ..modeling.data_sensitivity import tool_output_entity
@@ -48,9 +49,82 @@ from .risk_types import (
 )
 from .tool_output_scanner import (
     REDACTION_PLACEHOLDER,
-    quarantine_tool_output_fields,
     scan_tool_output,
 )
+
+
+_PATH_COMPONENT_RE = re.compile(
+    r"\[(\d+)\]|\.([A-Za-z0-9_]+)"
+)
+
+
+def _path_parts(path: str) -> list[str | int]:
+    if not str(path).startswith("$"):
+        return []
+    return [
+        int(index) if index else key
+        for index, key in _PATH_COMPONENT_RE.findall(str(path))
+    ]
+
+
+def _path_value(value: Any, path: str) -> Any:
+    current = value
+    for part in _path_parts(path):
+        if isinstance(part, int):
+            if not isinstance(current, list) or part >= len(current):
+                return None
+            current = current[part]
+        else:
+            if not isinstance(current, dict) or part not in current:
+                return None
+            current = current[part]
+    return current
+
+
+def _set_path_value(value: Any, path: str, replacement: Any) -> Any:
+    parts = _path_parts(path)
+    if not parts:
+        return copy.deepcopy(replacement)
+    result = copy.deepcopy(value)
+    current = result
+    for index, part in enumerate(parts):
+        final = index == len(parts) - 1
+        if isinstance(part, int):
+            if not isinstance(current, list) or part >= len(current):
+                return result
+            if final:
+                current[part] = copy.deepcopy(replacement)
+            else:
+                current = current[part]
+        else:
+            if not isinstance(current, dict) or part not in current:
+                return result
+            if final:
+                current[part] = copy.deepcopy(replacement)
+            else:
+                current = current[part]
+    return result
+
+
+def _apply_authorized_projected_redactions(
+    projected: Any,
+    projected_sanitized: Any,
+    projected_scan: Any,
+    authorized_paths: list[str],
+) -> Any:
+    """Apply only redactions belonging to raw-scan flagged fields."""
+    result = copy.deepcopy(projected)
+    for path in authorized_paths:
+        replacement = (
+            _path_value(projected_sanitized, path)
+            if projected_scan.field_statuses.get(path)
+            == "quarantined"
+            else None
+        )
+        if not isinstance(replacement, str):
+            replacement = REDACTION_PLACEHOLDER
+        result = _set_path_value(result, path, replacement)
+    return result
 
 
 def _skipped_diagnostics(ring: str, reason: str = "ring_disabled") -> dict:
@@ -557,19 +631,32 @@ def process_after_execution_with_details(
                 app=output_app,
                 entity=output_entity,
             )
-            if projected_scan.changed:
-                final_result = projected_scan.sanitized_value
-            else:
-                # The raw scan is authoritative. If projection changes the
-                # path shape enough for the second scan to miss, quarantine
-                # every field identified by the raw scan instead of silently
-                # returning potentially unsafe projected content.
-                final_result, field_quarantined = (
-                    quarantine_tool_output_fields(
-                        result,
-                        scan.quarantined_fields,
-                    )
-                )
-                if not field_quarantined:
-                    final_result = REDACTION_PLACEHOLDER
+            # The raw scan is authoritative for the set of contaminated
+            # fields. The projected scan only remaps redactions after Ring 2
+            # changes string offsets; fields first introduced by the projected
+            # scan are diagnostics, not new quarantine decisions.
+            authorized_paths = list(scan.quarantined_fields)
+            projected_extra_paths = sorted(
+                set(projected_scan.quarantined_fields)
+                - set(authorized_paths)
+            )
+            projected_payload = projected_scan.to_dict()
+            projected_payload[
+                "authoritative_raw_fields"
+            ] = authorized_paths
+            projected_payload[
+                "ignored_projected_quarantined_fields"
+            ] = projected_extra_paths
+            diagnostics["ring_1"][
+                "projected_scan"
+            ] = projected_payload
+            event_complete["projected_injection_scan"] = (
+                projected_payload
+            )
+            final_result = _apply_authorized_projected_redactions(
+                result,
+                projected_scan.sanitized_value,
+                projected_scan,
+                authorized_paths,
+            )
     return final_result, diagnostics

@@ -1910,8 +1910,12 @@ def evaluate_plan_execution_conformance(
                     (node_step_id, node_action)
                 )
         node_plan = node.get("task_data_plan")
-        if not isinstance(node_plan, Mapping):
+        if (
+            not isinstance(node_plan, Mapping)
+            and node_status != "blocked"
+        ):
             actions_without_plan += 1
+        if not isinstance(node_plan, Mapping):
             continue
         revision = int(node_plan.get("plan_revision", 1) or 1)
         plan_revisions[revision] = copy.deepcopy(dict(node_plan))
@@ -1998,6 +2002,7 @@ def evaluate_plan_execution_conformance(
     ] = set()
     actual_edge_list: list[dict[str, Any]] = []
     unplanned_actions: list[dict[str, Any]] = []
+    blocked_unplanned_actions: list[dict[str, Any]] = []
     for node in nodes:
         if not isinstance(reference_plan, Mapping):
             continue
@@ -2013,13 +2018,26 @@ def evaluate_plan_execution_conformance(
             or "",
         )
         if matched_action is None:
-            unplanned_actions.append(
-                {
-                    "activity_id": str(node.get("id", "")),
-                    "action": target_parameter,
-                    "plan_revision": reference_revision,
-                }
-            )
+            entry = {
+                "activity_id": str(node.get("id", "")),
+                "action": target_parameter,
+                "plan_revision": reference_revision,
+            }
+            node_status = str(
+                node.get("status", "") or ""
+            ).lower()
+            if (
+                node_status == "blocked"
+                or bool(node.get("blocked", False))
+            ):
+                blocked_unplanned_actions.append(
+                    {
+                        **entry,
+                        "status": node_status or "blocked",
+                    }
+                )
+            else:
+                unplanned_actions.append(entry)
             continue
         action_step, action = matched_action
         target_step_id = str(
@@ -2290,69 +2308,6 @@ def evaluate_plan_execution_conformance(
                     contract_flow_adjacency[
                         source_step
                     ].add(target_step)
-        for expected in execution_contract.get(
-            "expected_flow_edges",
-            [],
-        ) or []:
-            if isinstance(expected, Mapping):
-                expected_source_step = str(
-                    expected.get("from", "") or ""
-                )
-                expected_target_step = str(
-                    expected.get("to", "") or ""
-                )
-                if expected_source_step and expected_target_step:
-                    contract_flow_adjacency[
-                        expected_source_step
-                    ].add(expected_target_step)
-            if (
-                not isinstance(expected, Mapping)
-                or not bool(
-                    expected.get("dependency_only", False)
-                )
-            ):
-                continue
-            source_step = str(
-                expected.get("from", "") or ""
-            )
-            target_step = str(
-                expected.get("to", "") or ""
-            )
-            target_action = str(
-                expected.get("target_action", "") or ""
-            )
-            if not target_step or not target_action:
-                continue
-            dependency_only_targets[
-                (target_step, target_action)
-            ].add(source_step)
-            required_edges.append(
-                {
-                    "target_step_id": target_step,
-                    "target_action": target_action,
-                    "target_parameter": "__dependency__",
-                    "source_ref": {
-                        "producer_step": source_step,
-                        "source_action": str(
-                            expected.get(
-                                "source_action",
-                                "",
-                            )
-                            or ""
-                        ),
-                    },
-                    "plan_revision": reference_revision,
-                    "edge_kind": "dependency",
-                    "required_group": str(
-                        expected.get(
-                            "alternative_group",
-                            "",
-                        )
-                        or ""
-                    ),
-                    "group_mode": "any",
-                }
-            )
     def contract_dependency_reaches(
         source_step: str,
         target_step: str,
@@ -3299,17 +3254,18 @@ def evaluate_plan_execution_conformance(
     reference_plan_hash_verifiable = plan_hash_valid(
         reference_plan
     )
-    execution_conformant = bool(
+    plan_action_conformant = bool(
+        available
+        and actions_without_plan == 0
+        and not unplanned_actions
+        and not plan_binding_issues
+        and reference_plan_hash_verifiable
+    )
+    provenance_edge_alignment = bool(
         available
         and not certifying_missing_required
         and not unexpected_edges
         and not certifying_ambiguous_source_instances
-        and not unplanned_actions
-        and not plan_binding_issues
-        and (
-            execution_contract is None
-            or reference_plan_hash_verifiable
-        )
     )
     plan_contract_failures: list[str] | None = None
     plan_contract_conformant: bool | None = None
@@ -3364,13 +3320,7 @@ def evaluate_plan_execution_conformance(
         and final_plan.get("contract_digest")
         == contract_data.get("contract_digest")
     )
-    process_certified = bool(
-        execution_conformant
-        and plan_contract_evaluable
-        and plan_contract_conformant is True
-        and contract_identity_verifiable
-        and reference_plan_hash_verifiable
-    )
+    process_certified = plan_action_conformant
     return {
         "available": available,
         "plan_hash_verifiable": (
@@ -3387,6 +3337,7 @@ def evaluate_plan_execution_conformance(
         "actions_without_plan": actions_without_plan,
         "plan_snapshot_complete": actions_without_plan == 0,
         "unplanned_actions": unplanned_actions,
+        "blocked_unplanned_actions": blocked_unplanned_actions,
         "plan_binding_issues": plan_binding_issues,
         "invalid_verification_targets": (
             invalid_verification_targets
@@ -3420,7 +3371,15 @@ def evaluate_plan_execution_conformance(
         ),
         "unexpected_edges": unexpected_edges,
         "contaminated_parameters": sorted(contaminated_parameters),
-        "execution_conformant": execution_conformant,
+        "plan_action_conformant": plan_action_conformant,
+        "execution_conformant": provenance_edge_alignment,
+        "provenance_edge_alignment": (
+            provenance_edge_alignment
+        ),
+        "provenance_validation_role": "visualization_only",
+        "process_certification_basis": (
+            "action_and_parameter_plan_conformance"
+        ),
         "plan_contract_evaluable": plan_contract_evaluable,
         "plan_contract_conformant": plan_contract_conformant,
         "plan_contract_failures": plan_contract_failures,

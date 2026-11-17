@@ -13,8 +13,10 @@ from pathlib import Path
 DEFAULT_INJECTION_MODEL_ID = "Unplug-AI/unplug-tiny-v1"
 DEFAULT_INJECTION_MODEL_DIRNAME = "unplug-tiny-v1"
 INJECTION_MODEL_PATH_ENV = "AGENTDOJO_PI_MODEL_PATH"
-DIRECT_INJECTION_MODEL_ID = "deberta-v3-base-prompt-injection-v2"
-DIRECT_INJECTION_MODEL_DIRNAME = "deberta-v3-base-prompt-injection-v2"
+DIRECT_INJECTION_MODEL_ID = (
+    "Horizon-Labs/prompt-injection-guard-small"
+)
+DIRECT_INJECTION_MODEL_DIRNAME = "prompt-injection-guard-small"
 DIRECT_INJECTION_MODEL_PATH_ENV = "AGENTDOJO_DIRECT_PI_MODEL_PATH"
 FALLBACK_INJECTION_MODEL_ID = (
     "Horizon-Labs/prompt-injection-guard-small"

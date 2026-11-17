@@ -1170,6 +1170,9 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
             "outstanding shares",
             "outstanding amount",
             "still to be paid",
+            "still need to pay",
+            "still needs to pay",
+            "need to pay",
             "still owe",
             "still owes",
             "amount owed",
@@ -1179,6 +1182,8 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
             "please pay",
             "pay your share",
             "send your share",
+            "send your payment",
+            "please send payment",
         ]
         account_message_templates = (
             "For transfers, I use {iban}.",

@@ -101,19 +101,8 @@ def align_plan_step_ids(
         str,
         list[Mapping[str, Any]],
     ] = defaultdict(list)
-    for edge in execution_contract.get(
-        "expected_flow_edges",
-        [],
-    ) or []:
-        if not isinstance(edge, Mapping):
-            continue
-        target_step = str(
-            edge.get("to")
-            or edge.get("target_step")
-            or ""
-        )
-        if target_step:
-            flow_edges_by_target[target_step].append(edge)
+    # Flow-edge templates are legacy display hints. Step alignment uses
+    # required step IDs and dependencies, not reference data edges.
 
     def group_flow_signature(
         step_id: str,
@@ -213,9 +202,15 @@ def align_plan_step_ids(
             group_flow_signature(step_id)
             for step_id in group_ids
         }
+        has_flow_signature = any(
+            bool(signature) for signature in signatures
+        )
         if (
             len(signatures) != 1
-            or not next(iter(signatures), ())
+            or (
+                has_flow_signature
+                and not next(iter(signatures), ())
+            )
         ):
             continue
         candidates = [

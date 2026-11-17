@@ -21,7 +21,7 @@ from ..modeling.policy import (
     tool_identity,
 )
 from .access_plan import parse_plan_json
-from .source_refs import source_refs_match
+from .source_refs import normalize_source_path, source_refs_match
 
 REQUIREMENT_STATUSES = {
     "verified",
@@ -96,6 +96,13 @@ Rules:
   by the proposed tool is sufficient evidence for destination identity. Do not
   mark it needs_data solely to prove friendship, contact-directory presence,
   shared-channel membership or some other social relationship.
+- controller_parameter_facts are controller-produced facts, not tool content or
+  a model claim. A fact with binding_status=resolved and value_verified=true
+  means the final proposed argument was resolved by the controller from the
+  listed provenance activity and path. Use that fact when judging a requirement
+  scoped to the same parameter; do not mark the requirement unverifiable merely
+  because the Agent-visible copy of the tool output contained a SENSITIVE_REF.
+  The fact intentionally omits the raw value and must not be used to reveal it.
 - Contact and channel-membership reads are relevant only when the instruction
   identifies the destination indirectly and a lookup is needed to obtain the
   tool-native identifier, or when the destination set is explicitly defined by
@@ -607,6 +614,114 @@ def _valid_read_recommendations(
     return result, warnings
 
 
+def _controller_parameter_facts(
+    parameter_resolutions: Sequence[Mapping[str, Any]],
+    proposed_args: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Describe controller-verified bindings without exposing raw values."""
+    facts: list[dict[str, Any]] = []
+    resolutions = {
+        str(item.get("parameter", "")): item
+        for item in parameter_resolutions
+        if isinstance(item, Mapping) and item.get("parameter")
+    }
+    for parameter, resolution in resolutions.items():
+        if parameter not in proposed_args:
+            continue
+        provenance_refs = [
+            {
+                "app": str(item.get("app", "") or ""),
+                "entity": str(item.get("entity", "") or ""),
+                "source_action": str(item.get("source_action", "") or ""),
+                "activity_id": str(
+                    item.get("activity_id")
+                    or item.get("source_activity_id")
+                    or ""
+                ),
+                "source_path": normalize_source_path(
+                    str(item.get("source_path", "") or "")
+                ),
+                "confidentiality": str(
+                    item.get("confidentiality", "") or ""
+                ),
+                "categories": [
+                    str(value)
+                    for value in item.get("categories", [])
+                    if str(value).strip()
+                ],
+            }
+            for item in resolution.get("provenance_refs", [])
+            if isinstance(item, Mapping)
+        ]
+        facts.append(
+            {
+                "parameter": parameter,
+                "binding_status": str(
+                    resolution.get("status", "") or ""
+                ),
+                "generation_kind": str(
+                    resolution.get("generation_kind", "") or ""
+                ),
+                "parameter_role": str(
+                    resolution.get("parameter_role", "") or ""
+                ),
+                "value_verified": bool(
+                    resolution.get("status") == "resolved"
+                    and int(
+                        resolution.get("unresolved_value_count", 0)
+                        or 0
+                    )
+                    == 0
+                    and int(
+                        resolution.get("ambiguous_value_count", 0)
+                        or 0
+                    )
+                    == 0
+                ),
+                "value_hash": str(
+                    resolution.get("value_hash", "") or ""
+                ),
+                "source_paths": sorted(
+                    {
+                        normalize_source_path(str(item))
+                        for item in resolution.get("source_paths", [])
+                        if str(item).strip()
+                    }
+                ),
+                "provenance_refs": provenance_refs,
+            }
+        )
+    return facts
+
+
+def _audit_visible_arguments(
+    proposed_args: Mapping[str, Any],
+    parameter_resolutions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Remove controller-resolved secret values from the auditor prompt."""
+    visible = copy.deepcopy(dict(proposed_args))
+    for resolution in parameter_resolutions:
+        if not isinstance(resolution, Mapping):
+            continue
+        parameter = str(resolution.get("parameter", "") or "")
+        if (
+            parameter in visible
+            and resolution.get("used_symbol") is True
+        ):
+            digest = hashlib.sha256(
+                json.dumps(
+                    visible[parameter],
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            visible[parameter] = (
+                f"[[CONTROLLER_VERIFIED_REF:{parameter}:{digest}]]"
+            )
+    return visible
+
+
 def _normalize_audit(
     raw: Mapping[str, Any],
     *,
@@ -900,6 +1015,7 @@ def _normalize_audit(
         for item in parameter_resolutions
         if isinstance(item, Mapping) and item.get("parameter")
     }
+
     sources_by_parameter: dict[str, list[Mapping[str, Any]]] = {}
     for item in argument_sources:
         if not isinstance(item, Mapping):
@@ -1021,15 +1137,23 @@ def _normalize_audit(
                 or int(resolution.get("ambiguous_value_count", 0) or 0) > 0
             ):
                 continue
+            provenance_refs = [
+                item
+                for item in resolution.get("provenance_refs", [])
+                if isinstance(item, Mapping)
+                and str(item.get("source_path", "") or "").strip()
+            ]
             source_refs = [
                 item
                 for item in resolution.get("source_refs", [])
                 if isinstance(item, Mapping) and str(item.get("source_path", "") or "").strip()
             ]
+            if not source_refs:
+                source_refs = provenance_refs
             evidence_sources = [
                 item
                 for item in sources_by_parameter.get(parameter, [])
-                if str(item.get("source_activity_id", "") or "") and str(item.get("source_path", "") or "").strip()
+                if str(item.get("source_path", "") or "").strip()
                 and str(item.get("source_activity_id", ""))
                 in complete_evidence_ids
             ]
@@ -1176,11 +1300,18 @@ def audit_requirements(
                 "current_plan": dict(plan),
                 "proposed_l2_call": {
                     "name": proposed_tool,
-                    "arguments": dict(proposed_args),
+                    "arguments": _audit_visible_arguments(
+                        proposed_args,
+                        parameter_resolutions,
+                    ),
                     "plan_step_id": plan_step_id,
                 },
                 "execution_evidence": execution_evidence,
                 "available_tools": _bounded_catalog(available_tools),
+                "controller_parameter_facts": _controller_parameter_facts(
+                    parameter_resolutions,
+                    proposed_args,
+                ),
             },
             ensure_ascii=False,
             indent=2,

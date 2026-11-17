@@ -13,6 +13,7 @@ from ..modeling.labels import make_injection
 from .data_access import SENSITIVE_REFERENCE_PATTERN
 from .injection_metrics import merge_quarantine_metrics
 from .injection_scanner import (
+    _INJECTION_CONTROL_MARKER_RE,
     INDIRECT_INJECTION_PLACEHOLDER,
     InjectionScanner,
     redact_injection_chunks_with_metrics,
@@ -258,7 +259,7 @@ def _expand_injection_spans(
         )
         if not closing_tag.search(text, match.end()):
             envelopes.append((match.start(), len(text)))
-    sentence_units: list[tuple[int, int]] = []
+    coarse_units: list[tuple[int, int]] = []
     sentence_start = 0
     for match in re.finditer(
         r"(?:[.!?](?=\s|$)|\u3002|\uff01|\uff1f|\r?\n)",
@@ -266,12 +267,26 @@ def _expand_injection_spans(
     ):
         sentence_end = match.end()
         if sentence_end > sentence_start:
-            sentence_units.append(
+            coarse_units.append(
                 (sentence_start, sentence_end)
             )
             sentence_start = sentence_end
     if sentence_start < len(text):
-        sentence_units.append((sentence_start, len(text)))
+        coarse_units.append((sentence_start, len(text)))
+    sentence_units: list[tuple[int, int]] = []
+    for unit_start, unit_end in coarse_units:
+        unit = text[unit_start:unit_end]
+        marker_positions = [
+            unit_start + match.start()
+            for match in _INJECTION_CONTROL_MARKER_RE.finditer(unit)
+        ]
+        cursor = unit_start
+        for marker_start in marker_positions:
+            if marker_start > cursor:
+                sentence_units.append((cursor, marker_start))
+            cursor = marker_start
+        if cursor < unit_end:
+            sentence_units.append((cursor, unit_end))
     expanded: list[dict[str, int | float]] = []
     for chunk in chunks:
         start = max(0, int(getattr(chunk, "start", 0) or 0))

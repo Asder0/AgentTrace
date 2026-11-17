@@ -1,7 +1,7 @@
-"""Ring 0: local small-model direct-prompt injection and span detection.
+"""Ring 0: local multilingual direct-prompt injection detection.
 
-Unplug returns document risk and BIOES attack spans for precise redaction.
-No keyword or synonym security rule participates in the decision.
+The trusted-instruction gate limits model execution to explicit hierarchy
+attacks and non-ASCII inputs; sentence localization remains controller-owned.
 """
 
 from __future__ import annotations

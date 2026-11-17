@@ -452,12 +452,7 @@ def check_task_scope(
             tool_name=tool_name,
             decision=DECISION_BLOCK,
         )
-    if not planned and effect == "read":
-        result.update(
-            planned=True,
-            runtime_read_scope_extension=True,
-        )
-    elif not planned:
+    if not planned:
         result.update(
             passed=False,
             reason="action_not_bound_to_task_scope",
@@ -470,13 +465,7 @@ def check_task_scope(
             decision=DECISION_BLOCK,
         )
 
-    if (
-        effect not in allowed_effects
-        and not (
-            effect == "read"
-            and result.get("runtime_read_scope_extension")
-        )
-    ):
+    if effect not in allowed_effects:
         result.update(
             passed=False,
             reason="effect_not_bound_to_task_scope",
@@ -612,6 +601,9 @@ def check_task_scope(
                     "protected_visible_fields",
                     [],
                 )
+            ),
+            "analysis_fields": list(
+                access.get("analysis_fields", [])
             ),
             "opaque_fields": list(access.get("opaque_fields", [])),
             "max_exposure_level": str(

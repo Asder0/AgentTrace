@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,12 @@ _ENGLISH_LABEL_GROUPS = [
         "government identifier",
     ],
 ]
+_IBAN_CANDIDATE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"[A-Z]{2}\d{2}(?:[ -]?[A-Z0-9]){10,30}"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,42 @@ class SensitiveEntity:
     start: int
     end: int
     score: float
+
+
+def _valid_iban(value: str) -> bool:
+    compact = re.sub(r"[^A-Za-z0-9]", "", value).upper()
+    if not 15 <= len(compact) <= 34:
+        return False
+    rearranged = compact[4:] + compact[:4]
+    try:
+        numeric = "".join(
+            str(int(character, 36))
+            for character in rearranged
+        )
+    except ValueError:
+        return False
+    return int(numeric) % 97 == 1
+
+
+def _detect_structured_identifiers(
+    text: str,
+) -> list[SensitiveEntity]:
+    """Detect identifiers with a public checksum independent of model inference."""
+    entities: list[SensitiveEntity] = []
+    for match in _IBAN_CANDIDATE_PATTERN.finditer(text):
+        value = match.group(0)
+        if not _valid_iban(value):
+            continue
+        entities.append(
+            SensitiveEntity(
+                category="iban",
+                text=value,
+                start=match.start(),
+                end=match.end(),
+                score=1.0,
+            )
+        )
+    return entities
 
 
 class GLiNERSensitivityDetector:
@@ -201,7 +244,17 @@ def elevate_policy_for_content(
     detector = _DEFAULT_DETECTOR
     if detector is None or not detector.enabled or not isinstance(value, str):
         return policy
-    entities = detector.detect(value)
+    model_entities = detector.detect(value)
+    structured_entities = _detect_structured_identifiers(value)
+    structured_spans = {
+        (item.start, item.end) for item in structured_entities
+    }
+    entities = [
+        item
+        for item in model_entities
+        if (item.start, item.end) not in structured_spans
+    ]
+    entities.extend(structured_entities)
     if not entities:
         return policy
     categories = sorted(
@@ -222,7 +275,11 @@ def elevate_policy_for_content(
         **policy,
         "level": required,
         "categories": categories,
-        "source": f"{policy.get('source', 'field_policy')}+gliner",
+        "source": (
+            f"{policy.get('source', 'field_policy')}"
+            f"+gliner"
+            f"{'+structured' if structured_entities else ''}"
+        ),
         "gliner_entities": [
             {
                 "category": item.category,

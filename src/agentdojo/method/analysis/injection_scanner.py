@@ -65,6 +65,20 @@ _EMAIL_IN_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _CONTROLLER_REFERENCE_RE = re.compile(r"\[\[(?:SENSITIVE_REF:.+?|DATA_REMOVED)\]\]")
+_INJECTION_CONTROL_MARKER_RE = re.compile(
+    r"(?i)(?<!\w)(?:"
+    r"###\s*\(\s*system_message\s*\)|"
+    r"handoff\s+note\s*:|"
+    r"important\s*!!!|"
+    r"<\s*(?:information|system|instructions|important)\b"
+    r")"
+)
+_STRUCTURED_LINE_RE = re.compile(
+    r"(?:^\s*(?:[-*•]|\d+[.)])\s+\S|"
+    r"^\s*#+\s+\S|"
+    r"\[[^\]\n]+:\s*[^\]\n]+\]|"
+    r"^[^:\n]{1,80}:\s+\S)"
+)
 _DIRECT_OVERRIDE_RE = re.compile(
     r"(?:<\s*(?:information|system|instructions|important)\b"
     r"|<\|\s*(?:im_start|im_end|system|assistant)\s*\|>"
@@ -76,6 +90,15 @@ _DIRECT_OVERRIDE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+def _is_structured_text_line(line: str) -> bool:
+    value = str(line or "").strip()
+    if not value:
+        return False
+    if _INJECTION_CONTROL_MARKER_RE.search(value):
+        return True
+    return bool(_STRUCTURED_LINE_RE.search(value))
 SECURITY_PLACEHOLDER_NOTICE = (
     "AgentTrace security notice: the marker "
     f"'{DIRECT_INJECTION_PLACEHOLDER}' is controller-generated "
@@ -385,6 +408,7 @@ class InjectionScanner:
             if (
                 self.trusted_instruction_mode
                 and not _DIRECT_OVERRIDE_RE.search(value)
+                and value.isascii()
             ):
                 results[index] = self._decorate_result(
                     InjectionScanResult(
@@ -747,7 +771,10 @@ class InjectionScanner:
         when it is suspicious. It is intentionally block-level detection and
         does not claim exact attack-span localisation.
         """
-        spans = self._semantic_unit_spans(value)
+        spans = self._semantic_unit_spans(
+            value,
+            structured_lines=False,
+        )
         if not spans:
             spans = [(0, len(value))]
         expanded: list[tuple[int, int]] = []
@@ -798,13 +825,15 @@ class InjectionScanner:
         value: str,
         covered_spans: Sequence[tuple[int, int]],
     ) -> tuple[list[InjectionChunk], bool]:
-        """Recursively expand a native span through fallback-positive units.
+        """Extend a native span through cumulative forward semantic windows.
 
-        The primary detector determines the initial span. The fallback
-        detector reviews only the immediately following semantic unit. A
-        positive neighbour joins the span and becomes the new frontier; the
-        expansion stops at the first negative neighbour and never walks
-        towards the previous sentence.
+        The primary detector determines the initial span. Within the same
+        paragraph, the fallback detector cumulatively groups following
+        sentences: first one sentence, then two consecutive sentences, and so
+        on until the current group reaches the fallback threshold. Detection
+        resumes after the matching sentence, allowing later malicious groups
+        to be found while preserving a genuinely clean trailing sentence.
+        Expansion never walks backwards or crosses a paragraph boundary.
         """
         if self.fallback_classifier is None or not covered_spans:
             return [], False
@@ -826,77 +855,114 @@ class InjectionScanner:
             )
 
         initial_indices: set[int] = set()
-        included_indices: set[int] = set()
-        visited_indices: set[int] = set()
-        frontier: set[int] = set()
         for covered in covered_spans:
             local_covered = {
                 index
                 for index, unit in enumerate(units)
                 if overlaps(unit, covered)
             }
-            included_indices.update(local_covered)
             initial_indices.update(local_covered)
-            visited_indices.update(local_covered)
-            frontier.update(local_covered)
-        if not frontier:
+        if not initial_indices:
             return [], False
 
-        scores_by_index: dict[int, float] = {}
-        while frontier:
-            candidates = sorted(
-                {
-                    neighbour
-                    for unit_index in frontier
-                    for neighbour in (unit_index + 1,)
-                    if 0 <= neighbour < len(units)
-                    and neighbour not in visited_indices
-                }
-            )
-            if not candidates:
-                break
-            visited_indices.update(candidates)
-            scores = self.fallback_classifier.classify_many(
-                [
-                    _mask_nonlinguistic_tokens(
-                        value[
-                            units[index][0] : units[index][1]
-                        ]
-                    )
-                    for index in candidates
-                ]
-            )
-            next_frontier: set[int] = set()
-            for unit_index, raw_score in zip(
-                candidates,
-                scores,
-                strict=True,
-            ):
-                score = min(
-                    1.0,
-                    max(0.0, float(raw_score or 0.0)),
+        def paragraph_break(
+            previous: tuple[int, int],
+            following: tuple[int, int],
+        ) -> bool:
+            gap = value[previous[1] : following[0]]
+            return bool(
+                re.search(
+                    r"(?:\r?\n)[ \t]*(?:\r?\n)",
+                    gap,
                 )
-                scores_by_index[unit_index] = score
-                if score >= self.fallback_threshold:
-                    included_indices.add(unit_index)
-                    next_frontier.add(unit_index)
-            frontier = next_frontier
+            )
 
-        expanded_indices = included_indices - initial_indices
-        chunks = [
-            InjectionChunk(
-                index=index,
-                start=units[unit_index][0],
-                end=units[unit_index][1],
-                score=scores_by_index[unit_index],
-                text=value[
-                    units[unit_index][0] : units[unit_index][1]
-                ],
+        chunks: list[InjectionChunk] = []
+        for covered in covered_spans:
+            local_covered = sorted(
+                index
+                for index, unit in enumerate(units)
+                if overlaps(unit, covered)
             )
-            for index, unit_index in enumerate(
-                sorted(expanded_indices)
-            )
-        ]
+            if not local_covered:
+                continue
+            first_index = local_covered[0]
+            last_index = local_covered[-1]
+            next_index = last_index + 1
+            if next_index >= len(units):
+                continue
+            if paragraph_break(
+                units[last_index],
+                units[next_index],
+            ):
+                continue
+
+            paragraph_last = next_index
+            for candidate_index in range(
+                next_index + 1,
+                len(units),
+            ):
+                if paragraph_break(
+                    units[candidate_index - 1],
+                    units[candidate_index],
+                ):
+                    break
+                paragraph_last = candidate_index
+
+            group_start = next_index
+            last_hit_index = -1
+            last_hit_score = 0.0
+            while group_start <= paragraph_last:
+                hit_index = -1
+                hit_score = 0.0
+                window_start = units[group_start][0]
+                for candidate_index in range(
+                    group_start,
+                    paragraph_last + 1,
+                ):
+                    window_end = units[candidate_index][1]
+                    text = _mask_nonlinguistic_tokens(
+                        value[window_start:window_end]
+                    )
+                    if hasattr(
+                        self.fallback_classifier,
+                        "classify",
+                    ):
+                        raw_score = self.fallback_classifier.classify(
+                            text
+                        )
+                    else:
+                        raw_score = (
+                            self.fallback_classifier.classify_many(
+                                [text]
+                            )[0]
+                        )
+                    score = min(
+                        1.0,
+                        max(0.0, float(raw_score or 0.0)),
+                    )
+                    if score >= self.fallback_threshold:
+                        hit_index = candidate_index
+                        hit_score = score
+                        break
+                if hit_index < 0:
+                    break
+                last_hit_index = hit_index
+                last_hit_score = max(last_hit_score, hit_score)
+                group_start = hit_index + 1
+
+            if last_hit_index >= 0:
+                start = units[first_index][0]
+                end = units[last_hit_index][1]
+                chunks.append(
+                    InjectionChunk(
+                        index=len(chunks),
+                        start=start,
+                        end=end,
+                        score=last_hit_score,
+                        text=value[start:end],
+                    )
+                )
         return (
             _merge_injection_chunks(chunks, value),
             True,
@@ -1015,9 +1081,14 @@ class InjectionScanner:
             spans.extend((unit_start + start, unit_start + end) for start, end in unit_spans)
         return spans or self._char_spans(text)
 
-    def _semantic_unit_spans(self, text: str) -> list[tuple[int, int]]:
+    def _semantic_unit_spans(
+        self,
+        text: str,
+        *,
+        structured_lines: bool = True,
+    ) -> list[tuple[int, int]]:
         """Split at sentence and paragraph boundaries before token slicing."""
-        units: list[tuple[int, int]] = []
+        coarse_units: list[tuple[int, int]] = []
         start = 0
         sentence_pattern = (
             r"(?:[.!?](?=\s|$)|\u3002|\uff01|\uff1f)"
@@ -1026,11 +1097,77 @@ class InjectionScanner:
         for match in re.finditer(sentence_pattern, text):
             end = match.end()
             if end > start:
-                units.append((start, end))
+                coarse_units.append((start, end))
                 start = end
         if start < len(text):
-            units.append((start, len(text)))
-        return [(start, end) for start, end in units if text[start:end].strip()]
+            coarse_units.append((start, len(text)))
+        if not structured_lines:
+            return [
+                (unit_start, unit_end)
+                for unit_start, unit_end in coarse_units
+                if text[unit_start:unit_end].strip()
+            ]
+
+        def append_trimmed(
+            units: list[tuple[int, int]],
+            start: int,
+            end: int,
+        ) -> None:
+            while start < end and text[start].isspace():
+                start += 1
+            while end > start and text[end - 1].isspace():
+                end -= 1
+            if end > start:
+                units.append((start, end))
+
+        units: list[tuple[int, int]] = []
+        for coarse_start, coarse_end in coarse_units:
+            segment = text[coarse_start:coarse_end]
+            physical_lines = segment.splitlines(keepends=True)
+            structured_lines = any(
+                _is_structured_text_line(line)
+                for line in physical_lines
+            )
+            line_ranges: list[tuple[int, int]] = []
+            if structured_lines and len(physical_lines) > 1:
+                cursor = coarse_start
+                for line in physical_lines:
+                    line_end = cursor + len(line)
+                    line_ranges.append(
+                        (
+                            cursor,
+                            line_end
+                            - (
+                                len(line)
+                                - len(line.rstrip("\r\n"))
+                            ),
+                        )
+                    )
+                    cursor = line_end
+            else:
+                line_ranges.append((coarse_start, coarse_end))
+
+            for line_start, line_end in line_ranges:
+                marker_positions = [
+                    line_start + match.start()
+                    for match in _INJECTION_CONTROL_MARKER_RE.finditer(
+                        text[line_start:line_end]
+                    )
+                ]
+                if not marker_positions:
+                    append_trimmed(units, line_start, line_end)
+                    continue
+                cursor = line_start
+                for marker_start in marker_positions:
+                    if marker_start > cursor:
+                        append_trimmed(
+                            units,
+                            cursor,
+                            marker_start,
+                        )
+                    cursor = marker_start
+                append_trimmed(units, cursor, line_end)
+        return units
 
     def _context_window_spans(
         self,
@@ -1255,7 +1392,7 @@ def get_injection_scanner() -> InjectionScanner:
 
 
 def get_direct_injection_scanner() -> InjectionScanner:
-    """Return the DeBERTa scanner used for trusted direct user instructions."""
+    """Return the guard-small scanner used for trusted direct instructions."""
     global _DIRECT_INJECTION_SCANNER
     if _DIRECT_INJECTION_SCANNER is None:
         with _DIRECT_INJECTION_SCANNER_LOCK:

@@ -352,6 +352,13 @@ def _compile_resource_parameters(
         resource_parameters[name] = {
             "mode": mode,
             "semantic_type": semantic_type,
+            "explanation": str(
+                raw_rule.get(
+                    "explanation",
+                    raw_rule.get("reason", ""),
+                )
+                or ""
+            ).strip(),
             "allowed_values": copy.deepcopy(allowed_values),
             "allowed_canonical_values": list(
                 dict.fromkeys(
@@ -404,6 +411,10 @@ def compile_data_access(
         raw.get("opaque_fields", []),
         output_schema,
     )
+    analysis = _mapping_paths(
+        raw.get("analysis_fields", []),
+        output_schema,
+    )
     known_paths = {normalize_data_path(path) for path in schema_paths(output_schema or {})}
     known_paths.update(normalize_data_path(path) for path in allowed_output_fields)
 
@@ -418,6 +429,7 @@ def compile_data_access(
         ("visible", visible),
         ("hidden", hidden),
         ("opaque", opaque),
+        ("analysis", analysis),
     ):
         invalid = [path for path in paths if known_paths and not known_path(path)]
         if invalid:
@@ -426,6 +438,7 @@ def compile_data_access(
     visible = [path for path in visible if path not in invalid_paths]
     hidden = [path for path in hidden if path not in invalid_paths]
     opaque = [path for path in opaque if path not in invalid_paths]
+    analysis = [path for path in analysis if path not in invalid_paths]
 
     transport_paths = {
         normalize_data_path(path)
@@ -504,6 +517,34 @@ def compile_data_access(
             "conflicting_field_exposure_modes:"
             f"{action_name}:{mode_conflicts}"
         )
+    normalized_visible = {
+        normalize_data_path(path) for path in visible
+    }
+    analysis_not_visible = sorted(
+        {
+            path
+            for path in analysis
+            if not any(
+                (
+                    normalize_data_path(path)
+                    == normalize_data_path(visible_path)
+                    or normalize_data_path(path).startswith(
+                        f"{normalize_data_path(visible_path)}."
+                    )
+                    or normalize_data_path(path).startswith(
+                        f"{normalize_data_path(visible_path)}["
+                    )
+                )
+                for visible_path in visible
+            )
+        }
+        - normalized_visible
+    )
+    if analysis_not_visible:
+        warnings.append(
+            "analysis_fields_not_visible:"
+            f"{action_name}:{analysis_not_visible}"
+        )
 
     resource_parameters, resource_warnings = _compile_resource_parameters(
         raw.get("resource_parameters", {}),
@@ -524,6 +565,7 @@ def compile_data_access(
         (bool(visible) or bool(opaque) or allow_empty_visible)
         and not invalid_paths
         and not mode_conflicts
+        and not analysis_not_visible
         and not unknown_resources
         and not resource_warnings
     )
@@ -536,6 +578,7 @@ def compile_data_access(
     if not visible and not opaque and not allow_empty_visible:
         warnings.append(f"data_access_without_visible_fields:{action_name}")
     max_exposure_level = str(raw.get("max_exposure_level", "internal")).lower()
+    planned_max_exposure_level = max_exposure_level
     if max_exposure_level not in CONFIDENTIALITY_LEVELS:
         warnings.append(f"invalid_max_exposure_level:{action_name}:{max_exposure_level}")
         max_exposure_level = "internal"
@@ -622,13 +665,37 @@ def compile_data_access(
         ):
             exceeding_fields.append(path)
     if exceeding_fields:
-        if allow_exposure_downgrade:
-            visible = [path for path in visible if path not in exceeding_fields]
-            hidden = list(dict.fromkeys([*hidden, *exceeding_fields]))
-            warnings.append(f"visible_fields_downgraded_to_hidden:{action_name}:{exceeding_fields}")
-        else:
-            warnings.append(f"visible_fields_exceed_exposure_limit:{action_name}:{exceeding_fields}")
-            valid = False
+        required_exposure_level = max(
+            (
+                CONFIDENTIALITY_LEVELS.get(
+                    configured_level(path)
+                    or (
+                        "secret"
+                        if path == "$"
+                        else max_exposure_level
+                    ),
+                    3,
+                )
+                for path in exceeding_fields
+            ),
+            default=CONFIDENTIALITY_LEVELS.get(
+                max_exposure_level,
+                0,
+            ),
+        )
+        max_exposure_level = next(
+            (
+                level
+                for level, rank in CONFIDENTIALITY_LEVELS.items()
+                if rank == required_exposure_level
+            ),
+            "secret",
+        )
+        warnings.append(
+            "exposure_limit_auto_raised_for_task_plan:"
+            f"{action_name}:{planned_max_exposure_level}"
+            f"->{max_exposure_level}:{exceeding_fields}"
+        )
 
     requested_visible_fields = list(visible)
     protected_visible_fields: list[str] = []
@@ -658,6 +725,7 @@ def compile_data_access(
             visible = ["$"]
     exposure_modes = {
         "inspect": list(visible),
+        "analysis": list(analysis),
         "transport": list(opaque),
         "hidden": list(hidden),
     }
@@ -669,12 +737,15 @@ def compile_data_access(
         "resource_parameters": resource_parameters,
         "visible_fields": visible,
         "requested_visible_fields": requested_visible_fields,
+        "analysis_fields": analysis,
         "opaque_fields": opaque,
         "hidden_fields": hidden,
         "dynamic_entity_map": bool(dynamic_mapping_policy_paths),
         "dynamic_mapping_policy_paths": (dynamic_mapping_policy_paths),
         "content_detection": bool(content_detection),
         "max_exposure_level": max_exposure_level,
+        "planned_max_exposure_level": planned_max_exposure_level,
+        "exposure_limit_auto_raised": bool(exceeding_fields),
         "exposure_modes": exposure_modes,
         "protected_visible_fields": protected_visible_fields,
         "requires_exposure_authorization": bool(protected_visible_fields),
@@ -2070,9 +2141,15 @@ def project_agent_exposure(
         }
     plain = _plain_data(result)
     max_exposure_level = str(contract.get("max_exposure_level", "internal")).lower()
+    planned_max_exposure_level = max_exposure_level
     app = str(contract.get("app", ""))
     entity = str(contract.get("entity", ""))
     visible_patterns = {normalize_data_path(path) for path in contract.get("visible_fields", [])}
+    analysis_patterns = {
+        normalize_data_path(path)
+        for path in contract.get("analysis_fields", [])
+        if str(path).strip()
+    }
     dynamic_mapping_policy_paths = [
         str(path)
         for path in contract.get(
@@ -2109,6 +2186,16 @@ def project_agent_exposure(
             for pattern in visible_patterns
         )
 
+    def path_is_analysis(path: str) -> bool:
+        normalized = normalize_data_path(path)
+        return any(
+            normalized == pattern
+            or normalized.startswith(f"{pattern}.")
+            or normalized.startswith(f"{pattern}[")
+            for pattern in analysis_patterns
+        )
+
+    sensitive_content_exposed: list[dict[str, Any]] = []
     detector_required = False
 
     def requires_content_detector(value: Any, path: str) -> bool:
@@ -2191,7 +2278,36 @@ def project_agent_exposure(
                 )
                 > CONFIDENTIALITY_LEVELS.get(max_exposure_level, 0)
             ]
-            if not sensitive_high_entities:
+            if not sensitive_high_entities and path_is_analysis(path):
+                sensitive_content_exposed.append(
+                    {
+                        "path": path,
+                        "start": 0,
+                        "end": len(value),
+                        "category": ",".join(
+                            sorted(
+                                str(category)
+                                for category in policy.get(
+                                    "categories",
+                                    [],
+                                )
+                                if str(category)
+                            )
+                        ),
+                        "level": str(
+                            policy.get(
+                                "level",
+                                max_exposure_level,
+                            )
+                        ),
+                        "score": float(
+                            policy.get("score", 0.0) or 0.0
+                        ),
+                        "text": value,
+                        "analysis_required": True,
+                    }
+                )
+            elif not sensitive_high_entities:
                 runtime_hidden.add(path)
 
     inspect(plain, "$")
@@ -2206,7 +2322,6 @@ def project_agent_exposure(
     )
     references: dict[str, dict[str, Any]] = {}
     sensitive_span_redactions: list[dict[str, Any]] = []
-    sensitive_content_exposed: list[dict[str, Any]] = []
 
     def apply_sensitive_span_references(
         text: str,
@@ -2240,11 +2355,15 @@ def project_agent_exposure(
                 "level": entity_level,
                 "score": float(entity_item.get("score", 0.0) or 0.0),
                 "text": text[start:end],
+                "analysis_required": path_is_analysis(path),
             }
             if CONFIDENTIALITY_LEVELS.get(
                 entity_level,
                 3,
-            ) <= CONFIDENTIALITY_LEVELS.get(max_exposure_level, 0):
+            ) <= CONFIDENTIALITY_LEVELS.get(
+                max_exposure_level,
+                0,
+            ) or path_is_analysis(path):
                 sensitive_content_exposed.append(details)
 
         candidates = [
@@ -2285,6 +2404,7 @@ def project_agent_exposure(
             if (
                 CONFIDENTIALITY_LEVELS.get(level, 3)
                 <= CONFIDENTIALITY_LEVELS.get(max_exposure_level, 0)
+                or path_is_analysis(path)
             ):
                 continue
             if grouped and int(entity_item["start"]) < int(grouped[-1]["end"]):
@@ -2433,6 +2553,24 @@ def project_agent_exposure(
         return projected_value
 
     projected = semanticize(projected, plain, "$")
+    exposed_levels = [
+        str(item.get("level", "internal")).lower()
+        for item in sensitive_content_exposed
+    ]
+    analysis_exposure_level = max(
+        exposed_levels,
+        key=lambda item: CONFIDENTIALITY_LEVELS.get(item, 3),
+        default="",
+    )
+    if (
+        analysis_exposure_level
+        and CONFIDENTIALITY_LEVELS.get(
+            analysis_exposure_level,
+            3,
+        )
+        > CONFIDENTIALITY_LEVELS.get(max_exposure_level, 0)
+    ):
+        max_exposure_level = analysis_exposure_level
     return projected, {
         "passed": True,
         "reason": ("sensitive_field_withheld" if runtime_hidden else "field_scope_applied"),
@@ -2442,6 +2580,20 @@ def project_agent_exposure(
         "dynamic_mapping_policy_paths": list(contract.get("dynamic_mapping_policy_paths", [])),
         "content_detection": (contract.get("content_detection", True) is not False),
         "max_exposure_level": max_exposure_level,
+        "planned_max_exposure_level": planned_max_exposure_level,
+        "analysis_fields": sorted(analysis_patterns),
+        "analysis_exposure_level": analysis_exposure_level,
+        "analysis_exposure_raised": (
+            bool(analysis_exposure_level)
+            and CONFIDENTIALITY_LEVELS.get(
+                analysis_exposure_level,
+                3,
+            )
+            > CONFIDENTIALITY_LEVELS.get(
+                planned_max_exposure_level,
+                0,
+            )
+        ),
         "runtime_hidden_sensitive_fields": sorted(runtime_hidden),
         "runtime_sensitive_policies": {
             path: copy.deepcopy(inspected_policies.get(path, {})) for path in sorted(runtime_hidden)

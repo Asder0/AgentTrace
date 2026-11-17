@@ -935,21 +935,9 @@ def validate_plan_against_contract(
         str,
         list[Mapping[str, Any]],
     ] = defaultdict(list)
-    for expected_edge in contract_data.get(
-        "expected_flow_edges",
-        [],
-    ) or []:
-        if not isinstance(expected_edge, Mapping):
-            continue
-        target_step = str(
-            expected_edge.get("to")
-            or expected_edge.get("target_step")
-            or ""
-        )
-        if target_step:
-            flow_edges_by_target[target_step].append(
-                expected_edge
-            )
+    # expected_flow_edges is retained only for old reports. New plan
+    # validation relies on the plan's own parameter bindings and step
+    # dependencies; it does not require a pre-authored edge template.
 
     def group_flow_signature(
         step_id: str,
@@ -1030,9 +1018,15 @@ def validate_plan_against_contract(
             group_flow_signature(step_id)
             for step_id in group_ids
         }
+        has_flow_signature = any(
+            bool(signature) for signature in signatures
+        )
         if (
             len(signatures) != 1
-            or not next(iter(signatures), ())
+            or (
+                has_flow_signature
+                and not next(iter(signatures), ())
+            )
         ):
             continue
         exact_ids = [
@@ -1486,12 +1480,9 @@ def validate_plan_against_contract(
         failures.append(str(contract_error))
 
     flow_groups: dict[str, dict[str, Any]] = {}
+    expected_flow_edges_for_validation: list[Mapping[str, Any]] = []
     for edge_index, expected_edge in enumerate(
-        contract_data.get(
-            "expected_flow_edges",
-            [],
-        )
-        or []
+        expected_flow_edges_for_validation
     ):
         if not isinstance(expected_edge, Mapping):
             failures.append("invalid_expected_flow_edge")

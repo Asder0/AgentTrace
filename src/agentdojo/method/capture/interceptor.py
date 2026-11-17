@@ -66,6 +66,7 @@ from ..analysis.risk_types import (
     BLOCK_CATEGORY_REQUIREMENT_UNRESOLVED,
     BLOCK_CATEGORY_SEMANTIC_MISMATCH,
     BLOCK_CATEGORY_SYSTEM_UNAVAILABLE,
+    DECISION_ADVISORY,
     DECISION_BLOCK,
     DECISION_HOLD,
     DECISION_MITIGATE,
@@ -774,12 +775,21 @@ def _needs_runtime_binding_refresh(
     tool_calls: Sequence[dict[str, Any]],
     value_index: Mapping[str, list[ValueOrigin]],
     plan_usage: Mapping[str, Any],
+    *,
+    ignore_refresh_marker: bool = False,
 ) -> bool:
     """Detect planned calls whose selectors use newly admitted sources."""
     if not isinstance(plan, dict) or not tool_calls:
         return False
     revision = int(plan.get("plan_revision", 1) or 1)
-    if int(plan_usage.get("runtime_binding_refresh_revision", -1) or -1) == revision:
+    if (
+        not ignore_refresh_marker
+        and int(
+            plan_usage.get("runtime_binding_refresh_revision", -1)
+            or -1
+        )
+        == revision
+    ):
         return False
     runtime_step_ids = {
         str(update.get("step_id", ""))
@@ -842,6 +852,31 @@ def _needs_runtime_binding_refresh(
         source_identity(source)
         for source in runtime_source_refs
     }
+    known_origins = {
+        (
+            str(getattr(origin, "source_activity_id", "") or ""),
+            str(getattr(origin, "source_tool", "") or ""),
+            str(getattr(origin, "source_path", "") or ""),
+            value_key(getattr(origin, "value", None)),
+        ): origin
+        for origins in value_index.values()
+        for origin in origins
+    }.values()
+    step_by_id = {
+        str(step.get("id", "") or ""): step
+        for step in plan.get("steps", []) or []
+        if isinstance(step, Mapping) and str(step.get("id", "") or "")
+    }
+    required_runtime_source_refs = [
+        source
+        for source in runtime_source_refs
+        if not bool(
+            step_by_id.get(
+                str(source.get("producer_step", "") or ""),
+                {},
+            ).get("optional", False)
+        )
+    ]
     actions: list[Mapping[str, Any]] = [
         action
         for step in plan.get("steps", [])
@@ -858,6 +893,63 @@ def _needs_runtime_binding_refresh(
             ):
                 return action
         return None
+
+    def step_depends_on(
+        step_id: str,
+        wanted_step_id: str,
+        *,
+        visited: set[str] | None = None,
+    ) -> bool:
+        visited = visited or set()
+        if step_id in visited:
+            return False
+        visited.add(step_id)
+        step = step_by_id.get(step_id)
+        if not isinstance(step, Mapping):
+            return False
+        dependencies = [
+            str(item)
+            for item in step.get("depends_on", [])
+            if str(item).strip()
+        ]
+        return wanted_step_id in dependencies or any(
+            step_depends_on(
+                dependency,
+                wanted_step_id,
+                visited=visited,
+            )
+            for dependency in dependencies
+        )
+
+    def producer_step(source: Mapping[str, Any]) -> str:
+        direct = str(source.get("producer_step", "") or "")
+        if direct in step_by_id:
+            return direct
+        action_name = str(
+            source.get("source_action")
+            or source.get("source_tool")
+            or ""
+        )
+        candidates = {
+            str(step.get("id", "") or "")
+            for step in plan.get("steps", [])
+            if isinstance(step, Mapping)
+            and any(
+                isinstance(action, Mapping)
+                and (
+                    str(action.get("name", "")) == action_name
+                    or (
+                        "__" not in str(action.get("name", ""))
+                        and "__" not in action_name
+                        and base_tool_name(str(action.get("name", "")))
+                        == base_tool_name(action_name)
+                    )
+                )
+                for action in step.get("actions", [])
+            )
+        }
+        candidates.discard("")
+        return next(iter(candidates)) if len(candidates) == 1 else ""
 
     def flattened(value: Any) -> list[Any]:
         if isinstance(value, Mapping):
@@ -880,9 +972,20 @@ def _needs_runtime_binding_refresh(
             resource_parameters = {}
         inputs = call.get("args")
         inputs = inputs if isinstance(inputs, Mapping) else {}
-        for parameter, rule in resource_parameters.items():
+        parameter_names = {
+            str(parameter)
+            for parameter in resource_parameters
+        }
+        if str(action.get("effect", "")) == "read":
+            parameter_names.update(
+                str(parameter)
+                for parameter, value in inputs.items()
+                if value not in (None, "", [], {})
+            )
+        for parameter in parameter_names:
+            rule = resource_parameters.get(parameter, {})
             if not isinstance(rule, Mapping):
-                continue
+                rule = {}
             semantic_type = str(rule.get("semantic_type", "identifier"))
             parameter_values = flattened(inputs.get(str(parameter)))
             if str(rule.get("mode", "")).lower() == "literal":
@@ -942,7 +1045,7 @@ def _needs_runtime_binding_refresh(
         )
         if not isinstance(bindings, Mapping):
             continue
-        for binding in bindings.values():
+        for parameter, binding in bindings.items():
             if (
                 not isinstance(binding, Mapping)
                 or str(binding.get("mode", "")).lower()
@@ -961,16 +1064,97 @@ def _needs_runtime_binding_refresh(
                 source_identity(item)
                 for item in allowed_refs
             }
-            for source in runtime_source_refs:
-                identity = source_identity(source)
-                if not any(
+            parameter_values = flattened(inputs.get(parameter))
+            if not parameter_values:
+                continue
+            semantic_type = str(
+                binding.get("semantic_type", "") or ""
+            )
+            matched_sources: dict[
+                tuple[str, str, str],
+                Mapping[str, Any],
+            ] = {}
+            matched_known_source = False
+            for value in parameter_values:
+                for origin in known_origins:
+                    if not (
+                        value_key(getattr(origin, "value", None))
+                        == value_key(value)
+                        or value_occurs_in_origin(
+                            value,
+                            origin,
+                            semantic_type,
+                        )
+                        or composed_value_supports_origin(
+                            value,
+                            origin,
+                        )
+                    ):
+                        continue
+                    matched_known_source = True
+                    identity = source_identity(
+                        {
+                            "app": origin.app,
+                            "entity": origin.entity,
+                            "source_action": origin.source_tool,
+                        }
+                    )
+                    if identity not in runtime_source_identities:
+                        continue
+                    matched_sources[identity] = {
+                        "app": origin.app,
+                        "entity": origin.entity,
+                        "source_action": origin.source_tool,
+                    }
+            allowed_steps = {
+                step
+                for item in allowed_refs
+                if (step := producer_step(item))
+            }
+            if not matched_sources:
+                if matched_known_source:
+                    # The value has a concrete provenance source, but none of
+                    # its instances came from a runtime-added read. A runtime
+                    # source used by another parameter cannot invalidate it.
+                    continue
+                for source in required_runtime_source_refs:
+                    identity = source_identity(source)
+                    if any(
+                        identity_is_covered(
+                            identity,
+                            allowed_identity,
+                        )
+                        for allowed_identity in allowed_identities
+                    ):
+                        continue
+                    runtime_step = producer_step(source)
+                    if runtime_step and any(
+                        step_depends_on(allowed_step, runtime_step)
+                        for allowed_step in allowed_steps
+                    ):
+                        continue
+                    return True
+                continue
+            for identity, source in matched_sources.items():
+                if any(
                     identity_is_covered(
                         identity,
                         allowed_identity,
                     )
                     for allowed_identity in allowed_identities
                 ):
-                    return True
+                    continue
+                runtime_step = producer_step(source)
+                if runtime_step and any(
+                    step_depends_on(allowed_step, runtime_step)
+                    for allowed_step in allowed_steps
+                ):
+                    # The runtime read is already an upstream input of a source
+                    # explicitly authorized for this parameter. Its values can
+                    # legitimately be reused in a composed presentation, so it
+                    # does not widen the target parameter's source scope.
+                    continue
+                return True
     return False
 
 
@@ -2437,6 +2621,7 @@ def capture_llm_interaction(func: Callable):
         plan_updates: list[dict[str, Any]] = []
         plan_update_warnings: list[str] = []
         tool_calls: list[dict[str, Any]] = []
+        runtime_binding_update_required = False
         if len(result) >= 4:
             updated_messages = result[3]
             ctx.partial_messages = list(updated_messages or [])
@@ -2458,6 +2643,9 @@ def capture_llm_interaction(func: Callable):
                     tool_calls,
                     ctx.tool_value_index,
                     ctx.plan_usage,
+                )
+                runtime_binding_update_required = bool(
+                    needs_binding_refresh
                 )
                 if (
                     tool_calls
@@ -2527,6 +2715,10 @@ def capture_llm_interaction(func: Callable):
                         tool_calls,
                         ctx.tool_value_index,
                         ctx.plan_usage,
+                    )
+                    runtime_binding_update_required = (
+                        runtime_binding_update_required
+                        or post_scope_binding_refresh
                     )
                     if scope_updates or post_scope_binding_refresh:
                         active_plan = ctx.task_data_plan
@@ -2618,6 +2810,61 @@ def capture_llm_interaction(func: Callable):
                 ctx.task_data_plan = synced_plan
             plan_updates.extend(binding_sync_updates)
             plan_update_warnings.extend(binding_sync_warnings)
+            if (
+                runtime_binding_update_required
+                and isinstance(ctx.task_data_plan, dict)
+                and _needs_runtime_binding_refresh(
+                    ctx.task_data_plan,
+                    tool_calls,
+                    ctx.tool_value_index,
+                    ctx.plan_usage,
+                    ignore_refresh_marker=True,
+                )
+            ):
+                updated_plan = copy.deepcopy(
+                    ctx.task_data_plan
+                )
+                updated_plan["execution_stop"] = {
+                    "id": "runtime_plan_binding_update_required",
+                    "reason": (
+                        "The proposed tool call uses data from a "
+                        "runtime-added read, but the current plan "
+                        "does not authorize that parameter source. "
+                        "Update the task plan before execution."
+                    ),
+                }
+                updated_plan["valid"] = False
+                ctx.task_data_plan = updated_plan
+                plan_update_warnings.append(
+                    "runtime_binding_update_required"
+                )
+            binding_failures = [
+                warning
+                for warning in binding_sync_warnings
+                if warning.startswith(
+                    (
+                        "runtime_binding_unresolved:",
+                        "runtime_binding_source_ambiguous:",
+                        "optional_parameter_binding_ambiguous:",
+                    )
+                )
+            ]
+            if (
+                binding_failures
+                and isinstance(ctx.task_data_plan, dict)
+            ):
+                stopped_plan = copy.deepcopy(ctx.task_data_plan)
+                stopped_plan["execution_stop"] = {
+                    "id": "runtime_plan_update_required",
+                    "reason": (
+                        "The proposed tool call depends on data from an "
+                        "earlier runtime read, but the required plan "
+                        "binding could not be completed."
+                    ),
+                    "warnings": binding_failures,
+                }
+                stopped_plan["valid"] = False
+                ctx.task_data_plan = stopped_plan
 
         response_label = derive_flow_label(
             [context_flow_label],
@@ -4331,6 +4578,193 @@ def capture_tool_call(func: Callable):
                         "risk_assessments",
                         [],
                     ).append(risk)
+                exposed_content = data_access_check.get(
+                    "sensitive_content_exposed",
+                    [],
+                )
+                if isinstance(exposed_content, list) and exposed_content:
+                    exposed_paths = list(
+                        dict.fromkeys(
+                            str(item.get("path", ""))
+                            for item in exposed_content
+                            if isinstance(item, Mapping)
+                            and str(item.get("path", "")).strip()
+                        )
+                    )
+                    exposed_levels = [
+                        str(item.get("level", "internal")).lower()
+                        for item in exposed_content
+                        if isinstance(item, Mapping)
+                    ]
+                    actual_exposure_level = max(
+                        exposed_levels,
+                        key=lambda item: CONFIDENTIALITY_LEVELS.get(
+                            item,
+                            3,
+                        ),
+                        default=str(
+                            data_access_check.get(
+                                "max_exposure_level",
+                                "secret",
+                            )
+                        ),
+                    )
+                    field_policies: dict[str, dict[str, Any]] = {}
+                    for item in exposed_content:
+                        if not isinstance(item, Mapping):
+                            continue
+                        path = str(item.get("path", ""))
+                        if not path:
+                            continue
+                        current_policy = field_policies.setdefault(
+                            path,
+                            {
+                                "level": str(
+                                    item.get(
+                                        "level",
+                                        actual_exposure_level,
+                                    )
+                                ),
+                                "categories": [],
+                            },
+                        )
+                        if CONFIDENTIALITY_LEVELS.get(
+                            str(item.get("level", "")),
+                            3,
+                        ) > CONFIDENTIALITY_LEVELS.get(
+                            str(current_policy.get("level", "")),
+                            3,
+                        ):
+                            current_policy["level"] = str(
+                                item.get("level", "")
+                            )
+                        category = str(
+                            item.get("category", "")
+                        )
+                        if category:
+                            current_policy["categories"] = list(
+                                dict.fromkeys(
+                                    [
+                                        *current_policy.get(
+                                            "categories",
+                                            [],
+                                        ),
+                                        *[
+                                            part
+                                            for part in category.split(",")
+                                            if part
+                                        ],
+                                    ]
+                                )
+                            )
+                    exposure_check = {
+                        "phase": "post_execution_runtime_detection",
+                        "action": tracked_function,
+                        "inspection_fields": exposed_paths,
+                        "analysis_fields": list(
+                            data_access_check.get(
+                                "analysis_fields",
+                                [],
+                            )
+                        ),
+                        "opaque_fields": list(
+                            access_contract.get(
+                                "opaque_fields",
+                                [],
+                            )
+                        ),
+                        "previous_max_exposure_level": str(
+                            data_access_check.get(
+                                "planned_max_exposure_level",
+                                access_contract.get(
+                                    "max_exposure_level",
+                                    "internal",
+                                ),
+                            )
+                        ),
+                        "max_exposure_level": actual_exposure_level,
+                        "field_policies": field_policies,
+                        "sensitive_content_exposed": copy.deepcopy(
+                            exposed_content
+                        ),
+                    }
+                    existing_exposure_risk = next(
+                        (
+                            risk
+                            for risk in event_record.get(
+                                "risk_assessments",
+                                [],
+                            )
+                            if isinstance(risk, Mapping)
+                            and str(risk.get("policy_id", ""))
+                            == "ring2.sensitive_data_exposure_confirmation"
+                            and str(risk.get("activity_id", ""))
+                            == str(
+                                event_record.get(
+                                    "activity_id",
+                                    "",
+                                )
+                            )
+                        ),
+                        None,
+                    )
+                    if isinstance(
+                        existing_exposure_risk,
+                        dict,
+                    ):
+                        existing_exposure_risk[
+                            "exposure_check"
+                        ] = exposure_check
+                        existing_exposure_risk[
+                            "exposure_fields"
+                        ] = exposed_paths
+                        existing_exposure_risk[
+                            "sensitive_content_exposed"
+                        ] = copy.deepcopy(exposed_content)
+                    else:
+                        exposure_risk = make_risk(
+                            2,
+                            DECISION_ADVISORY,
+                            (
+                                "Sensitive values required for task "
+                                "analysis were exposed to the Agent; "
+                                "the exposure is marked on the data-flow "
+                                "path for user review."
+                            ),
+                            severity="high",
+                            event_kind="security",
+                            policy_id=(
+                                "ring2.sensitive_content_exposed"
+                            ),
+                            activity_id=event_record.get(
+                                "activity_id"
+                            ),
+                            source_ids=exposed_paths,
+                            sink_ids=[tracked_function],
+                            fsm_before="OUTPUT_OBSERVED",
+                            fsm_after="ADMITTED",
+                            confidence=1.0,
+                        )
+                        exposure_risk["phase"] = (
+                            "post_execution_runtime_detection"
+                        )
+                        exposure_risk["exposure_fields"] = (
+                            exposed_paths
+                        )
+                        exposure_risk["exposure_check"] = (
+                            exposure_check
+                        )
+                        exposure_risk[
+                            "sensitive_content_exposed"
+                        ] = copy.deepcopy(exposed_content)
+                        exposure_risk["occurrence_count"] = 1
+                        event_record.setdefault(
+                            "risk_assessments",
+                            [],
+                        ).append(exposure_risk)
+                    data_access_check[
+                        "analysis_exposure_warning"
+                    ] = True
             if (
                 SEMANTIC_BINDING_ENFORCEMENT
                 and not data_access_check.get("passed", False)

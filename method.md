@@ -330,7 +330,7 @@ outcome 仍保留为必需结果。
 
 ### 7.1 Ring 0：用户输入直接注入
 
-默认检测器为项目本地的 `deberta-v3-base-prompt-injection-v2`，用于直接用户指令：
+默认检测器为项目本地的 `Horizon-Labs/prompt-injection-guard-small`，用于直接用户指令：
 
 - 先对完整用户 prompt 做文档级门控，避免把正常的发送、转账命令按短句误判；
 - 完整 prompt 命中后，再按段落和句子定位可疑片段；
@@ -436,6 +436,10 @@ effect、标准数据流边和允许的环境变化。规划器必须覆盖该�
   必须使用空列表，使整个返回结果在进入 Agent 前被隐藏；
 - `opaque_fields` 限定只允许以 `[[SENSITIVE_REF:...]]` 引用搬运、但不向 Agent 展示真实值的
   字段；未列入 `visible_fields` 或 `opaque_fields` 的字段直接隐藏；
+- `analysis_fields` 是 `visible_fields` 的子集，用于声明 Agent 必须比较、计算、筛选或
+  理解真实值的字段。其敏感 Span 不转为引用，而是向 Agent 返回真实值，并在风险卡片和
+  数据流图中标记为已向模型暴露。存在直接参数搬运绑定的字段不进入 `analysis_fields`，
+  继续使用 `[[SENSITIVE_REF:...]]`。
 
 预订酒店、餐厅和租车使用独立的 `resource_mutation` profile：它们是
 `write/L2` 资源变更，而不是自由文本外发，因此不要求 message/email body 所需的
@@ -452,10 +456,14 @@ egress flow contract。
 索引；即使工具函数返回 `None`，只要环境变化可观测，其新实体字段仍可作为后续动作来源。
 
 溯源图作为数据流追踪、审计和可视化的核心证据，不再压缩为单独的数据流完整率主指标。
-图中的参数来源、数据边、来源歧义、缺失必需边、意外边和计划外动作分别用于风险判定、
-过程认证和前端解释。过程认证率负责评价执行是否遵守冻结计划与授权合同；正常任务完成率
+图中的参数来源、数据边、来源歧义、缺失边和意外边只用于前端解释和案例诊断，不做确定性
+认证。过程认证率只评价 Agent 是否遵守冻结任务计划中的动作和参数授权；正常任务完成率
 负责评价最终结果；攻击指标负责评价注入检测和阻断。这样不会因为 Agent 使用等价但不同的
-查询或工具路径而错误降低任务指标。
+查询或来源路径而错误降低任务指标。
+
+任务契约中的 `expected_flow_edges` 只作为旧版本兼容数据保留。新流程不要求 Planner
+覆盖预设边，也不从预设边自动生成参数绑定；参数来源安全仍由计划自身的
+`allowed_source_refs`、`required_source_refs` 和 Ring 2/3 运行时检查保证。
 
 - `max_exposure_level` 限定该次调用允许暴露的最高字段等级；
 - 控制器在工具执行前验证资源授权，在工具返回后、Ring 1 扫描前执行字段投影；
@@ -465,13 +473,15 @@ egress flow contract。
 - 运行中新补充的 L0/L1 读取在确定性回退路径中只自动暴露 `public/internal` 字段。
   如果主模型的结构化计划补丁明确声明某个 `confidential/secret` 字段是任务比较或分析
   所必需，可以加入计划，但执行前必须进入用户授权；授权拒绝时读取不执行。
-- 若任务必须查看、比较或分析 `confidential/secret` 字段，计划只能将该字段放入
-  `visible_fields`；Ring 2 在读取执行前暂停并请求用户授权，说明待查看字段、仅搬运字段和
-  最高暴露等级。用户拒绝、计划变化或授权后参数变化都会阻断该读取。
-- 对于字段静态等级为 `internal`、但正文中的自然语言内容被 GLiNER 动态提升为
-  `confidential/secret` 的情况，控制器先隐藏原文并记录实际敏感策略。如果该字段属于计划
-  `visible_fields`，系统会针对实际检测到的字段再次请求用户授权；批准后才展示原文，拒绝则
-  Agent 只能看到控制器占位符。
+- 若任务必须查看、比较或分析 `confidential/secret` 字段，计划将该字段放入
+  `visible_fields` 和 `analysis_fields`；Ring 2 在读取执行前执行标准暴露授权，
+  说明待查看字段、仅搬运字段和最高暴露等级。分析和自动确认完成后，真实敏感值返回给
+  Agent，同时生成用户可见的敏感暴露风险卡片。
+- 对于字段静态等级为 `internal`、但正文中的自然语言内容被 GLiNER 或结构化校验器动态
+  提升为 `confidential/secret` 的情况，未列入 `analysis_fields` 的 Span 继续隐藏并记录
+  实际敏感策略；列入 `analysis_fields` 且没有直接搬运绑定的 Span 保留真实值并标记暴露。
+- IBAN 等具有公开格式和校验规则的标识符使用确定性校验作为模型检测的兜底，避免模型
+  偶发漏检导致本应引用的账号直接暴露。
 - 只需要在后续动作中转发、写入或作为资源选择器的敏感值必须放入 `opaque_fields`，
   Agent 只能看到控制器引用，不能读取原值。该路径无需暴露授权，但仍接受来源、接收方和
   Ring 3 数据流检查。
@@ -590,7 +600,9 @@ Ring 3 区分两类来源：
 fail-closed 为 `secret`；完全没有字段策略的实体才继承实体默认等级。GLiNER 是强制数据暴露检查，
 只用于提高非公开字段的敏感类别，不会降低人工配置等级；人工明确配置为 `public` 的企业目录
 字段属于显式公开策略，不再由内容检测提升。默认实体识别阈值为 `0.45`，配置键为
-`gliner_sensitivity_threshold`。模型不可用时读取结果不得进入 Agent。
+`gliner_sensitivity_threshold`。对 IBAN 等具有公开格式和校验位的标识符，系统还会运行
+确定性格式与 mod-97 校验作为模型漏检兜底；该规则不用于猜测普通自然语言语义。
+模型不可用时读取结果不得进入 Agent。
 
 部分旅行工具返回“实体名 → 该实体的一个公开或内部字段值”的动态字典，例如
 `{hotel_name: price_range}`。这类工具在 `tool_security.json` 中显式声明
@@ -889,7 +901,7 @@ source_paths
 | 变量 | 说明 |
 | --- | --- |
 | `AGENTDOJO_PI_MODEL_PATH` | 覆盖 Ring 1 的 Unplug/间接注入模型目录 |
-| `AGENTDOJO_DIRECT_PI_MODEL_PATH` | 覆盖 Ring 0 的 DeBERTa 直接注入模型目录 |
+| `AGENTDOJO_DIRECT_PI_MODEL_PATH` | 覆盖 Ring 0 的 prompt-injection-guard-small 直接注入模型目录 |
 | `AGENTDOJO_USE_RELOADER=true` | 开启 Flask 自动重载 |
 | `AGENTDOJO_ATTACK_SCENARIOS_PER_SUITE` | 旧版单 APP 攻击 API 每个 suite 生成的场景数量；主界面不依赖该变量 |
 | `LOCAL_LLM_PORT` | 本地 OpenAI 兼容服务端口，默认 `8000` |
@@ -994,8 +1006,9 @@ curl -X POST http://localhost:5000/api/config/defense \
 
 ### 新增敏感实体
 
-只修改人工配置文件，不根据实际值做字符串规则猜测等级。结构化字段路径用于确定性查找；
-GLiNER 是强制字段暴露检查，只提高已检测敏感类别的等级。派生实体使用来源字段的最高等级。
+人工敏感等级仍以配置文件为准，不对普通自然语言做字符串规则推测。结构化字段路径用于
+确定性查找；GLiNER 负责内容类别检测，具有公开格式和校验位的标识符可使用确定性校验兜底。
+两者都只提高非公开字段等级，派生实体使用来源字段的最高等级。
 
 ### 新增检测器
 
