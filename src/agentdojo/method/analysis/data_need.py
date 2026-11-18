@@ -732,7 +732,7 @@ Return JSON only:
 }
 
 Rules:
-- Return one selector for every missing_selector listed in the input.
+- Return one selector for every field in each target.repair_selector_fields list.
 - Operate only on the exact step/action/parameter target listed in the input.
 - Never add, remove, rename or replace a step or action. Never change an APP,
   effect, destination, required outcome or visible-field declaration.
@@ -893,9 +893,81 @@ def _optional_schema_fields(metadata: dict[str, Any]) -> set[str]:
     }
 
 
+def _resolve_catalog_tool_name(
+    name: str,
+    catalog: Mapping[str, Mapping[str, Any]],
+    *,
+    step: Mapping[str, Any] | None = None,
+    action: Mapping[str, Any] | None = None,
+    step_id: str = "",
+    execution_contract: Mapping[str, Any] | None = None,
+) -> str:
+    """Resolve a plan action name without guessing across APP suites."""
+    candidate = str(name or "").strip()
+    if not candidate:
+        return ""
+    if candidate in catalog:
+        return candidate
+    base = base_tool_name(candidate)
+    if not base:
+        return ""
+
+    step_id = str(
+        step_id
+        or (
+            step.get("id", "")
+            if isinstance(step, Mapping)
+            else ""
+        )
+    ).strip()
+    if isinstance(execution_contract, Mapping) and step_id:
+        contracted = [
+            str(contract_step.get("action", ""))
+            for contract_step in execution_contract.get(
+                "required_steps",
+                [],
+            ) or []
+            if isinstance(contract_step, Mapping)
+            and str(contract_step.get("id", "")).strip()
+            == step_id
+            and base_tool_name(
+                str(contract_step.get("action", ""))
+            )
+            == base
+            and str(contract_step.get("action", "")) in catalog
+        ]
+        if len(set(contracted)) == 1:
+            return contracted[0]
+
+    suite_hints = []
+    for source in (action, step):
+        if not isinstance(source, Mapping):
+            continue
+        access = source.get("data_access")
+        if isinstance(access, Mapping):
+            suite_hints.append(str(access.get("app", "")))
+        suite_hints.append(str(source.get("suite", "")))
+    for suite in dict.fromkeys(
+        value.strip().lower()
+        for value in suite_hints
+        if str(value).strip()
+    ):
+        qualified = f"{suite}__{base}"
+        if qualified in catalog:
+            return qualified
+
+    matches = sorted(
+        tool_name
+        for tool_name in catalog
+        if base_tool_name(tool_name) == base
+    )
+    return matches[0] if len(matches) == 1 else ""
+
+
 def _plan_input_contract_report(
     plan: Mapping[str, Any],
     available_tools: Sequence[Mapping[str, Any]] | None,
+    execution_contract: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Report exact schema fields an invalid plan failed to cover."""
     catalog = {
@@ -906,7 +978,9 @@ def _plan_input_contract_report(
     invalid_targets = {
         (
             str(item.get("step_id", "") or ""),
-            str(item.get("action", "") or ""),
+            base_tool_name(
+                str(item.get("action", "") or "")
+            ),
         )
         for item in plan.get("invalid_actions", [])
         if isinstance(item, Mapping)
@@ -919,11 +993,38 @@ def _plan_input_contract_report(
         for action in step.get("actions", []) or []:
             if not isinstance(action, Mapping):
                 continue
-            action_name = str(action.get("name", "") or "")
-            if invalid_targets and (step_id, action_name) not in invalid_targets:
+            raw_action_name = str(
+                action.get("name", "") or ""
+            )
+            action_name = _resolve_catalog_tool_name(
+                raw_action_name,
+                catalog,
+                step=step,
+                action=action,
+                step_id=step_id,
+                execution_contract=execution_contract,
+            )
+            target_key = (
+                step_id,
+                base_tool_name(raw_action_name),
+            )
+            if invalid_targets and target_key not in invalid_targets:
                 continue
             metadata = catalog.get(action_name)
             if not isinstance(metadata, Mapping):
+                report.append(
+                    {
+                        "step_id": step_id,
+                        "action": action_name or raw_action_name,
+                        "effect": str(
+                            action.get("effect", "") or ""
+                        ),
+                        "tool_resolution_error": (
+                            "tool_metadata_unresolved:"
+                            f"{raw_action_name}"
+                        ),
+                    }
+                )
                 continue
             effect = str(action.get("effect", "") or "")
             access = (
@@ -1014,16 +1115,9 @@ def _complete_missing_resource_selectors(
     prompt: str,
     planner: Callable[[str], str],
     available_tools: list[dict[str, Any]] | None,
+    execution_contract: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Ask for a minimal selector-only patch for otherwise valid actions."""
-    invalid_reasons = {
-        str(item.get("reason", ""))
-        for item in plan.get("invalid_actions", [])
-        if isinstance(item, Mapping)
-    }
-    if invalid_reasons != {"data_access_contract_invalid"}:
-        return None, []
-
     catalog = {
         str(item.get("name", "")): item
         for item in available_tools or []
@@ -1032,21 +1126,63 @@ def _complete_missing_resource_selectors(
     report = _plan_input_contract_report(
         plan,
         available_tools,
+        execution_contract,
     )
-    targets = [
-        item
-        for item in report
-        if item.get("missing_resource_selector_fields")
-    ]
+    targets = []
+    for item in report:
+        repair_fields = list(
+            item.get("missing_resource_selector_fields", [])
+        )
+        if str(item.get("effect", "")) == "read":
+            repair_fields.extend(
+                item.get("missing_required_schema_fields", [])
+            )
+        repair_fields = sorted(
+            {
+                str(field)
+                for field in repair_fields
+                if str(field).strip()
+            }
+        )
+        if repair_fields:
+            targets.append(
+                {
+                    **item,
+                    "repair_selector_fields": repair_fields,
+                }
+            )
     if not targets:
-        return None, []
+        unresolved = [
+            str(item.get("tool_resolution_error"))
+            for item in report
+            if item.get("tool_resolution_error")
+        ]
+        return None, (
+            [
+                "resource_selector_repair_targets_unresolved:"
+                + ",".join(unresolved)
+            ]
+            if unresolved
+            else []
+        )
 
     target_details: list[dict[str, Any]] = []
     expected: dict[tuple[str, str, str], dict[str, Any]] = {}
     for target in targets:
         step_id = str(target.get("step_id", ""))
-        action_name = str(target.get("action", ""))
+        raw_action_name = str(target.get("action", ""))
+        action_name = _resolve_catalog_tool_name(
+            raw_action_name,
+            catalog,
+            step_id=step_id,
+            execution_contract=execution_contract,
+        )
         metadata = catalog.get(action_name, {})
+        if not action_name or not metadata:
+            return None, [
+                "resource_selector_repair_target_unresolved:"
+                f"{step_id}:{raw_action_name}"
+            ]
         input_schema = (
             metadata.get("input_schema")
             if isinstance(metadata, Mapping)
@@ -1059,7 +1195,7 @@ def _complete_missing_resource_selectors(
         )
         selector_schemas = {}
         for parameter in target.get(
-            "missing_resource_selector_fields",
+            "repair_selector_fields",
             [],
         ):
             parameter = str(parameter)
@@ -1120,9 +1256,19 @@ def _complete_missing_resource_selectors(
     ).items():
         if not isinstance(raw_source, Mapping):
             continue
-        source_action = str(
+        raw_source_action = str(
             raw_source.get("source_action", "")
         )
+        source_action = _resolve_catalog_tool_name(
+            raw_source_action,
+            catalog,
+            step_id=str(
+                raw_source.get("producer_step", "")
+            ),
+            execution_contract=execution_contract,
+        )
+        if not source_action:
+            source_action = raw_source_action
         metadata = catalog.get(source_action, {})
         output_schema = (
             metadata.get("output_schema")
@@ -7806,8 +7952,6 @@ def _find_unique_plan_action(
             ):
                 matches.append((step, action))
                 continue
-            if "__" in requested:
-                continue
             if (
                 base_tool_name(action_name)
                 == base_tool_name(requested)
@@ -8815,16 +8959,13 @@ def compile_runtime_plan_update(
     catalog = {
         str(item.get("name")): item for item in (available_tools or []) if isinstance(item, dict) and item.get("name")
     }
-    tools_by_base: dict[str, list[str]] = {}
-    for name in catalog:
-        tools_by_base.setdefault(base_tool_name(name), []).append(name)
-
-    def canonical_tool(name: str) -> str:
-        value = str(name or "").strip()
-        if value in catalog:
-            return value
-        matches = tools_by_base.get(base_tool_name(value), [])
-        return matches[0] if len(matches) == 1 else ""
+    def canonical_tool(name: str, step_id: str = "") -> str:
+        return _resolve_catalog_tool_name(
+            name,
+            catalog,
+            step_id=step_id,
+            execution_contract=execution_contract,
+        )
 
     try:
         raw = parse_plan_json(planner_response)
@@ -8861,7 +9002,10 @@ def compile_runtime_plan_update(
             for action in step.get("actions", []):
                 if (
                     not isinstance(action, Mapping)
-                    or canonical_tool(str(action.get("name", "")))
+                    or canonical_tool(
+                        str(action.get("name", "")),
+                        str(step.get("id", "")),
+                    )
                     != target_action
                 ):
                     continue
@@ -8943,7 +9087,10 @@ def compile_runtime_plan_update(
         for raw_action in raw_step.get("actions", []):
             if not isinstance(raw_action, dict):
                 continue
-            tool_name = canonical_tool(str(raw_action.get("name", "")))
+            tool_name = canonical_tool(
+                str(raw_action.get("name", "")),
+                step_id,
+            )
             metadata = catalog.get(tool_name, {})
             effect = str(metadata.get("effect", "unknown"))
             risk_level = str(metadata.get("risk_level", "L2")).upper()
@@ -9317,7 +9464,19 @@ def compile_runtime_plan_update(
             if step_id and str(step.get("id", "")) != step_id:
                 continue
             for action in step.get("actions", []):
-                if isinstance(action, dict) and str(action.get("name", "")) == action_name:
+                resolved_action = (
+                    _resolve_catalog_tool_name(
+                        str(action.get("name", "")),
+                        catalog,
+                        step=step,
+                        action=action,
+                        step_id=str(step.get("id", "")),
+                        execution_contract=execution_contract,
+                    )
+                    if isinstance(action, dict)
+                    else ""
+                )
+                if isinstance(action, dict) and resolved_action == action_name:
                     matches.append((step, action))
         return matches[0] if len(matches) == 1 else (None, None)
 
@@ -9346,11 +9505,6 @@ def compile_runtime_plan_update(
         return False
 
     for raw_extension in pending_source_extensions:
-        target_action = canonical_tool(str(raw_extension.get("target_action", "")))
-        source_action = canonical_tool(str(raw_extension.get("source_action", "")))
-        parameter = str(raw_extension.get("parameter", "")).strip()
-        raw_source_path = str(raw_extension.get("source_path", "")).strip()
-        source_path = normalize_source_path(raw_source_path)
         target_step_id = str(
             raw_extension.get("target_step_id")
             or raw_extension.get("step_id")
@@ -9360,6 +9514,17 @@ def compile_runtime_plan_update(
             raw_extension.get("source_step_id", "")
             or ""
         ).strip()
+        target_action = canonical_tool(
+            str(raw_extension.get("target_action", "")),
+            target_step_id,
+        )
+        source_action = canonical_tool(
+            str(raw_extension.get("source_action", "")),
+            requested_source_step_id,
+        )
+        parameter = str(raw_extension.get("parameter", "")).strip()
+        raw_source_path = str(raw_extension.get("source_path", "")).strip()
+        source_path = normalize_source_path(raw_source_path)
         if not target_action or not source_action or not parameter or not raw_source_path:
             warnings.append(f"invalid_runtime_source_extension:{target_action}:{parameter}:{source_action}")
             continue
@@ -9810,8 +9975,6 @@ def compile_runtime_plan_update(
                 "name",
                 "",
             )
-        target_action = canonical_tool(str(target_value))
-        source_action = canonical_tool(str(source_value))
         parameter = str(
             binding_value(
                 "parameter",
@@ -9826,12 +9989,20 @@ def compile_runtime_plan_update(
                 default="",
             )
         ).strip()
+        target_action = canonical_tool(
+            str(target_value),
+            target_step_id,
+        )
         requested_source_step_id = str(
             binding_value(
                 "source_step_id",
                 default="",
             )
         ).strip()
+        source_action = canonical_tool(
+            str(source_value),
+            requested_source_step_id,
+        )
         if not target_action or not source_action or not parameter:
             warnings.append(
                 f"invalid_runtime_binding:target={target_value!r}:parameter={parameter!r}:source={source_value!r}"
@@ -10640,12 +10811,6 @@ def compile_runtime_binding_sync(
                         "source_action": source_action,
                         "source_path": source_path,
                     }
-                    if binding_contains_source(
-                        existing_binding,
-                        source_ref,
-                        source_path,
-                    ):
-                        continue
                     candidates.append(
                         (
                             event_order.get(
@@ -11927,7 +12092,6 @@ def _attach_execution_contract_identity(
 ) -> dict[str, Any]:
     if not isinstance(execution_contract, Mapping):
         return plan
-    changed = False
     for plan_key, contract_key in (
         ("task_id", "task_id"),
         ("prompt_digest", "prompt_digest"),
@@ -11936,13 +12100,16 @@ def _attach_execution_contract_identity(
         expected = str(execution_contract.get(contract_key, "") or "")
         if expected and plan.get(plan_key) != expected:
             plan[plan_key] = expected
-            changed = True
-    return _finalize_plan(plan) if changed else plan
+    # Validation and selector repair may rewrite plan contents while the
+    # contract identity fields already match. Recompute identity from the
+    # final plan contents on every attach pass.
+    return _finalize_plan(plan)
 
 
 def _optional_parameter_support_candidates(
     plan: Mapping[str, Any],
     available_tools: Sequence[Mapping[str, Any]],
+    execution_contract: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     catalog = {
         str(item.get("name")): item
@@ -11956,7 +12123,17 @@ def _optional_parameter_support_candidates(
         for action in step.get("actions", []):
             if not isinstance(action, Mapping):
                 continue
-            action_name = str(action.get("name", ""))
+            raw_action_name = str(action.get("name", ""))
+            action_name = _resolve_catalog_tool_name(
+                raw_action_name,
+                catalog,
+                step=step,
+                action=action,
+                step_id=str(step.get("id", "")),
+                execution_contract=execution_contract,
+            )
+            if not action_name:
+                continue
             metadata = catalog.get(action_name, {})
             input_schema = metadata.get("input_schema")
             fields = (
@@ -12315,6 +12492,7 @@ def _complete_optional_parameter_support(
     candidates = _optional_parameter_support_candidates(
         plan,
         available_tools or [],
+        execution_contract,
     )
     if not candidates:
         return plan
@@ -12350,6 +12528,7 @@ def _complete_optional_parameter_support(
     candidates = _optional_parameter_support_candidates(
         plan,
         available_tools or [],
+        execution_contract,
     )
     if not candidates:
         return plan
@@ -12505,6 +12684,7 @@ def generate_task_data_plan(
                     str(prompt),
                     planner,
                     available_tools,
+                    execution_contract,
                 )
             )
             if selector_raw is not None:
@@ -12553,6 +12733,10 @@ def generate_task_data_plan(
                     plan.setdefault("warnings", []).extend(
                         selector_contract_failures
                     )
+            else:
+                plan.setdefault("warnings", []).extend(
+                    selector_warnings
+                )
         if plan.get("valid", False) and not plan.get(
             "invalid_actions"
         ):
@@ -12585,6 +12769,7 @@ def generate_task_data_plan(
                         "input_contracts": _plan_input_contract_report(
                             plan,
                             available_tools,
+                            execution_contract,
                         ),
                         "repair_rules": [
                             ("Return one complete corrected plan, not a partial patch."),
@@ -12714,11 +12899,13 @@ def generate_task_data_plan(
             structural_report = _plan_input_contract_report(
                 repaired,
                 available_tools,
+                execution_contract,
             )
             structural_failures = [
                 item
                 for item in structural_report
-                if item.get("missing_required_schema_fields")
+                if item.get("tool_resolution_error")
+                or item.get("missing_required_schema_fields")
                 or item.get("missing_resource_selector_fields")
                 or item.get("resource_value_type_errors")
                 or item.get("parameter_value_type_errors")
