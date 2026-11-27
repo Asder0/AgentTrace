@@ -157,14 +157,16 @@ AppWorld 0.2.0 共包含 733 个任务目录：
 生成 inventory：
 
 ```powershell
-.\.venv\Scripts\python.exe util_scripts\appworld_migration_inventory.py
+conda activate agent
+python util_scripts\appworld_migration_inventory.py
 ```
 
 验证首批迁移：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests\test_cross_app_tasks.py tests\test_appworld_migration_inventory.py
-.\.venv\Scripts\python.exe util_scripts\validate_cross_app_tasks.py
+conda activate agent
+python -m pytest -q tests\test_cross_app_tasks.py tests\test_appworld_migration_inventory.py
+python util_scripts\validate_cross_app_tasks.py
 ```
 
 ## 批量扩产门槛
@@ -257,15 +259,17 @@ step DAG、fixture 唯一性、evaluation 和 source provenance。迁移 prompt
 首批确定性验收命令：
 
 ```powershell
-C:\Users\86534\.conda\envs\agent\python.exe util_scripts\validate_cross_app_tasks.py `
+conda activate agent
+python util_scripts\validate_cross_app_tasks.py `
   --output external_data\validation\appworld_first_batch_ground_truth.json
 ```
 
 真实模型验收命令：
 
 ```powershell
+conda activate agent
 $env:DEEPSEEK_API_KEY = "<key>"
-C:\Users\86534\.conda\envs\agent\python.exe util_scripts\validate_appworld_migrations.py `
+python util_scripts\validate_appworld_migrations.py `
   --new-batch --output external_data\validation\appworld_first_batch_llm.json
 ```
 

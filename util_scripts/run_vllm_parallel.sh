@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Optional Linux-only vLLM helper. `uv` is used here only to isolate the vLLM
+# dependency. The AgentTrace app and tests use the Conda environment `agent`.
+
 MODEL_PATH=$1
 PARSER=$2
 PORT=${3:-8000}

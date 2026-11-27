@@ -20,7 +20,6 @@ from typing import Any
 
 import networkx as nx
 
-from ..app_domains import domain_for_tool
 from .data_sensitivity import entity_level, entity_source
 from .labels import (
     aggregate_flow_labels,
@@ -87,10 +86,6 @@ def _make_label(node_type: str, content: str, max_len: int = 120) -> str:
 
 def _make_tool_label(tool_intent: str, tool_description: str = "") -> str:
     return tool_intent
-
-
-def _infer_app_from_function_name(function_name: str) -> str:
-    return domain_for_tool(function_name) or "unknown"
 
 
 def _add_edge(

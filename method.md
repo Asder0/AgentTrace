@@ -243,7 +243,8 @@ flowchart LR
 
 环境变更只应表示 Agent 行为造成的修改。测试时预先加载的账单邮件、攻击文本或场景数据必须进入任务基线，不能作为 Agent 新增内容。
 
-旧 trace 未保存完整任务级快照时，历史回放会从图谱中的环境变更节点恢复摘要，并明确标记“仅保留环境变更摘要”。
+当前版本只接受包含完整任务级环境快照的新版 Trace。旧 Trace 与降级恢复逻辑已删除；
+缺少快照的记录会直接提示环境变更不可回放。
 
 ## 6. Modeling Layer
 
@@ -835,7 +836,7 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 - 环境字段差异
 - 风险、策略、任务计划和最终结果
 
-历史回放不会读取当前实时环境。旧 trace 没有完整环境快照时，只显示图谱中可恢复的变更摘要。
+历史回放不会读取当前实时环境，只加载当前 Trace Schema 中保存的完整环境快照。
 
 历史列表默认按“任务 ID + 正常/攻击类型 + 攻击配置 + 防御开关”保留最新版本。
 同一配置重复执行会生成新 trace，但旧版本会移动到
@@ -992,7 +993,8 @@ curl -X POST http://localhost:5000/api/execute \
 ```
 
 ```bash
-pip install -e ".[transformers]"
+conda activate agent
+pip install -e ".[transformers,privacy]"
 pip install flask flask-cors networkx
 python -m agentdojo.method.visualization.server
 ```
@@ -1003,7 +1005,7 @@ python -m agentdojo.method.visualization.server
 frontend/index.html
 ```
 
-前端当前从 `https://d3js.org` 加载 D3 v7。完全离线部署时需将 D3 资源本地化。
+前端使用项目内置的 D3 v7（`frontend/vendor/d3.v7.min.js`）。页面直接从本地加载可视化依赖，无需连接 D3 CDN。
 
 执行预设任务：
 
@@ -1090,8 +1092,8 @@ curl -X POST http://localhost:5000/api/config/defense \
 
 - 执行串行锁是单进程锁；多进程部署需要外部锁或按 `task_id` 隔离环境。
 - trace 默认可包含完整邮件、文件内容、账户信息和工具输出，属于敏感审计数据。当前 API 未提供额外鉴权，建议仅在本机可信环境运行。
-- 前端依赖 D3 CDN，离线环境需要本地化依赖。
-- 旧 trace 若没有 `environment_snapshots`，只能恢复环境变更摘要。
+- 前端已内置 D3 v7 本地依赖，无需访问外网即可初始化拓扑图。
+- 当前版本不兼容旧 Trace Schema；旧 Trace 和历史归档已删除。
 - 真实任务执行需要配置可用 LLM API；本地注入分类器需要 `transformers` 和 `torch`。
 - 历史页面只展示每个运行版本的最新 Trace；归档目录中的旧版本不会出现在前端列表中。
 - `deepseek-chat` 是当前可调用但未列入官方稳定模型列表的兼容别名，不应作为长期实验契约；

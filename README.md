@@ -72,11 +72,17 @@ AgentTrace 在 AgentDojo 基准测试框架之上，通过 AOP 拦截器（Monke
 
 ## 快速开始
 
+> 本项目本地运行、测试和演示统一使用 Conda 环境 `agent`。以下命令都应先执行
+> `conda activate agent`；仓库中的 `.venv` 不属于本项目的正式启动环境。
+
 ```bash
-# 1. 创建环境并安装项目基础依赖（Python 3.10+，推荐 3.12）
+# 1. 首次使用时创建环境并安装项目基础依赖（Python 3.10+，推荐 3.12）
 conda create -n agent python=3.12 -y
 conda activate agent
 pip install -e ".[transformers,privacy]"
+
+# 确认当前解释器来自 Conda agent 环境
+python -c "import sys; print(sys.executable)"
 
 # 2. 安装可视化平台依赖
 pip install flask flask-cors networkx
@@ -100,7 +106,7 @@ xdg-open frontend/index.html
 > `models/prompt-injection-guard-small` 多语言后备；
 > Ring 2/Ring 3 使用任务授权、声明式工具元数据、信息流标签和确定性路径检查。
 
-> 前端通过 `https://d3js.org` 加载 D3 v7。完全离线运行时需要把 D3 资源下载到 `frontend/` 并修改 `frontend/index.html` 的脚本地址。
+> 前端使用项目内置的 D3 v7（`frontend/vendor/d3.v7.min.js`），无需联网加载可视化依赖。
 
 ## 环境变量
 
@@ -155,7 +161,7 @@ src/agentdojo/
 ├── agent_pipeline/       # Agent 执行管线与各 LLM 适配
 ├── default_suites/       # 各任务套件（banking/workspace/slack/travel）
 └── scripts/              # 基准测试命令行工具
-frontend/                 # D3.js 可视化前端
+frontend/                 # D3.js 可视化前端（含本地 vendor 依赖）
 method.md                 # 方法层设计与运行流程
 docs/                     # 文档（mkdocs）
 ```
@@ -164,7 +170,7 @@ docs/                     # 文档（mkdocs）
 
 - 当前执行入口在单个 Flask 进程内串行化任务，避免并发任务覆盖 APP 环境、任务基线和 trace。
 - trace 与历史环境快照可能包含完整邮件、文件内容、账户信息等敏感审计数据，建议只在可信的本地环境运行。
-- 旧版 trace 若未保存 `environment_snapshots`，只能回放图谱中的环境变更摘要，无法恢复完整字段级前后值。
+- 当前版本只加载包含完整 `environment_snapshots` 和 `defense_config` 的新版 Trace；旧版本 Trace 与兼容回放代码已删除。
 
 ## 许可证
 

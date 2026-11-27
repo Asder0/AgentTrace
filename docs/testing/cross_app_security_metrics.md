@@ -341,17 +341,17 @@ defense-off executions.
 先做不调用模型的计划检查：
 
 ```powershell
-C:\Users\86534\.conda\envs\agent\python.exe `
-  util_scripts\validate_cross_app_security_metrics.py `
+conda activate agent
+python util_scripts\validate_cross_app_security_metrics.py `
   --dry-run
 ```
 
 真实模型 smoke 运行：
 
 ```powershell
+conda activate agent
 $env:DEEPSEEK_API_KEY = "<key>"
-C:\Users\86534\.conda\envs\agent\python.exe `
-  util_scripts\validate_cross_app_security_metrics.py `
+python util_scripts\validate_cross_app_security_metrics.py `
   --profile smoke `
   --output external_data\validation\cross_app_security_metrics_smoke.json
 ```

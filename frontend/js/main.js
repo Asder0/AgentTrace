@@ -1137,7 +1137,7 @@ const APP = {
         const nodes = graph ? graph.nodes : [];
         const links = graph ? (graph.links || []) : [];
         if (!graph) {
-            this._showHistoryHint('该历史记录未保存拓扑快照（旧版记录），仅显示事件与流转步骤');
+            this._showHistoryHint('该历史记录未保存拓扑快照，仅显示可用事件与步骤');
         }
         GRAPH.setData(nodes, links, { suite: this._resolveTraceSuite(trace) });
         GRAPH.render();
@@ -1214,18 +1214,16 @@ const APP = {
         });
     },
 
-    /**
-     * 解析历史记录所属 suite（新版记录使用 suite 字段，旧记录退回 app_name）。
-     */
+    /** Resolve the suite stored by the current trace schema. */
     _resolveTraceSuite(trace) {
         if (!trace) return null;
-        const suite = trace.suite || trace.app_name || '';
+        const suite = trace.suite || '';
         return ['banking', 'workspace', 'slack', 'travel'].includes(suite) ? suite : null;
     },
 
     /**
      * 从历史记录中恢复风险卡片。
-     * 新版记录直接带有 risk_cards；旧版记录退化为从风险事件推导。
+     * Current records persist normalized risk cards and policy events.
      */
     _buildReplayRiskCards(trace) {
         const normalizeRisk = card => {
@@ -1523,45 +1521,7 @@ const APP = {
             ]);
         }
 
-        const riskEvents = events.filter(
-            e => e && ['risk', 'policy'].includes(e.type)
-        );
-        if (riskEvents.length === 0) return [];
-
-        return RISK_PANEL.dedupeCards(riskEvents.flatMap((event) => {
-            const detail = event.block_reason || event.content || '检测到风险事件';
-            const suite = this._resolveTraceSuite(trace);
-            const risks = Array.isArray(event.risks) && event.risks.length
-                ? event.risks
-                : Array.isArray(event.risk_assessments) && event.risk_assessments.length
-                    ? event.risk_assessments
-                    : Array.isArray(event.policy_events) && event.policy_events.length
-                        ? event.policy_events
-                        : [{}];
-            return risks.map((risk) => normalizeRisk({
-                ring: Number.isFinite(risk.ring) ? risk.ring : event.ring || 0,
-                decision: risk.decision || 'ADVISORY',
-                severity: risk.severity || 'medium',
-                policy_id: risk.policy_id || '',
-                detail: risk.reason || detail,
-                defense_detail: risk.reason || detail,
-                evidence_entity_ids: risk.evidence_entity_ids || [],
-                source_ids: risk.source_ids || [],
-                sink_ids: risk.sink_ids || [],
-                fsm_before: risk.fsm_before || null,
-                fsm_after: risk.fsm_after || null,
-                agent: event.agent_id || 'unknown',
-                action: event.tool_intent || 'unknown',
-                app: this._canonicalAppName(event.target_app, suite) || 'unknown',
-            }));
-        }));
-    },
-
-    /**
-     * 兼容旧 trace 的模块级 APP 名。
-     */
-    _canonicalAppName(app, suite) {
-        return window.AgentTraceAppCatalog.canonicalApp(app, suite);
+        return [];
     },
 
     /**

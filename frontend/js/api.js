@@ -73,37 +73,6 @@ const API = {
     },
 
     /**
-     * 获取事件历史
-     * @returns {Promise<Array>}
-     */
-    async getEvents() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/events`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取事件历史失败:', err.message);
-            throw err;
-        }
-    },
-
-    /**
-     * 获取节点详情
-     * @param {string} nodeId - 节点 ID
-     * @returns {Promise<Object>}
-     */
-    async getNodeDetail(nodeId) {
-        try {
-            const response = await fetch(`${this.BASE_URL}/node/${encodeURIComponent(nodeId)}`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取节点详情失败:', err.message);
-            return null;
-        }
-    },
-
-    /**
      * 获取所有可用的预设场景列表
      * @returns {Promise<Array>}
      */

@@ -934,14 +934,7 @@ def _trace_attack_info(trace: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _trace_defense_enabled(trace: Mapping[str, Any]) -> bool:
-    explicit = trace.get("defense_enabled")
-    if isinstance(explicit, bool):
-        return explicit
-    attack_info = _trace_attack_info(trace)
-    explicit = attack_info.get("defense_enabled")
-    if isinstance(explicit, bool):
-        return explicit
-    return bool(trace.get("task_data_plan"))
+    return trace.get("defense_enabled") is True
 
 
 def _trace_task_identity(trace: Mapping[str, Any]) -> str:
@@ -2052,34 +2045,6 @@ def _hidden_sensitive_values(
     return result
 
 
-def _sensitivity_visibility_summary(
-    details: Sequence[Mapping[str, Any]],
-) -> tuple[str, str]:
-    def format_group(visibility: str) -> str:
-        items = [item for item in details if str(item.get("visibility", "")) == visibility]
-        by_entity: dict[str, list[Mapping[str, Any]]] = {}
-        for item in items:
-            by_entity.setdefault(
-                str(item.get("entity", "related_entity")),
-                [],
-            ).append(item)
-        entity_parts = []
-        for entity, entity_items in by_entity.items():
-            field_parts = []
-            for item in entity_items:
-                count = int(item.get("count", 0) or 0)
-                prefix = f"{count} 条 " if count > 1 else ""
-                categories = "、".join(str(value) for value in item.get("categories", []) if value)
-                category_text = f"，{categories}" if categories else ""
-                field_parts.append(
-                    f"{prefix}{item.get('field', 'unknown')}（{item.get('level', 'unknown')}{category_text}）"
-                )
-            entity_parts.append(f"{entity}：{'、'.join(field_parts)}")
-        return "；".join(entity_parts) or "无"
-
-    return format_group("exposed"), format_group("hidden")
-
-
 def _highest_sensitivity_level(
     details: Sequence[Mapping[str, Any]],
 ) -> str:
@@ -2128,20 +2093,6 @@ def _natural_language_hidden_details(
             }
         )
     return details
-
-
-def _natural_language_hidden_summary(
-    details: Sequence[Mapping[str, Any]],
-) -> str:
-    if not details:
-        return "无"
-    return "、".join(
-        f"{item.get('entity', 'related_entity')}."
-        f"{item.get('field', 'unknown')}"
-        f"（{item.get('status', 'quarantined')}，"
-        f"{item.get('reason', 'prompt_injection')}）"
-        for item in details
-    )
 
 
 def _risk_type_for_user(ring: int, policy_id: str) -> str:
@@ -2362,60 +2313,6 @@ def _injection_user_content(
             if safe_spans:
                 return "检测到的可疑内容：" + " | ".join(safe_spans[:3])
     return "发现一段可能试图改变 Agent 行为的可疑内容，系统已对其进行安全处理。"
-
-
-def _legacy_natural_risk_reason(
-    ring: int,
-    policy_id: str,
-    decision: str,
-    raw_reason: str,
-    action_content: str = "",
-    confirmation_state: Mapping[str, str] | None = None,
-    sensitivity_details: Sequence[Mapping[str, Any]] = (),
-    natural_language_hidden: Sequence[Mapping[str, Any]] = (),
-) -> str:
-    """Explain why the structured policy fired without exposing internal state."""
-    if policy_id.startswith("ring0."):
-        return "用户输入中包含试图覆盖或绕过原始任务目标的指令，因此系统在交给 Agent 前进行了安全处理。"
-    if policy_id.startswith("ring1."):
-        return "Agent 读取到的外部内容中夹带了额外操作指令，可能与您最初的任务目标不一致，因此系统隔离了这部分内容。"
-    if policy_id == "ring2.sensitive_data_exposure_confirmation":
-        confirmation = confirmation_state or {}
-        exposed, hidden = _sensitivity_visibility_summary(sensitivity_details)
-        hidden_content = _natural_language_hidden_summary(natural_language_hidden)
-        if confirmation.get("status") == "approved":
-            return (
-                f"对 Agent 暴露：{exposed}。\n"
-                f"对 Agent 隐藏字段：{hidden}。\n"
-                f"对 Agent 隐藏自然语言内容：{hidden_content}。"
-            )
-        if confirmation.get("status") in {"rejected", "cancelled"}:
-            return (
-                "本次读取已停止。\n"
-                f"原计划暴露：{exposed}。\n"
-                f"对 Agent 隐藏字段：{hidden}。\n"
-                f"对 Agent 隐藏自然语言内容：{hidden_content}。"
-            )
-        return (
-            f"拟向 Agent 暴露：{exposed}。\n"
-            f"对 Agent 隐藏字段：{hidden}。\n"
-            f"对 Agent 隐藏自然语言内容：{hidden_content}。"
-        )
-    if policy_id == "ring2.l2_chain_inconsistent":
-        return "系统判断该高风险操作与当前任务计划、数据来源或操作目标不一致，因此阻止了执行。"
-    if policy_id.startswith("ring2.task_scope"):
-        return "Agent 准备使用的操作、资源或目标不属于当前任务授权范围，因此系统阻止了执行。"
-    if ring == 3 or "sensitive_egress" in policy_id:
-        return "待发送内容包含敏感信息，而目的地或用途不符合当前授权，因此系统暂停或阻止了这次外发。"
-    if decision == "HOLD":
-        action_text = re.sub(r"\s+", " ", str(action_content)).strip().rstrip("。")
-        confirmation = confirmation_state or {}
-        if confirmation.get("status") == "approved":
-            source_label = "默认策略" if confirmation.get("approval_source") == "automatic_default" else "你的确认"
-            return f"系统已根据{source_label}允许该操作继续执行。"
-        return "该操作可能产生重要影响，系统已暂停并等待确认。"
-    compact = re.sub(r"\s+", " ", str(raw_reason or "")).strip()
-    return compact[:500] or "系统根据当前任务授权和风险策略处理了该操作。"
 
 
 def _visibility_field_summary(
@@ -2791,7 +2688,7 @@ def _build_risk_cards_from_events(
                     "decision": "BLOCK",
                     "severity": "high",
                     "reason": event.get("block_reason", ""),
-                    "policy_id": "legacy.block_reason",
+                    "policy_id": "system.block_without_policy",
                     "evidence_entity_ids": [],
                     "source_ids": [],
                     "sink_ids": [],
@@ -3167,21 +3064,6 @@ def _reset_graph_and_context():
 
     ctx = TrackingContext()
     ctx.reset()
-
-
-def _final_assistant_response(messages: list[dict[str, Any]]) -> str:
-    """Return the latest assistant text without tool-call metadata."""
-    for message in reversed(messages or []):
-        if message.get("role") != "assistant":
-            continue
-        raw_content = message.get("content")
-        if isinstance(raw_content, str):
-            content = raw_content.strip()
-        else:
-            content = get_text_content_as_str(raw_content or []).strip()
-        if content:
-            return content
-    return ""
 
 
 def _reconcile_completion_with_evaluation(
@@ -5486,17 +5368,6 @@ def _execute_with_injected_env(
         "steps": trace_steps,
         "total_steps": len(trace_steps),
     }
-
-
-def _get_scenario_name(action: str) -> str:
-    """获取场景的显示名称。
-
-    对于原版任务 ID（如 user_task_0），直接返回 ID 作为名称。
-    """
-    scenario = MOCK_SCENARIOS.get(action)
-    if scenario:
-        return action
-    return action
 
 
 # ============================================================

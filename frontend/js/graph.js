@@ -28,7 +28,7 @@ const GRAPH = {
     // 行号映射（node id → 迭代行下标），用于行间不连线过滤
     _nodeRow: new Map(),
 
-    // 当前图谱所属 suite（用于兼容旧 trace 的模块级 app 名）
+    // Current graph suite used to normalize module-level APP names.
     _contextSuite: null,
     _renderedNodes: null,
     _renderedLinks: null,
@@ -96,7 +96,7 @@ const GRAPH = {
             'used': '#d4862b',
             'produces': '#a371f7',
             'wasDerivedFrom': '#56d4dd',
-            // 旧版兼容（保留但不再使用）
+            // Legacy PROV aliases retained for older trace payloads.
             'wasInformedBy': '#3fb950',
             'wasGeneratedBy': '#a371f7',
             'transition_from': '#58a6ff',
@@ -123,7 +123,7 @@ const GRAPH = {
             'policy_of': '策略判定',
             'egress_to': '外发到',
             'authorizes': '人工授权',
-            // 旧版兼容
+            // PROV alias labels used by normalized graph payloads.
             'wasInformedBy': '通知',
             'wasGeneratedBy': '产出',
         },

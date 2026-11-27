@@ -87,10 +87,6 @@ def _tool_call_records(messages: Sequence[Any]) -> list[dict[str, str]]:
     return observed
 
 
-def _tool_call_count(messages: Sequence[Any]) -> int:
-    return len(_tool_call_records(messages))
-
-
 def evaluate_capture_completeness(
     messages: Sequence[Any],
     events: Sequence[Mapping[str, Any]],

@@ -3932,42 +3932,6 @@ def _authorization_value_is_grounded(
     )
 
 
-def _resource_authorization_errors(
-    raw_contract: Any,
-    *,
-    prompt_text: str,
-    trusted_identity_values: Sequence[str],
-    action_name: str,
-    contract_kind: str,
-) -> list[str]:
-    """Validate only authority-bearing literal resource selectors."""
-    if not isinstance(raw_contract, Mapping):
-        return []
-    raw_resources = raw_contract.get("resource_parameters", {})
-    if not isinstance(raw_resources, Mapping):
-        return []
-    errors: list[str] = []
-    for raw_name, raw_rule in raw_resources.items():
-        if not isinstance(raw_rule, Mapping):
-            continue
-        if str(raw_rule.get("mode", "literal")).lower() != "literal":
-            continue
-        values = raw_rule.get("allowed_values", [])
-        if not isinstance(values, list):
-            values = [values]
-        for value in values:
-            if value in (None, ""):
-                continue
-            if not _authorization_value_is_grounded(
-                value,
-                prompt_text,
-                trusted_identity_values,
-                str(raw_rule.get("semantic_type", "")),
-            ):
-                errors.append(f"{contract_kind}_value_not_grounded:{action_name}:{raw_name}:{value}")
-    return errors
-
-
 def _destination_authorization_errors(
     raw_flow_contract: Any,
     *,

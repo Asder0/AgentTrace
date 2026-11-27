@@ -22,7 +22,6 @@ const STORAGE_VIEW = {
     _pendingTool: null,
     _traceSnapshots: null,
     _traceContext: null,
-    _traceLegacy: false,
     _expandedChangeGroups: new Set(),
 
     init() {
@@ -123,14 +122,6 @@ const STORAGE_VIEW = {
         this._mode = 'diff';
         this._expandedChangeGroups.clear();
         this._traceSnapshots = trace?.environment_snapshots || null;
-        this._traceLegacy = false;
-        if (!this._traceSnapshots && trace?.graph) {
-            const legacy = this._legacyTraceSnapshots(trace);
-            if (Object.keys(legacy).length) {
-                this._traceSnapshots = legacy;
-                this._traceLegacy = true;
-            }
-        }
         this._selectedChange = null;
         this._detail = null;
         if (this._traceSnapshots) {
@@ -143,7 +134,6 @@ const STORAGE_VIEW = {
     clearTrace() {
         this._traceContext = null;
         this._traceSnapshots = null;
-        this._traceLegacy = false;
         this._expandedChangeGroups.clear();
         this._detail = null;
         this._selectedChange = null;
@@ -196,58 +186,6 @@ const STORAGE_VIEW = {
         if (this.el?.locateGraph) this.el.locateGraph.disabled = true;
     },
 
-    _legacyTraceSnapshots(trace) {
-        const nodes = Array.isArray(trace.graph?.nodes) ? trace.graph.nodes : [];
-        const grouped = new Map();
-        const kinds = { created: 'added', updated: 'changed', deleted: 'removed' };
-        nodes.forEach((node) => {
-            if (node.type !== 'DomainData') return;
-            const kind = kinds[String(node.operation || '').toLowerCase()];
-            if (!kind) return;
-            const suite = ['workspace', 'banking', 'slack', 'travel'].includes(node.app)
-                ? node.app
-                : '';
-            if (!suite) return;
-            if (!grouped.has(suite)) grouped.set(suite, []);
-            grouped.get(suite).push({
-                path: `${suite}.${node.entity_type || 'entity'}.${node.id}`,
-                kind,
-                before: node.environment_delta?.before
-                    ?? '旧版 trace 未保存变更前值',
-                after: node.environment_delta?.after
-                    ?? node.label
-                    ?? node.id,
-                entity: node.entity_type || '环境数据',
-                field: node.id,
-                sensitivity: {
-                    level: node.flow_label?.confidentiality?.level || 'secret',
-                    entity: node.entity_type || '',
-                },
-            });
-        });
-
-        const result = {};
-        grouped.forEach((changes, suite) => {
-            const counts = { added: 0, changed: 0, removed: 0 };
-            changes.forEach(change => { counts[change.kind] += 1; });
-            result[suite] = {
-                initial: {},
-                current: {},
-                diff: {
-                    changes,
-                    counts,
-                    total: changes.length,
-                    truncated: false,
-                    legacy_summary_only: true,
-                },
-                baseline_captured_at: '',
-                captured_at: trace.timestamp || '',
-                baseline_source: 'legacy_graph_summary',
-            };
-        });
-        return result;
-    },
-
     _renderTraceSuite(suite) {
         const snapshot = this._traceSnapshots?.[suite];
         if (!snapshot) {
@@ -271,7 +209,6 @@ const STORAGE_VIEW = {
             generated_at: snapshot.captured_at || this._traceContext?.timestamp || '',
             baseline_source: snapshot.baseline_source || 'task_start_after_fixtures',
             historical_trace_id: this._traceContext?.trace_id || '',
-            legacy_summary_only: this._traceLegacy,
         };
         this._graphEvidence = this._collectGraphEvidence(suite);
         this._selectedChange = null;
@@ -695,19 +632,13 @@ const STORAGE_VIEW = {
                 ? `当前 ${this._detail.generated_at}`
                 : '';
             this.el.status.textContent = [baseline, current].filter(Boolean).join(' · ');
-            if (this._detail.legacy_summary_only) {
-                this.el.status.textContent = '旧版历史记录 · 仅保留环境变更摘要';
-            }
         }
     },
 
     _syncModeControls() {
         document.querySelectorAll('.storage-mode-btn').forEach((button) => {
             button.classList.toggle('active', button.dataset.mode === this._mode);
-            button.disabled = Boolean(
-                this._detail?.legacy_summary_only
-                && button.dataset.mode !== 'diff'
-            );
+            button.disabled = false;
         });
         if (this.el.onlyChanges) {
             this.el.onlyChanges.disabled = this._mode === 'diff';

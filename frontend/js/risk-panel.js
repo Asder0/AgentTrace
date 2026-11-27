@@ -214,14 +214,8 @@ const RISK_PANEL = {
 
     _attentionKind(card) {
         const explicit = String(card?.attention_kind || '');
-        const legacyKinds = {
-            attack: 'prompt_injection',
-            sensitive_read: 'sensitive_llm_exposure',
-            sensitive_reference: 'sensitive_llm_exposure',
-            authorization: 'high_risk_authorization',
-        };
         if (explicit) {
-            return legacyKinds[explicit] || explicit;
+            return explicit;
         }
         const policyId = String(card?.policy_id || '');
         if (

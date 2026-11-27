@@ -16,7 +16,6 @@ from dateutil import parser as date_parser
 from ..modeling.data_sensitivity import (
     ValueOrigin,
     canonical_entity_name,
-    normalize_data_path,
     origins_for_entity_refs,
     value_key,
 )

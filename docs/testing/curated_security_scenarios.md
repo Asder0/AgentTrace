@@ -13,17 +13,17 @@
 运行全部场景：
 
 ```powershell
+conda activate agent
 $env:PYTHONIOENCODING = "utf-8"
 $env:DEEPSEEK_API_KEY = "<key>"
-& "C:\Users\86534\.conda\envs\agent\python.exe" `
-  util_scripts\validate_curated_security_scenarios.py
+python util_scripts\validate_curated_security_scenarios.py
 ```
 
 只运行指定场景：
 
 ```powershell
-& "C:\Users\86534\.conda\envs\agent\python.exe" `
-  util_scripts\validate_curated_security_scenarios.py `
+conda activate agent
+python util_scripts\validate_curated_security_scenarios.py `
   --case cross_app_success `
   --case direct_injection
 ```

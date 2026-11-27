@@ -298,8 +298,8 @@
             }
             return '外发内容涉及敏感数据，已按当前外发策略完成检查和处理。';
         }
-        if (policyId === 'legacy.block_reason') {
-            return '旧版安全事件没有结构化策略编号，已按阻断事件记录。';
+        if (policyId === 'system.block_without_policy') {
+            return '阻断事件没有结构化策略编号，已按安全阻断记录。';
         }
         return ring === 1
             ? '不可信内容触发了审计提醒，已记录风险标签。'

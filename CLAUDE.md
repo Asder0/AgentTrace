@@ -10,35 +10,35 @@ AgentDojo is a dynamic environment to evaluate prompt injection attacks and defe
 
 ### Development Setup
 ```bash
-# Install all dependencies including dev, docs, and extras
-uv sync --dev --group docs --all-extras --no-lock
-
-# Install without extras (basic development)
-uv sync --dev
+# Local development uses the Conda environment named `agent`
+conda create -n agent python=3.12 -y
+conda activate agent
+pip install -e ".[transformers,privacy]"
+pip install pytest ruff pyright mkdocs-material python-dotenv
 ```
 
 ### Testing
 ```bash
 # Run all tests
-uv run pytest tests
+python -m pytest tests
 
 # Run a specific test file
-uv run pytest tests/test_benchmark.py
+python -m pytest tests/test_benchmark.py
 
 # Run tests with verbose output
-uv run pytest -v tests
+python -m pytest -v tests
 ```
 
 ### Linting and Type Checking
 ```bash
 # Run linter with auto-fix
-uv run ruff check --fix .
+python -m ruff check --fix .
 
 # Format code
-uv run ruff format
+python -m ruff format
 
 # Run type checker
-uv run pyright
+python -m pyright
 ```
 
 ### Running the Benchmark
@@ -59,13 +59,13 @@ python -m agentdojo.scripts.benchmark --help
 ### Documentation
 ```bash
 # Build and serve docs locally
-uv run mkdocs serve  # Available at http://localhost:8000
+python -m mkdocs serve  # Available at http://localhost:8000
 
 # Deploy docs to GitHub Pages
-uv run mkdocs gh-deploy --force
+python -m mkdocs gh-deploy --force
 
 # Generate results table for docs
-uv run util_scripts/create_results_table.py
+python util_scripts/create_results_table.py
 ```
 
 ## Code Architecture
@@ -143,7 +143,8 @@ Tests are organized by component in the `tests/` directory. Key test areas:
 
 Always run the full test suite before committing changes:
 ```bash
-uv run pytest tests
-uv run ruff check .
-uv run pyright
+conda activate agent
+python -m pytest tests
+python -m ruff check .
+python -m pyright
 ```

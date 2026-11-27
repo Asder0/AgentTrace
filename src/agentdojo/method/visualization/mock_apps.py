@@ -222,16 +222,6 @@ def build_injected_environment(suite_name: str, injection_string: str) -> Any:
     return suite.load_and_inject_default_environment(injections)
 
 
-def _create_default_workspace_env() -> Any:
-    """兼容旧调用：直接使用原版 TaskSuite 环境（自动替换注入占位符默认值）。"""
-    return _get_suite_env("workspace")
-
-
-def _create_default_banking_env() -> Any:
-    """兼容旧调用：直接使用原版 TaskSuite 环境（自动替换注入占位符默认值）。"""
-    return _get_suite_env("banking")
-
-
 # ============================================================
 # FunctionsRuntime instances for each APP
 # ============================================================
