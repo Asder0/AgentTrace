@@ -55,7 +55,6 @@ const APP = {
         };
 
         initModule('GRAPH', () => GRAPH.init());
-        initModule('TIMELINE', () => TIMELINE.init());
         initModule('RISK_PANEL', () => RISK_PANEL.init());
         initModule('STATUS_PANEL', () => STATUS_PANEL.init());
         initModule('STORAGE_VIEW', () => STORAGE_VIEW.init());
@@ -955,13 +954,11 @@ const APP = {
     _switchView(tabName) {
         const graphPanel = document.querySelector('.graph-panel');
         const sidePanel = document.querySelector('.side-panel');
-        const timelinePanel = document.querySelector('.timeline-panel');
         const mainContainer = document.querySelector('.main-container');
         const storageView = document.getElementById('storageView');
 
         if (tabName === 'storage') {
             if (mainContainer) mainContainer.style.display = 'none';
-            if (timelinePanel) timelinePanel.style.display = 'none';
             if (storageView) storageView.hidden = false;
             document.getElementById('statusText').textContent = '环境变更';
             document.querySelector('.status-dot').className = 'status-dot';
@@ -980,7 +977,6 @@ const APP = {
                 // 实时监控：显示所有面板
                 graphPanel.style.display = 'flex';
                 sidePanel.style.display = 'flex';
-                timelinePanel.style.display = 'flex';
                 if (Store.get('replaying')) {
                     this.exitReplay();
                 } else {
@@ -993,7 +989,6 @@ const APP = {
                 // 历史回放：放大拓扑图，隐藏风险卡片
                 graphPanel.style.display = 'flex';
                 sidePanel.style.display = 'flex';
-                timelinePanel.style.display = 'flex';
                 if (!Store.get('replaying')) {
                     document.getElementById('statusText').textContent = '回放';
                 }
@@ -1004,7 +999,6 @@ const APP = {
                 // 风险审计：放大风险卡片，缩小拓扑图
                 graphPanel.style.display = 'flex';
                 sidePanel.style.display = 'flex';
-                timelinePanel.style.display = 'none';
                 document.getElementById('statusText').textContent = '审计';
                 document.querySelector('.status-dot').className = 'status-dot';
                 // 滚动到风险卡片区域
@@ -1071,6 +1065,10 @@ const APP = {
                 const meta = document.createElement('span');
                 meta.className = 'history-item-meta';
                 meta.textContent = [
+                    trace.run_kind === 'attack'
+                        ? `攻击${trace.attack_type ? `：${trace.attack_type}` : ''}`
+                        : '正常任务',
+                    trace.defense_enabled ? '防御开启' : '防御关闭',
                     trace.timestamp,
                     trace.app_name,
                     trace.total_steps ? `${trace.total_steps} 步` : '',
@@ -1084,13 +1082,32 @@ const APP = {
             }
 
             panel.querySelectorAll('.history-item').forEach((el) => {
-                el.addEventListener('click', () => this._replayTrace(el.dataset.traceId));
+                el.addEventListener(
+                    'click',
+                    () => this._replayTrace(
+                        el.dataset.traceId,
+                        el,
+                    ),
+                );
             });
         }
 
         panel.classList.add('visible');
     },
-    async _replayTrace(tid) {
+    async _replayTrace(tid, trigger = null) {
+        const triggerTitle = trigger?.querySelector(
+            '.history-item-title'
+        );
+        const originalTitle = triggerTitle?.textContent || '';
+        if (trigger) {
+            trigger.disabled = true;
+            trigger.classList.add('history-item-loading');
+        }
+        if (triggerTitle) {
+            triggerTitle.textContent = (
+                '正在加载历史记录，大记录可能需要数秒...'
+            );
+        }
         let trace;
         try {
             trace = await API.getTrace(tid);
@@ -1098,6 +1115,13 @@ const APP = {
             console.error('[app] 加载历史记录失败:', err);
         }
         if (!trace) {
+            if (trigger) {
+                trigger.disabled = false;
+                trigger.classList.remove('history-item-loading');
+            }
+            if (triggerTitle) {
+                triggerTitle.textContent = originalTitle;
+            }
             this._showHistoryHint('历史记录加载失败，请刷新后重试');
             return;
         }
@@ -1119,11 +1143,8 @@ const APP = {
         GRAPH.render();
         if (typeof STORAGE_VIEW !== 'undefined') STORAGE_VIEW.setTrace(trace);
 
-        // 2. 执行时间线（合并生命周期步骤与真实事件内容）
+        // 2. 风险卡片与统计概览（使用历史快照，而不是实时数据）
         const events = Array.isArray(trace.events) ? trace.events : [];
-        TIMELINE.setTrace(trace, 'top');
-
-        // 3. 风险卡片与统计概览（使用历史快照，而不是实时数据）
         const riskCards = this._buildReplayRiskCards(trace);
         RISK_PANEL.render(riskCards);
 
@@ -1291,12 +1312,22 @@ const APP = {
                     event.l2_confirmation
                     && typeof event.l2_confirmation === 'object'
                 ) ? event.l2_confirmation : {};
+                const confirmationRelevant = (
+                    String(card.policy_id || '').startsWith(
+                        'ring2.sensitive_data_exposure_'
+                    )
+                    || [
+                        'ring2.l2_confirmation',
+                        'ring2.l2_confirmation_rejected',
+                        'ring2.source_risk_confirmation',
+                    ].includes(String(card.policy_id || ''))
+                );
                 const status = String(
                     authorization?.status
                     || confirmation.status
                     || ''
                 );
-                if (status) {
+                if (status && confirmationRelevant) {
                     const approved = (
                         status === 'approved'
                         || authorization?.approved === true
@@ -1416,7 +1447,10 @@ const APP = {
                                 : ''
                         }Slack 私信`
                         : `“${action}”`;
-                    card.user_view = {
+                    card.user_view = (
+                        card.user_view?.content
+                        && card.user_view?.reason
+                    ) ? card.user_view : {
                         ...(card.user_view || {}),
                         content: runtimePhase
                             ? `${actionText}；实际检测字段：${fieldText}；最高等级：${currentLevel}。`
@@ -1557,7 +1591,6 @@ const APP = {
 
         Store.set('replaying', false);
         if (typeof STORAGE_VIEW !== 'undefined') STORAGE_VIEW.clearTrace();
-        TIMELINE.clear();
 
         const statusText = document.getElementById('statusText');
         if (statusText) statusText.textContent = '实时';
@@ -1735,7 +1768,6 @@ const APP = {
                     if (Store.get('replaying')) this.exitReplay({ reload: false });
                     await API.resetData();
                     await GRAPH.loadData();
-                    TIMELINE.clear();
                     RISK_PANEL.loadRiskCards();
                     Store.set('lastNodeCount', 0);
                     Store.set('lastEdgeCount', 0);
@@ -1781,10 +1813,6 @@ const APP = {
                         
                         Store.set('lastNodeCount', newNodeCount);
                         Store.set('lastEdgeCount', newEdgeCount);
-                        
-                        if (data.events) {
-                            TIMELINE.loadEvents(data.events);
-                        }
                         
                         const riskCards = await RISK_PANEL.loadRiskCards();
                         GRAPH.updateStats(

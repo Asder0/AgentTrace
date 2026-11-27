@@ -27,9 +27,9 @@
 ### 前端架构
 frontend/index.html - 主页面
 frontend/js/graph.js - D3.js 拓扑图
-frontend/js/timeline.js - 执行时间线（合并步骤与事件）
 frontend/js/risk-panel.js - 风险卡片面板
 frontend/js/status-panel.js - 系统状态面板
+frontend/js/audit-summary.js - 任务总结与确定性结果核验
 frontend/js/console.js - 操作控制台
 frontend/js/storage-view.js - 环境变更（字段差异、敏感等级与完整快照）
 frontend/js/api.js - API 通信层
@@ -53,14 +53,14 @@ frontend/css/style.css - 暗色主题样式
 - 拖拽/缩放/平移，重置视图自动适配画布
 
 ### 风险审计功能
-- 风险卡片按 Ring 分类展示
-- 执行时间线：合并生命周期步骤与事件内容，支持全部/阶段/LLM/工具/风险筛选
-- 阻断步骤标记与图谱节点定位
-- 时间线面板支持拖拽 / 方向键调整高度，双击恢复默认
+- 风险卡片按提示注入、敏感数据外发、高风险操作授权和敏感数据对 LLM 暴露分类展示
+- 点击风险卡片可聚焦对应工具、数据、授权、风险和出口节点
+- 统计概览展示当前可见节点、关系、执行事件和风险卡片数量
+- 任务总结展示跨 APP 路径、工具调用、外发行为、字段范围、数据类别和确定性结果核验
 
 ### 环境变更
 - 默认按“实体 → 字段差异”展示环境变化，并标注人工配置的敏感等级
-- 变更详情并排展示变更前后值，支持从图谱节点和时间线工具步骤定位到对应变更
+- 变更详情并排展示变更前后值，支持从图谱节点和工具调用定位到对应变更
 - 支持按 APP、实体、字段、值或敏感等级搜索
 - 完整初始/当前快照保留为辅助视图，自动刷新默认关闭
 - 新 trace 保存任务基线和执行后快照，可在历史回放中恢复当次环境差异；旧 trace 会明确提示快照不可用
@@ -76,44 +76,40 @@ frontend/css/style.css - 暗色主题样式
 ## 四、知识图谱建模
 
 src/agentdojo/method/modeling/graph_db.py 实现 FSM + PROV 融合知识图谱:
-- PROV 实体: AIAgent, AIModelInvocation, AgentTool, Prompt, DomainData
-- PROV 关系: belongsTo, informed, used, produces, wasDerivedFrom
+- PROV 实体: AIAgent, AIModelInvocation, AgentTool, Prompt, DomainData、
+  HumanAuthorization、PolicyEvent、RiskEvent、EgressSink
+- PROV/审计关系: belongsTo, informed, used, produces, wasDerivedFrom、
+  authorizes, policy_of, risk_of, risk_evidence, egress_to
 - FSM 状态机: State - Transition - State
 - 使用 NetworkX 内存实现
 
 ## 五、后端 API 服务器
 
-src/agentdojo/method/visualization/server.py (1854 行)
+src/agentdojo/method/visualization/server.py
 Flask REST API, 使用真实 AgentPipeline 执行
 提供 15+ 个 API 端点覆盖图谱/事件/风险/执行/攻击场景等
 
 ## 六、测试覆盖
 
-tests/test_method.py - 1 项基础集成测试
-tests/test_method_with_llm.py - 完整功能测试
+当前测试按机制拆分在多个文件中：
 
-无 LLM 测试:
-- test_capture_layer (Capture)
-- test_ring1_topology (Ring 1)
-- test_ring2_ifc (Ring 2)
-- test_ring3_flow (Ring 3)
-- test_modeling_layer (Modeling)
-- test_visualization_layer (Visualization)
-
-带 LLM 测试:
-- test_ring1_with_llm
-- test_ring2_with_llm
-- test_ring3_with_llm
-- test_full_pipeline_with_llm
+- `tests/test_flow_policy.py`：Ring 2/3 数据流与来源策略
+- `tests/test_ring0_ring1_scanner.py`：直接注入、工具输出注入和 span 处理
+- `tests/test_ring3_flow.py`：敏感数据外发检查
+- `tests/test_plan_scope_mechanism.py`、`tests/test_plan_contract_matrix.py`：任务计划与执行约束
+- `tests/test_cross_app_tasks.py`：跨 APP 任务、攻击构造和真值评测
+- `tests/test_cross_app_security_metrics.py`：安全指标与配对运行
+- `tests/test_visualization_config.py`、`tests/test_trace_history.py`、`tests/test_risk_visualization.py`：前端配置同步、历史保留和风险展示
+- `tests/test_method_with_llm.py`：真实或模拟 LLM 管线集成测试
 
 ## 七、总结
 
 | 要求 | 实现 | 状态 |
 |------|------|------|
 | 数据流捕获 | interceptor.py + environment_snapshot.py | 通过 |
-| 拓扑图可视化 | frontend/js/graph.js (D3.js 1411 行) | 通过 |
+| 拓扑图可视化 | frontend/js/graph.js（D3.js） | 通过 |
 | 异常行为高亮 | 红色描边高亮 + 风险卡片 | 通过 |
-| 审计与回溯 | 时间线 + 追踪面板 | 通过 |
+| 审计与回溯 | 拓扑图 + 任务总结 + 风险卡片 + 历史回放 | 通过 |
 | 至少 3 个 APP | 4 个 Task Suite（banking/workspace/slack/travel） | 通过 |
 | 敏感数据标记 | Ring 3 APP 原生实体标签与信息流继承 | 通过 |
 | 异常告警 | Ring 1 + 风险卡片 | 通过 |

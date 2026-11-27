@@ -123,12 +123,15 @@ const API = {
      * @param {string} action - 操作名称
      * @returns {Promise<Object>} 更新后的图谱数据
      */
-    async executeAction(action) {
+    async executeAction(action, runtimeOptions = {}) {
         try {
             const response = await fetch(`${this.BASE_URL}/execute`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action })
+                body: JSON.stringify({
+                    action,
+                    ...runtimeOptions,
+                })
             });
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             return await response.json();

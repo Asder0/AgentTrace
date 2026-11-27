@@ -67,6 +67,7 @@
 
     const categoryLabels = {
         email: '邮件',
+        financial_amount: '金额',
         financial_data: '金融数据',
         banking: '银行数据',
         credential: '凭证',
@@ -286,7 +287,16 @@
                 : `“${action}”不在当前任务授权范围内，操作已阻断。`;
         }
         if (policyId === 'ring3.sensitive_egress') {
-            return '外发内容涉及敏感数据，但接收方、数据来源或敏感等级校验未通过，操作已阻断。';
+            const normalizedDecision = String(
+                decision || ''
+            ).toUpperCase();
+            if (normalizedDecision === 'ADVISORY') {
+                return '外发内容涉及敏感数据，接收方、数据来源或敏感等级存在告警，操作已记录告警并允许继续执行。';
+            }
+            if (normalizedDecision === 'BLOCK') {
+                return '外发内容涉及敏感数据，且接收方、数据来源或敏感等级校验未通过，操作已阻断。';
+            }
+            return '外发内容涉及敏感数据，已按当前外发策略完成检查和处理。';
         }
         if (policyId === 'legacy.block_reason') {
             return '旧版安全事件没有结构化策略编号，已按阻断事件记录。';
@@ -414,9 +424,11 @@
         if (kind === 'incomplete') {
             const missing = Number(outcomeCounts.unsatisfied || 0);
             const uncertain = Number(outcomeCounts.uncertain || 0);
+            const unexpected = Number(outcomeCounts.unexpected || 0);
             return [
                 '任务未完成。',
                 missing ? `${missing} 项必需结果未满足。` : '',
+                unexpected ? `${unexpected} 项计划外环境变化。` : '',
                 uncertain ? `${uncertain} 项结果无法验证。` : '',
             ].filter(Boolean).join('');
         }
@@ -483,6 +495,181 @@
             title = 'Ring 0：直接提示注入隔离';
         }
         const severity = String(card.severity || 'medium').toLowerCase();
+        const userView = (
+            card.user_view
+            && typeof card.user_view === 'object'
+        ) ? card.user_view : {};
+        const originalReason = String(
+            userView.reason || card.user_reason || ''
+        );
+        const originalContent = String(
+            userView.content || card.user_content || ''
+        );
+        const isExposureCard = (
+            policyId
+            === 'ring2.sensitive_data_exposure_confirmation'
+        );
+        const isInjectionCard = (
+            policyId.startsWith('ring0.')
+            || policyId.startsWith('ring1.')
+        );
+        const splitLabeledLines = (value) => String(value || '')
+            .replace(
+                /；\s*(?=计划上限|敏感类别|隐藏字段|LLM 可见|仅以|对 Agent|内容等级|来源状态|来源：|接收方：)/g,
+                '\n'
+            )
+            .replace(
+                /;\s*(?=未向 LLM|LLM 可见|仅以|对 Agent)/g,
+                '\n'
+            );
+        let normalizedContent = originalContent;
+        if (isExposureCard) {
+            const segments = originalContent
+                .split(/;\s*/)
+                .map(item => item.trim())
+                .filter(Boolean);
+            const first = segments[0] || '';
+            const actionMatch = first.match(
+                /^(.*?)(?::|：)\s*(?:LLM 可见字段|LLM 分析字段)/
+            );
+            const hiddenCount = segments.filter(
+                item => item.startsWith('未向 LLM 展示')
+            ).length;
+            const visibleCount = segments.filter(
+                item => (
+                    item.startsWith('LLM 可见字段')
+                    || item.startsWith('LLM 分析字段')
+                )
+            ).length + (actionMatch ? 1 : 0);
+            if (actionMatch && (visibleCount || hiddenCount)) {
+                normalizedContent = (
+                    `${actionMatch[1].trim()}。\n`
+                    + `拟向 Agent 提供 ${visibleCount} 个字段；`
+                    + `以占位符引用 0 个；`
+                    + `隐藏 ${hiddenCount} 个。`
+                );
+            } else {
+                normalizedContent = splitLabeledLines(
+                    normalizedContent
+                );
+            }
+            const auditValues = Array.isArray(
+                userView.hidden_sensitive_values
+                || card.hidden_sensitive_values
+            )
+                ? (
+                    userView.hidden_sensitive_values
+                    || card.hidden_sensitive_values
+                )
+                : [];
+            if (auditValues.length) {
+                const hiddenCount = new Set(
+                    auditValues
+                        .filter(item => (
+                            String(item.visibility || 'hidden')
+                            === 'hidden'
+                        ))
+                        .map(item => String(item.field || ''))
+                ).size;
+                const referenceCount = new Set(
+                    auditValues
+                        .filter(item => (
+                            String(item.visibility || '')
+                            === 'reference'
+                        ))
+                        .map(item => String(item.field || ''))
+                ).size;
+                const visibleCount = (
+                    Array.isArray(card.sensitivity_details)
+                        ? card.sensitivity_details
+                        : []
+                ).reduce((total, item) => (
+                    (
+                        item.visibility === 'analysis'
+                        || item.visibility === 'exposed'
+                    )
+                        ? total + Number(item.count || 0)
+                        : total
+                ), 0);
+                const actionText = originalContent
+                    .split(/\n|;\s*/)[0]
+                    .replace(
+                        /[:：]\s*(?:LLM 可见字段|LLM 分析字段).*$/,
+                        ''
+                    )
+                    .replace(/[。.\s]+$/, '')
+                    .trim();
+                normalizedContent = (
+                    `${actionText || '当前读取操作'}。\n`
+                    + `拟向 Agent 提供 ${visibleCount} 个字段；`
+                    + `以占位符引用 ${referenceCount} 个；`
+                    + `隐藏 ${hiddenCount} 个。`
+                );
+            }
+        }
+        if (isInjectionCard) {
+            normalizedContent = normalizedContent
+                .replace(/。\s*来源字段：/g, '。\n来源字段：');
+        }
+        const normalizeEgressAdvisoryReason = (
+            decision === 'ADVISORY'
+            && policyId === 'ring3.sensitive_egress'
+            && originalReason.includes('外发检查未通过')
+        );
+        let normalizedReason = normalizeEgressAdvisoryReason
+            ? (
+                '触发敏感数据外发告警。\n'
+                + splitLabeledLines(
+                    originalReason
+                    .replace(/^.*?的外发检查未通过：/, '')
+                    .replace(
+                        '接收方为受控派生目标',
+                        '接收方：由任务数据动态解析，属于受控授权目标'
+                    )
+                    .replace(
+                        /内容等级 ([^，。；]+)，上限 ([^；。]+)/,
+                        '内容等级 $1，未超过计划上限 $2'
+                    )
+                    .replace(
+                        '来源状态 complete',
+                        '来源：完整（complete）'
+                    )
+                    .replace(/。$/, '')
+                    + '。'
+                )
+            )
+            : originalReason;
+        if (isExposureCard) {
+            normalizedReason = splitLabeledLines(
+                normalizedReason
+            );
+        }
+        if (
+            [
+                'ring2.l2_confirmation',
+                'ring2.source_risk_confirmation',
+            ].includes(policyId)
+            && String(card.action || '') === 'send_direct_message'
+        ) {
+            normalizedReason = normalizedReason.replace(
+                '该操作会向外部接收方发送内容，属于 L2 外发。',
+                '该操作会向指定 Slack 用户发送消息并写入会话记录，属于 L2 外发。'
+            );
+        }
+        const actionEcho = originalContent
+            .replace(/[。.\s]+$/, '')
+            .trim();
+        if (
+            actionEcho
+            && normalizedReason.startsWith(actionEcho)
+        ) {
+            normalizedReason = normalizedReason
+                .slice(actionEcho.length)
+                .replace(/^[。\s：:，,]+/, '');
+        }
+        const hasNormalizedViewText = Boolean(
+            normalizedContent || normalizedReason
+        );
         return {
             ...card,
             ring,
@@ -510,6 +697,15 @@
                 policyId,
                 phase,
             ),
+            user_content: normalizedContent || card.user_content,
+            user_reason: normalizedReason || card.user_reason,
+            user_view: hasNormalizedViewText
+                ? {
+                    ...userView,
+                    content: normalizedContent || userView.content,
+                    reason: normalizedReason,
+                }
+                : card.user_view,
         };
     }
 

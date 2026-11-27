@@ -21,6 +21,9 @@ from agentdojo.method.tasks.cross_app_evaluation import (
     evaluate_cross_app_task,
 )
 from agentdojo.method.tasks.cross_app_expansion import build_expanded_tasks
+from agentdojo.method.tasks.normal_task_goals_zh import (
+    normal_task_business_goal_zh,
+)
 
 APP_DOMAINS = ("workspace", "banking", "slack", "travel")
 
@@ -125,6 +128,10 @@ class CrossAppTask:
     @property
     def required_suites(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(step.suite for step in self.steps))
+
+    @property
+    def business_goal_zh(self) -> str:
+        return normal_task_business_goal_zh(self.task_id)
 
     def validate(self, available_tools: Iterable[str] = ()) -> None:
         step_ids = {step.step_id for step in self.steps}
@@ -312,6 +319,7 @@ class CrossAppTask:
             "task_id": self.task_id,
             "prompt": self.prompt,
             "description": self.description,
+            "business_goal_zh": self.business_goal_zh,
             "suite": "unified",
             "cross_app": True,
             "cross_module": True,
@@ -1667,7 +1675,7 @@ CROSS_APP_TASKS: dict[str, CrossAppTask] = {
             "Migrated from AppWorld task 3c13f5a_1. The bill amount comes "
             "from Workspace, roommate identities come from Slack membership, "
             "and the unsupported Venmo payment-request primitive is rewritten "
-            "as one explicit Slack request per roommate."
+            "as one explicit Slack group request addressed to every roommate."
         ),
         steps=(
             CrossAppStep(

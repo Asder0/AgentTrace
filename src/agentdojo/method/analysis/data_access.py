@@ -2552,7 +2552,212 @@ def project_agent_exposure(
             ]
         return projected_value
 
+    projected_hidden_paths: set[str] = set()
+    projected_opaque_paths: set[str] = set()
+
+    def collect_projection_markers(
+        value: Any,
+        path: str,
+    ) -> None:
+        if isinstance(value, str) and value.startswith("[HIDDEN"):
+            projected_hidden_paths.add(path)
+            return
+        if (
+            isinstance(value, Mapping)
+            and set(value) == {"$ref"}
+        ):
+            projected_opaque_paths.add(path)
+            return
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                collect_projection_markers(
+                    child,
+                    f"{path}.{key}",
+                )
+            return
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                collect_projection_markers(
+                    child,
+                    f"{path}[{index}]",
+                )
+
+    collect_projection_markers(projected, "$")
     projected = semanticize(projected, plain, "$")
+    user_hidden_values: list[dict[str, Any]] = []
+    seen_hidden_values: set[tuple[str, str, str]] = set()
+
+    def append_user_hidden_value(
+        source_path: str,
+        raw_value: Any,
+        visibility: str,
+        *,
+        level: str = "",
+        categories: Sequence[str] = (),
+        reference: str = "",
+    ) -> None:
+        policy = inspected_policies.get(source_path)
+        if policy is None:
+            policy = policy_for_exposure(source_path)
+        raw_value = copy.deepcopy(raw_value)
+        actual_level = str(
+            level
+            or policy.get("level", "unknown")
+            or "unknown"
+        )
+        actual_categories = list(
+            categories
+            or policy.get("categories", [])
+            or []
+        )
+        try:
+            value_key = json.dumps(
+                raw_value,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            value_key = str(raw_value)
+        dedupe_key = (
+            normalize_data_path(source_path),
+            actual_level,
+            value_key,
+        )
+        if dedupe_key in seen_hidden_values:
+            return
+        seen_hidden_values.add(dedupe_key)
+        user_hidden_values.append(
+            {
+                "field": source_path,
+                "value": raw_value,
+                "level": actual_level,
+                "categories": actual_categories,
+                "visibility": visibility,
+                "reference": reference,
+            }
+        )
+
+    for reference, details in references.items():
+        source_path = str(details.get("source_path", "") or "")
+        if not source_path:
+            continue
+        visibility = ""
+        if any(
+            _resource_path_matches(source_path, pattern)
+            for pattern in hidden
+        ) or any(
+            _resource_path_matches(source_path, pattern)
+            for pattern in projected_hidden_paths
+        ):
+            visibility = "hidden"
+        elif any(
+            _resource_path_matches(source_path, pattern)
+            for pattern in opaque
+        ) or any(
+            _resource_path_matches(source_path, pattern)
+            for pattern in projected_opaque_paths
+        ):
+            visibility = "reference"
+        if not visibility:
+            continue
+        append_user_hidden_value(
+            source_path,
+            details.get("value"),
+            visibility,
+            level=str(
+                details.get("confidentiality", "") or ""
+            ),
+            categories=list(
+                details.get("categories", []) or []
+            ),
+            reference=reference,
+        )
+
+    def collect_omitted_values(
+        raw_value: Any,
+        projected_value: Any,
+        path: str,
+        present: bool,
+    ) -> None:
+        if not present:
+            if isinstance(raw_value, Mapping):
+                if raw_value:
+                    for key, child in raw_value.items():
+                        collect_omitted_values(
+                            child,
+                            None,
+                            f"{path}.{key}",
+                            False,
+                        )
+                else:
+                    append_user_hidden_value(
+                        path,
+                        raw_value,
+                        "hidden",
+                    )
+                return
+            if isinstance(raw_value, list):
+                if raw_value:
+                    for index, child in enumerate(raw_value):
+                        collect_omitted_values(
+                            child,
+                            None,
+                            f"{path}[{index}]",
+                            False,
+                        )
+                else:
+                    append_user_hidden_value(
+                        path,
+                        raw_value,
+                        "hidden",
+                    )
+                return
+            append_user_hidden_value(
+                path,
+                raw_value,
+                "hidden",
+            )
+            return
+        if isinstance(raw_value, Mapping):
+            projected_mapping = (
+                projected_value
+                if isinstance(projected_value, Mapping)
+                else {}
+            )
+            for key, child in raw_value.items():
+                collect_omitted_values(
+                    child,
+                    projected_mapping.get(key),
+                    f"{path}.{key}",
+                    key in projected_mapping,
+                )
+            return
+        if isinstance(raw_value, list):
+            projected_items = (
+                projected_value
+                if isinstance(projected_value, list)
+                else []
+            )
+            for index, child in enumerate(raw_value):
+                collect_omitted_values(
+                    child,
+                    (
+                        projected_items[index]
+                        if index < len(projected_items)
+                        else None
+                    ),
+                    f"{path}[{index}]",
+                    index < len(projected_items),
+                )
+
+    collect_omitted_values(plain, projected, "$", True)
+    user_hidden_values.sort(
+        key=lambda item: (
+            0 if item["visibility"] == "hidden" else 1,
+            str(item["field"]),
+        )
+    )
     exposed_levels = [
         str(item.get("level", "internal")).lower()
         for item in sensitive_content_exposed
@@ -2602,6 +2807,7 @@ def project_agent_exposure(
         "sensitive_content_exposed": sensitive_content_exposed,
         "reference_placeholders": sorted(references),
         "_sensitive_references": references,
+        "user_hidden_values": user_hidden_values,
         "withheld_fields": hidden,
         "opaque_fields": opaque,
     }

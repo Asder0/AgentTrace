@@ -46,10 +46,6 @@ const CONSOLE = {
         if (typeof APP !== 'undefined' && typeof APP.exitReplay === 'function') {
             APP.exitReplay({ reload: false });
         }
-        // 新的实时执行会重新下发步骤，先清除上一次的步骤信息，避免错配
-        if (typeof TIMELINE !== 'undefined' && typeof TIMELINE.clearTraceSteps === 'function') {
-            TIMELINE.clearTraceSteps();
-        }
     },
 
     /**
@@ -186,7 +182,11 @@ const CONSOLE = {
         // 发布场景执行事件（触发追踪面板）
         
         try {
-            const result = await API.executeAction(action);
+            const result = await API.executeAction(
+                action,
+                this._executionRuntimeOptions()
+            );
+            const renderedRiskCards = RISK_PANEL.renderExecutionResult(result);
 
             
             if (result.error) {
@@ -198,55 +198,26 @@ const CONSOLE = {
             if (result.graph && result.graph.nodes && result.graph.nodes.length > 0) {
                 GRAPH.setData(result.graph.nodes, result.graph.links, { suite: result.suite || null });
                 GRAPH.render();
-                const riskCardCount = result.risk_cards?.length || 0;
-                GRAPH.updateStats(result.summary, riskCardCount, result.events?.length);
+                GRAPH.updateStats(result.summary, renderedRiskCards.length, result.events?.length);
             } else {
                 // 后端可能没有返回 graph 数据，强制重新加载
                 await GRAPH.loadData();
             }
             
-            // 更新事件时间线
-            if (result.events) {
-                TIMELINE.loadEvents(result.events);
-            } else {
-                // 强制刷新事件
-                try {
-                    const events = await API.getEvents();
-                    if (events) TIMELINE.loadEvents(events);
-                } catch(e) {}
-            }
-            
             // 更新风险卡片
-            if (result.risk_cards) {
-                RISK_PANEL.loadRiskCards();
-            } else {
-                RISK_PANEL.loadRiskCards();
-            }
-            
-            // 从执行结果中直接渲染追踪面板
-            // 注意：后端 _build_trace_steps_from_messages 已包含阻断步骤，前端不再重复添加
-            if (result.steps && result.steps.length > 0) {
-                TIMELINE.setTrace({
-                    trace_id: result.trace_id || action,
-                    command: action,
-                    llm_mode: 'real',
-                    steps: result.steps,
-                    total_steps: result.steps.length,
-                });
-            }
             
             // 显示执行结果
             const llmMode = 'real';
             const modeText = '真实 LLM';
             
             if (result.blocked) {
-                const riskCount = result.risk_cards?.length || 0;
+                const riskCount = renderedRiskCards.length;
                 const reasons = this._localizedRiskReasons(result);
                 this._showFeedback(`操作已被阻断（${riskCount} 个风险事件）${reasons ? '；原因：' + reasons.substring(0, 100) : ''}`, 'error');
             } else if (result.status === 'incomplete') {
                 const reason = this._localizedTaskReason(result);
                 this._showFeedback(`任务未完成：${reason}`, 'warning');
-            } else if ((result.risk_cards?.length || 0) > 0) {
+            } else if (renderedRiskCards.length > 0) {
                 const reasons = this._localizedRiskReasons(result);
                 this._showFeedback(`操作已执行，但存在风险提醒${reasons ? '；' + reasons.substring(0, 120) : ''}`, 'warning');
             } else {
@@ -271,7 +242,13 @@ const CONSOLE = {
 
     _localizedRiskReasons(result) {
         const labels = window.AgentTraceRiskLabels;
-        return (result?.risk_cards || [])
+        const cards = (
+            Array.isArray(RISK_PANEL.riskCards)
+            && RISK_PANEL.riskCards.length > 0
+        )
+            ? RISK_PANEL.riskCards
+            : (result?.risk_cards || []);
+        return cards
             .map(card => {
                 const normalized = labels?.normalizeCard
                     ? labels.normalizeCard(card)
@@ -397,41 +374,32 @@ const CONSOLE = {
                 <div class="llm-config-row llm-config-actions">
                     <button id="btnSaveLLMConfig" class="btn-execute llm-save-btn" type="button">保存配置</button>
                 </div>
-                <div class="llm-config-row">
-                    <p class="llm-config-hint">
-                        ${hasApiKey 
-                            ? '真实 LLM 已配置，操作将通过 AgentPipeline 调用大模型 API 自主决策。'
-                            : '请配置 API Key 以启用真实 LLM。用户指令将直接输入给大模型，大模型根据可用工具 API 自主决策工具调用。'}
-                    </p>
-                </div>
             </div>
             <!-- 防御机制开关 -->
-            <div class="console-label llm-config-header defense-config-header">
-                防御机制
-                <span class="defense-status" id="defenseStatusText">加载中...</span>
-            </div>
-            <div class="llm-config-grid">
-                <div class="llm-config-row">
-                    <label class="llm-config-label">Analysis Pipeline</label>
+            <div class="llm-config-grid defense-controls-grid">
+                <div class="llm-config-row defense-simple-row">
+                    <label class="llm-config-label">防御机制</label>
                     <label class="toggle-switch">
                         <input type="checkbox" id="defenseToggle" checked>
                         <span class="toggle-slider"></span>
                     </label>
-                    <span class="llm-config-help">关闭后跳过 Ring 0-3 检测</span>
+                    <span class="defense-status defense-row-status disabled"
+                          id="defenseStatusText">加载中...</span>
                 </div>
-                <div class="llm-config-row llm-config-row-stack">
+                <div class="llm-config-row llm-config-row-stack" hidden>
                     <div class="llm-config-help">Ring 级开关（可单独关闭/开启每个 Ring 及其内部检测方法）</div>
                     <div id="ringTogglesContainer" class="ring-config-list">
                         <!-- 动态渲染：每个 Ring 一行，含 Ring 开关 + 方法开关 -->
                     </div>
                 </div>
-                <div class="llm-config-row">
-                    <label class="llm-config-label">自动同意确认</label>
+                <div class="llm-config-row defense-simple-row">
+                    <label class="llm-config-label">自动确认</label>
                     <label class="toggle-switch">
                         <input type="checkbox" id="autoConfirmationsToggle" checked>
                         <span class="toggle-slider"></span>
                     </label>
-                    <span class="llm-config-help">默认自动处理普通审批和任务要求解析；关闭后逐节点人工决策</span>
+                    <span class="defense-row-status disabled"
+                          id="autoConfirmStatusText">加载中...</span>
                 </div>
             </div>
         `;
@@ -475,6 +443,7 @@ const CONSOLE = {
         const defenseToggle = document.getElementById('defenseToggle');
         if (defenseToggle) {
             defenseToggle.addEventListener('change', () => {
+                this._syncRingControlStates();
                 this._toggleDefense();
             });
         }
@@ -493,6 +462,7 @@ const CONSOLE = {
         if (ringContainer) {
             ringContainer.addEventListener('change', (e) => {
                 if (e.target && e.target.dataset && e.target.dataset.role) {
+                    this._syncRingControlStates();
                     this._updateRingConfig();
                 }
             });
@@ -557,7 +527,6 @@ const CONSOLE = {
         try {
             const config = await API.getDefenseConfig();
             const toggle = document.getElementById('defenseToggle');
-            const statusText = document.getElementById('defenseStatusText');
             if (toggle) {
                 toggle.checked = config.enabled;
             }
@@ -567,23 +536,161 @@ const CONSOLE = {
             if (autoConfirmationsToggle) {
                 autoConfirmationsToggle.checked =
                     config.auto_confirmations !== false;
+                this._updateAutoConfirmationStatus(
+                    autoConfirmationsToggle.checked
+                );
             }
-            if (statusText) {
-                statusText.textContent = config.enabled ? '已启用' : '已关闭';
-                statusText.className = config.enabled ? 'defense-status enabled' : 'defense-status disabled';
-            }
+            const ringRow = document
+                .getElementById('ringTogglesContainer')
+                ?.closest('.llm-config-row-stack');
+            if (ringRow) ringRow.hidden = true;
             this._renderRingToggles(
                 config.rings || {},
                 config.direct_injection_mode || config.user_anchor_mode || 'quarantine'
             );
+            this._setDefenseControlsEnabled(
+                config.enabled,
+                config.planning_enabled !== false,
+            );
+            this._updateDefenseStatus(config);
         } catch (err) {
             console.warn('获取防御配置失败:', err.message);
         }
     },
 
+    _updateAutoConfirmationStatus(enabled) {
+        const status = document.getElementById(
+            'autoConfirmStatusText'
+        );
+        if (!status) return;
+        status.textContent = enabled
+            ? '\u5df2\u542f\u7528'
+            : '\u5df2\u5173\u95ed';
+        status.className = (
+            `defense-row-status ${enabled ? 'enabled' : 'disabled'}`
+        );
+    },
+
     /**
      * 渲染每个 Ring 的开关行（Ring 开关 + 硬编码检测方法开关）
      */
+    _defenseState(config) {
+        const enabled = config?.enabled === true;
+        const planning = config?.planning_enabled !== false;
+        const rings = Object.values(config?.rings || {});
+        const activeRings = rings.filter(
+            ring => ring?.enabled
+                && Object.values(ring?.methods || {}).some(Boolean)
+        ).length;
+        if (!enabled || !planning || activeRings === 0) {
+            return {
+                label: '\u5df2\u5173\u95ed',
+                className: 'disabled',
+            };
+        }
+        if (activeRings < rings.length) {
+            return {
+                label: '\u90e8\u5206\u542f\u7528',
+                className: 'partial',
+            };
+        }
+        return {
+            label: '\u5df2\u542f\u7528',
+            className: 'enabled',
+        };
+    },
+
+    _updateDefenseStatus(config) {
+        const statusText = document.getElementById(
+            'defenseStatusText'
+        );
+        if (!statusText) return;
+        const state = this._defenseState(config);
+        statusText.textContent = state.label;
+        statusText.className = (
+            'defense-status defense-row-status '
+            + state.className
+        );
+    },
+
+    _setDefenseControlsEnabled(enabled, planningEnabled = true) {
+        const container = document.getElementById(
+            'ringTogglesContainer'
+        );
+        if (container) {
+            container.dataset.planningEnabled = (
+                planningEnabled ? 'true' : 'false'
+            );
+            container.classList.toggle(
+                'is-disabled',
+                !enabled,
+            );
+            container
+                .querySelectorAll('input, select')
+                .forEach(control => {
+                    control.disabled = !enabled;
+                });
+        }
+        const autoToggle = document.getElementById(
+            'autoConfirmationsToggle'
+        );
+        if (autoToggle) autoToggle.disabled = !enabled;
+        this._syncRingControlStates();
+    },
+
+    _syncRingControlStates() {
+        const container = document.getElementById(
+            'ringTogglesContainer'
+        );
+        const master = document.getElementById('defenseToggle');
+        if (!container) return;
+        const masterEnabled = master?.checked !== false;
+        const planningEnabled = (
+            container.dataset.planningEnabled !== 'false'
+        );
+        container
+            .querySelectorAll('input[data-role="ring"]')
+            .forEach(control => {
+                const planDependent = [
+                    'ring_2',
+                    'ring_3',
+                ].includes(control.dataset.ring);
+                control.disabled = (
+                    !masterEnabled
+                    || (planDependent && !planningEnabled)
+                );
+            });
+        container
+            .querySelectorAll('input[data-role="method"]')
+            .forEach(control => {
+                const ring = container.querySelector(
+                    `input[data-role="ring"][data-ring="${control.dataset.ring}"]`
+                );
+                control.disabled = (
+                    !masterEnabled
+                    || ring?.checked === false
+                    || (
+                        [
+                            'ring_2',
+                            'ring_3',
+                        ].includes(control.dataset.ring)
+                        && !planningEnabled
+                    )
+                );
+            });
+        const directMode = container.querySelector(
+            'select[data-role="direct-injection-mode"]'
+        );
+        const ring0 = container.querySelector(
+            'input[data-role="ring"][data-ring="ring_0"]'
+        );
+        if (directMode) {
+            directMode.disabled = (
+                !masterEnabled || ring0?.checked === false
+            );
+        }
+    },
+
     _renderRingToggles(rings, directInjectionMode = 'quarantine') {
         const container = document.getElementById('ringTogglesContainer');
         if (!container || !rings) return;
@@ -595,6 +702,21 @@ const CONSOLE = {
             ring_3: 'Ring 3 · 敏感数据外发检查',
         };
 
+        ringNames.ring_0 = (
+            'Ring 0 \u00b7 \u521d\u59cb Prompt \u6ce8\u5165\u68c0\u6d4b'
+        );
+        ringNames.ring_1 = (
+            'Ring 1 \u00b7 \u5de5\u5177\u8f93\u51fa\u6ce8\u5165'
+            + '\u4e0e\u4e0d\u53ef\u4fe1\u63a7\u5236\u6d41'
+        );
+        ringNames.ring_2 = (
+            'Ring 2 \u00b7 \u4efb\u52a1\u8ba1\u5212\u8303\u56f4'
+            + '\u4e0e\u654f\u611f\u8bfb\u53d6\u6388\u6743'
+        );
+        ringNames.ring_3 = (
+            'Ring 3 \u00b7 \u654f\u611f\u6570\u636e\u5916\u53d1'
+        );
+
         const rows = Object.keys(rings).map((ring) => {
             const cfg = rings[ring] || {};
             const enabled = !!cfg.enabled;
@@ -605,8 +727,8 @@ const CONSOLE = {
                 const label = methodLabels[method] || method;
                 return `
                     <label class="ring-method">
-                        <input type="checkbox" data-role="method" data-ring="${ring}" data-method="${method}" ${checked}>
-                        <span title="${label}">${method}</span>
+                        <input type="checkbox" data-role="method" data-ring="${ring}" data-method="${method}" ${checked} ${enabled ? '' : 'disabled'}>
+                        <span title="${method}">${label}</span>
                     </label>
                 `;
             }).join('');
@@ -615,6 +737,9 @@ const CONSOLE = {
                     <label class="ring-config-label">
                         <input type="checkbox" data-role="ring" data-ring="${ring}" ${enabled ? 'checked' : ''}>
                         <span>${ringNames[ring] || ring}</span>
+                        ${['ring_2', 'ring_3'].includes(ring)
+                            ? '<span class="ring-plan-dependency">\u4f9d\u8d56\u4efb\u52a1\u8ba1\u5212</span>'
+                            : ''}
                     </label>
                     <div class="ring-method-list">
                         ${methodToggles}
@@ -634,7 +759,15 @@ const CONSOLE = {
                 </select>
             </div>
             ${rows}
+            <div class="ring-plan-note">
+                Ring 2 \u4e0e Ring 3 \u5171\u7528\u540c\u4e00\u4efb\u52a1
+                \u8ba1\u5212\u3002\u4e24\u4e2a\u68c0\u67e5\u5668\u53ef\u5206\u522b
+                \u5f00\u5173\uff0c\u4f46\u603b\u5f00\u5173\u5173\u95ed\u65f6
+                \u4efb\u52a1\u8ba1\u5212\u4e0d\u751f\u6210\uff0c\u4e24\u8005
+                \u5747\u4e0d\u53ef\u7528\u3002
+            </div>
         `;
+        this._syncRingControlStates();
     },
 
     /**
@@ -685,6 +818,7 @@ const CONSOLE = {
         const toggle = document.getElementById('autoConfirmationsToggle');
         if (!toggle) return;
         const enabled = toggle.checked;
+        this._updateAutoConfirmationStatus(enabled);
         try {
             const result = await API.setDefenseConfig(
                 null,
@@ -702,6 +836,7 @@ const CONSOLE = {
             }
         } catch (err) {
             toggle.checked = !enabled;
+            this._updateAutoConfirmationStatus(toggle.checked);
             console.error('设置自动同意策略失败:', err);
             this._showFeedback(
                 `设置自动同意策略失败：${err.message}`,
@@ -718,15 +853,15 @@ const CONSOLE = {
         if (!toggle) return;
         
         const enabled = toggle.checked;
-        const statusText = document.getElementById('defenseStatusText');
         
         try {
             const result = await API.setDefenseConfig(enabled);
             if (result.status === 'ok') {
-                if (statusText) {
-                    statusText.textContent = enabled ? '已启用' : '已关闭';
-                    statusText.className = enabled ? 'defense-status enabled' : 'defense-status disabled';
-                }
+                this._setDefenseControlsEnabled(
+                    enabled,
+                    result.planning_enabled !== false,
+                );
+                this._updateDefenseStatus(result);
                 this._showFeedback(
                     enabled ? '防御机制已启用' : '防御机制已关闭',
                     'info'
@@ -980,15 +1115,18 @@ const CONSOLE = {
                     injection_goal_id: scenario.injection_goal_id,
                     attack_type: scenario.attack_type,
                     suite: 'unified',
+                    ...this._executionRuntimeOptions(),
                 }
                 : {
                     user_task_id: scenario.user_task_id,
                     injection_task_id: scenario.injection_task_id,
                     attack_type: scenario.attack_type,
                     suite: scenario.suite,
+                    ...this._executionRuntimeOptions(),
                 };
             
             const result = await API.executeAttack(params);
+            const renderedRiskCards = RISK_PANEL.renderExecutionResult(result);
             
             if (result.error) {
                 this._showFeedback(`执行失败：${result.error}`, 'error');
@@ -999,46 +1137,22 @@ const CONSOLE = {
             if (result.graph && result.graph.nodes && result.graph.nodes.length > 0) {
                 GRAPH.setData(result.graph.nodes, result.graph.links, { suite: result.suite || null });
                 GRAPH.render();
-                const riskCardCount = result.risk_cards?.length || 0;
-                GRAPH.updateStats(result.summary, riskCardCount, result.events?.length);
+                GRAPH.updateStats(result.summary, renderedRiskCards.length, result.events?.length);
             } else {
                 await GRAPH.loadData();
             }
             
-            // 更新事件时间线
-            if (result.events) {
-                TIMELINE.loadEvents(result.events);
-            } else {
-                try {
-                    const events = await API.getEvents();
-                    if (events) TIMELINE.loadEvents(events);
-                } catch(e) {}
-            }
-            
             // 更新风险卡片
-            RISK_PANEL.loadRiskCards();
-            
-            // 渲染追踪面板
-            // 注意：后端 _build_trace_steps_from_messages 已包含阻断步骤，前端不再重复添加
-            if (result.steps && result.steps.length > 0) {
-                TIMELINE.setTrace({
-                    trace_id: result.trace_id || scenario.id,
-                    command: `${scenario.attack_name}: ${scenario.user_task_label || scenario.user_task_id} + ${scenario.injection_task_label || scenario.injection_task_id}`,
-                    llm_mode: 'real',
-                    steps: result.steps,
-                    total_steps: result.steps.length,
-                });
-            }
             
             // 显示执行结果
             if (result.blocked) {
-                const riskCount = result.risk_cards?.length || 0;
+                const riskCount = renderedRiskCards.length;
                 const reasons = this._localizedRiskReasons(result);
                 this._showFeedback(`攻击已被防御系统阻断（${riskCount} 个风险事件）${reasons ? '；原因：' + reasons.substring(0, 100) : ''}`, 'error');
             } else if (result.status === 'incomplete') {
                 const reason = this._localizedTaskReason(result);
                 this._showFeedback(`攻击场景执行未完成：${reason}`, 'warning');
-            } else if ((result.risk_cards?.length || 0) > 0) {
+            } else if (renderedRiskCards.length > 0) {
                 const reasons = this._localizedRiskReasons(result);
                 this._showFeedback(`攻击场景已执行，风险已高亮提醒${reasons ? '；' + reasons.substring(0, 120) : ''}`, 'warning');
             } else {
@@ -1059,5 +1173,21 @@ const CONSOLE = {
         } finally {
             this._isExecuting = false;
         }
+    },
+
+    _executionRuntimeOptions() {
+        const defenseToggle = document.getElementById('defenseToggle');
+        const autoConfirmationsToggle = document.getElementById(
+            'autoConfirmationsToggle'
+        );
+        const options = {};
+        if (defenseToggle) {
+            options.defense_enabled = defenseToggle.checked;
+        }
+        if (autoConfirmationsToggle) {
+            options.auto_confirmations =
+                autoConfirmationsToggle.checked;
+        }
+        return options;
     },
 };

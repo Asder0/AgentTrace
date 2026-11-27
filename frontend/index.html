@@ -70,7 +70,7 @@
                             <button type="button" class="legend-item" data-node-filter="data" aria-pressed="false" title="点击隐藏或显示数据实体节点"><span class="legend-color legend-data"></span><span>数据实体</span></button>
                             <button type="button" class="legend-item" data-node-filter="sensitive" aria-pressed="false" title="点击隐藏或显示敏感数据节点"><span class="legend-color legend-sensitive"></span><span>敏感数据</span></button>
                             <button type="button" class="legend-item" data-node-filter="untrusted" aria-pressed="false" title="点击隐藏或显示不可信或存在注入风险的数据节点"><span class="legend-color legend-untrusted"></span><span>不可信 / 注入风险</span></button>
-                            <button type="button" class="legend-item" data-node-filter="risk" aria-pressed="false" title="点击隐藏或显示风险、策略与阻断节点"><span class="legend-color legend-risk"></span><span>风险 / 策略</span></button>
+                            <button type="button" class="legend-item" data-node-filter="risk" aria-pressed="false" title="点击隐藏或显示风险与阻断节点"><span class="legend-color legend-risk"></span><span>风险</span></button>
                             <button type="button" class="legend-item" data-node-filter="authorization" aria-pressed="false" title="点击隐藏或显示人工授权节点"><span class="legend-color legend-authorization"></span><span>人工授权</span></button>
                         </div>
                         <div class="legend-actions">
@@ -82,17 +82,19 @@
                         <div class="legend-group-title">关系</div>
                         <div class="legend-grid">
                             <div class="legend-item"><span class="legend-line legend-line-read"></span><span>工具读取输入</span></div>
-                            <div class="legend-item"><span class="legend-line legend-line-produce"></span><span>工具产出数据</span></div>
-                            <div class="legend-item"><span class="legend-line legend-line-risk"></span><span>派生 / 风险关联</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-produce"></span><span>工具函数 → 数据</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-derived"></span><span>派生数据 → 上游数据</span></div>
+                            <div class="legend-item"><span class="legend-line"></span><span>数据 → LLM 推理</span></div>
+                            <div class="legend-item"><span class="legend-line legend-line-risk"></span><span>风险关联</span></div>
                             <div class="legend-item"><span class="legend-line legend-line-egress"></span><span>数据外发</span></div>
                             <div class="legend-item"><span class="legend-line legend-line-policy"></span><span>策略判定</span></div>
                             <div class="legend-item"><span class="legend-line legend-line-auth"></span><span>人工授权</span></div>
                             <div class="legend-item"><span class="legend-line legend-line-cross-app"></span><span>跨 APP 数据/控制流</span></div>
                             <div class="legend-item"><span class="legend-hop"></span><span>跨 APP 切换点</span></div>
-                            <div class="legend-item"><span class="legend-bundle">×N</span><span>聚合分支，悬停节点展开</span></div>
+                            <div class="legend-item" title="N 条同类关系因共享同一来源或目标而被合并显示；底层关系不会丢失。"><span class="legend-bundle">×N</span><span>N 条同类关系合并显示</span></div>
                         </div>
                     </div>
-                    <div class="legend-note">默认显示主要数据流；悬停节点可展开聚合分支及其风险、策略和授权关联。</div>
+                    <div class="legend-note">产出表示工具函数生成数据；派生自表示源数据由箭头末端的上游数据产生；数据影响表示数据进入 LLM 推理上下文。</div>
                     </div>
                 </div>
 
@@ -168,15 +170,15 @@
                     </div>
                     <div class="stat-item">
                         <span class="stat-value" id="statBlocks">0</span>
-                        <span class="stat-label">风险 / 策略</span>
+                        <span class="stat-label">风险</span>
                     </div>
                 </div>
             </section>
 
-            <!-- 任务级审计摘要 -->
-            <section class="card audit-summary-card" aria-label="任务审计摘要">
+            <!-- 任务总结 -->
+            <section class="card audit-summary-card" aria-label="任务总结">
                 <header class="card-heading">
-                    <h3>任务审计摘要</h3>
+                    <h3>任务总结</h3>
                     <span class="audit-summary-status" id="auditSummaryStatus">等待任务</span>
                 </header>
                 <div id="auditSummaryBody" class="audit-summary-body">
@@ -187,7 +189,7 @@
             <!-- 风险卡片面板 -->
             <section class="card risk-card-panel" aria-label="风险事件">
                 <header class="card-heading">
-                    <h3>风险与策略事件</h3>
+                    <h3>风险事件</h3>
                 </header>
                 <div id="riskCards">
                     <p class="hint">暂无风险事件</p>
@@ -225,34 +227,6 @@
             </div>
         </div>
     </div>
-
-    <!-- 底部：执行时间线 -->
-    <section class="timeline-panel" aria-label="执行时间线">
-        <div class="timeline-resizer" id="timelineResizer" role="separator" aria-orientation="horizontal"
-             aria-label="拖动调整执行时间线高度" tabindex="0"
-             title="拖动调整高度，双击恢复默认"></div>
-        <header class="panel-header timeline-header">
-            <div class="timeline-heading">
-                <h3>执行时间线</h3>
-                <span class="timeline-count" id="timelineCount">0 条</span>
-                <div class="timeline-flow" id="timelineFlow" hidden></div>
-            </div>
-            <div class="timeline-controls">
-                <div class="timeline-filters" id="timelineFilters" role="group" aria-label="事件筛选">
-                    <button type="button" class="timeline-filter active" data-filter="all" data-label="全部" aria-pressed="true">全部 0</button>
-                    <button type="button" class="timeline-filter" data-filter="phase" data-label="阶段" aria-pressed="false">阶段 0</button>
-                    <button type="button" class="timeline-filter" data-filter="llm" data-label="LLM" aria-pressed="false">LLM 0</button>
-                    <button type="button" class="timeline-filter" data-filter="tool" data-label="工具" aria-pressed="false">工具 0</button>
-                    <button type="button" class="timeline-filter" data-filter="risk" data-label="风险" aria-pressed="false">风险 0</button>
-                </div>
-                <button type="button" id="btnToggleTimeline">收起</button>
-                <button type="button" id="btnClearTimeline">清空</button>
-            </div>
-        </header>
-        <div class="timeline-container" id="timelineEvents">
-            <div class="timeline-empty">等待事件数据...</div>
-        </div>
-    </section>
 
     <!-- 环境变更：以字段差异为中心观察各 suite 的真实数据变化 -->
     <section id="storageView" class="storage-view" aria-label="环境变更" hidden>
@@ -309,7 +283,6 @@
     <script src="js/risk-labels.js"></script>
     <script src="js/audit-summary.js"></script>
     <script src="js/graph.js"></script>
-    <script src="js/timeline.js"></script>
     <script src="js/risk-panel.js"></script>
     <script src="js/status-panel.js"></script>
     <script src="js/console.js"></script>

@@ -3273,28 +3273,21 @@ def _raise_cross_source_analysis_exposure(
                         if isinstance(projection, dict)
                         else list(access.get("visible_fields", []))
                     )
-                    for candidate_path in access.get(
-                        "schema_paths",
-                        [],
-                    ):
-                        candidate_path = normalize_source_path(
-                            str(candidate_path)
-                        )
-                        if (
-                            candidate_path in {"", "$", "$[*]"}
-                            or candidate_path in visible_paths
-                            or CONFIDENTIALITY_LEVELS.get(
-                                field_level(
-                                    app,
-                                    source_entity,
-                                    candidate_path,
-                                ),
-                                3,
-                            )
-                            > CONFIDENTIALITY_LEVELS["internal"]
-                        ):
-                            continue
-                        visible_paths.append(candidate_path)
+                    matching_analysis_paths = sorted(
+                        {
+                            normalize_source_path(identity[3])
+                            for identity in refs
+                            if identity[0] == app
+                            and identity[2] == action_tool
+                        }
+                    )
+                    visible_paths.extend(
+                        path
+                        for path in matching_analysis_paths
+                        if path
+                        and path not in {"$", "$[*]"}
+                        and path not in visible_paths
+                    )
                     if isinstance(projection, dict):
                         projection["visible_fields"] = list(
                             dict.fromkeys(visible_paths)
@@ -3312,14 +3305,6 @@ def _raise_cross_source_analysis_exposure(
                                 *visible_paths,
                             ]
                         )
-                    )
-                    matching_analysis_paths = sorted(
-                        {
-                            normalize_source_path(identity[3])
-                            for identity in refs
-                            if identity[0] == app
-                            and identity[2] == action_tool
-                        }
                     )
                     if matching_analysis_paths:
                         access["analysis_fields"] = list(

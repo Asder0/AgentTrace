@@ -91,15 +91,6 @@ const RISK_PANEL = {
                 .querySelectorAll('.risk-card.is-selected')
                 .forEach(item => item.classList.remove('is-selected'));
             cardEl?.classList.add('is-selected');
-            const timelineNodeId = card.graph_focus?.activity_node_id
-                || card.graph_focus?.risk_node_id
-                || card.risk_id;
-            if (
-                typeof TIMELINE !== 'undefined'
-                && TIMELINE.focusNode
-            ) {
-                TIMELINE.focusNode(timelineNodeId);
-            }
         }
         return focused;
     },
@@ -128,8 +119,26 @@ const RISK_PANEL = {
             this.render(cards);
             return this.riskCards;
         } catch (err) {
-            console.error('加载风险与策略事件失败:', err);
+            console.error('加载风险事件失败:', err);
         }
+        return this.riskCards;
+    },
+
+    renderExecutionResult(result) {
+        if (!result || typeof result !== 'object') return [];
+        const riskCards = Array.isArray(result.risk_cards)
+            ? result.risk_cards
+            : [];
+        const policyCards = Array.isArray(result.policy_events)
+            ? result.policy_events.map(
+                event => this._policyToCard(event)
+            )
+            : [];
+        const cards = this.dedupeCards([
+            ...riskCards,
+            ...policyCards,
+        ]);
+        this.render(cards);
         return this.riskCards;
     },
 
@@ -143,6 +152,7 @@ const RISK_PANEL = {
                 ? labels.normalizeCard(rawCard)
                 : rawCard;
             if (!card) continue;
+            if (!this._attentionKind(card)) continue;
             const eventId = String(
                 card.risk_id || card.event_id || ''
             );
@@ -164,7 +174,25 @@ const RISK_PANEL = {
             keys.forEach(key => seen.add(key));
             result.push(normalizedCard);
         }
-        return result;
+        const priority = {
+            prompt_injection: 0,
+            sensitive_egress: 1,
+            high_risk_authorization: 2,
+            sensitive_llm_exposure: 3,
+        };
+        return result
+            .map((card, index) => ({ card, index }))
+            .sort((left, right) => (
+                (
+                    priority[this._attentionKind(left.card)]
+                    ?? 99
+                ) - (
+                    priority[this._attentionKind(right.card)]
+                    ?? 99
+                )
+                || left.index - right.index
+            ))
+            .map(item => item.card);
     },
 
     _policyToCard(event) {
@@ -182,6 +210,47 @@ const RISK_PANEL = {
             defense_detail: event.detail || event.reason || '策略事件',
             severity: event.severity || (decision === 'BLOCK' ? 'high' : 'medium'),
         };
+    },
+
+    _attentionKind(card) {
+        const explicit = String(card?.attention_kind || '');
+        const legacyKinds = {
+            attack: 'prompt_injection',
+            sensitive_read: 'sensitive_llm_exposure',
+            sensitive_reference: 'sensitive_llm_exposure',
+            authorization: 'high_risk_authorization',
+        };
+        if (explicit) {
+            return legacyKinds[explicit] || explicit;
+        }
+        const policyId = String(card?.policy_id || '');
+        if (
+            policyId === 'ring0.direct_user_instruction'
+            || policyId === 'ring1.indirect_prompt_injection'
+        ) {
+            return 'prompt_injection';
+        }
+        if (
+            policyId === 'ring3.sensitive_egress'
+            || policyId.includes('sensitive_egress')
+        ) {
+            return 'sensitive_egress';
+        }
+        if (
+            policyId.startsWith(
+                'ring2.sensitive_data_exposure_'
+            )
+        ) {
+            return 'sensitive_llm_exposure';
+        }
+        if (
+            policyId === 'ring2.l2_confirmation'
+            || policyId === 'ring2.l2_confirmation_rejected'
+            || policyId === 'ring2.source_risk_confirmation'
+        ) {
+            return 'high_risk_authorization';
+        }
+        return '';
     },
 
     /**
@@ -218,11 +287,14 @@ const RISK_PANEL = {
             const ringClass = `ring${ring}`;
             const meta = ringMeta[ring] || { color: '#8899aa', action: '未知' };
             const userView = card.user_view || {};
-            const riskType = this._escape(
+            const rawRiskType = String(
                 userView.risk_type
                 || card.risk_type
                 || labels?.titleFor?.(ring, card.policy_id)
                 || '安全风险'
+            );
+            const riskType = this._escape(
+                rawRiskType
             );
             const userContent = this._escape(
                 userView.content
@@ -315,8 +387,94 @@ const RISK_PANEL = {
                     </div>
                 `
                 : '';
+            const hiddenSensitiveValues = Array.isArray(
+                userView.hidden_sensitive_values
+                || card.hidden_sensitive_values
+            )
+                ? (
+                    userView.hidden_sensitive_values
+                    || card.hidden_sensitive_values
+                )
+                : [];
+            const hiddenValuesHtml = hiddenSensitiveValues.length
+                ? `
+                    <div class="risk-hidden-values">
+                        <div class="risk-hidden-values-title">
+                            用户可见的隐藏敏感内容
+                        </div>
+                        <div class="risk-hidden-values-note">
+                            以下字段未提供给 Agent，仅用于可信用户审计。
+                        </div>
+                        ${hiddenSensitiveValues.map(item => {
+                            const rawValue = item.value;
+                            const valueText = (
+                                typeof rawValue === 'string'
+                                    ? rawValue
+                                    : JSON.stringify(
+                                        rawValue,
+                                        null,
+                                        2
+                                    )
+                            );
+                            const categories = (
+                                Array.isArray(item.categories)
+                                    ? item.categories.map(category => (
+                                        labels?.categoryLabel
+                                            ? labels.categoryLabel(category)
+                                            : category
+                                    ))
+                                    : []
+                            );
+                            return `
+                                <div class="risk-hidden-value-item">
+                                    <div class="risk-hidden-value-head">
+                                        <span class="risk-hidden-value-field">${this._escape(
+                                            item.field || 'unknown'
+                                        )}</span>
+                                        <span class="risk-hidden-value-meta">${this._escape(
+                                            [
+                                                item.level || 'unknown',
+                                                ...categories,
+                                            ].join(' · ')
+                                        )}</span>
+                                        <span class="risk-hidden-value-state">${this._escape(
+                                            item.visibility === 'reference'
+                                                ? '占位符引用'
+                                                : '已隐藏'
+                                        )}</span>
+                                    </div>
+                                    <pre class="risk-hidden-value-text">${this._escape(
+                                        valueText == null
+                                            ? 'null'
+                                            : valueText
+                                    )}</pre>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                `
+                : '';
             
-            const kindClass = card.event_kind === 'policy' ? ' policy-card' : ' security-card';
+            const attentionKind = this._attentionKind(card);
+            const kindClass = card.event_kind === 'policy'
+                ? ` policy-card attention-${attentionKind}`
+                : ` security-card attention-${attentionKind}`;
+            const rawAttentionLabel = String(
+                card.attention_label
+                || {
+                    prompt_injection: '提示注入攻击',
+                    sensitive_egress: '敏感数据外发',
+                    high_risk_authorization: '高风险操作授权',
+                    sensitive_llm_exposure: '敏感数据对 LLM 暴露',
+                }[attentionKind]
+                || ''
+            );
+            const attentionLabel = (
+                rawAttentionLabel
+                && rawAttentionLabel !== rawRiskType
+            )
+                ? this._escape(rawAttentionLabel)
+                : '';
             const cardId = this._escape(this._cardId(card));
             html += `
                 <div class="risk-card${kindClass}"
@@ -327,12 +485,14 @@ const RISK_PANEL = {
                      aria-label="查看该风险对应的数据链">
                     <div class="risk-title">
                         <span class="risk-ring ${ringClass}">${riskType}</span>
+                        ${attentionLabel ? `<span class="risk-attention-badge attention-${attentionKind}">${attentionLabel}</span>` : ''}
                         <span class="risk-kind-badge">${decisionLabel}</span>
                         ${phaseLabel ? `<span class="risk-kind-badge risk-phase-badge">${phaseLabel}</span>` : ''}
                         <span class="risk-kind-badge">${levelLabel}：${this._escape(levelValue)}</span>
                     </div>
                     <div class="risk-detail">
                         ${injectionEvidenceHtml}
+                        ${hiddenValuesHtml}
                         <div class="defense-section">
                             <div class="defense-row">
                                 <span class="defense-label">具体内容</span>

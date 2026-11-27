@@ -126,7 +126,7 @@ def _detect_structured_identifiers(
 
 
 class GLiNERSensitivityDetector:
-    """Lazy optional detector; disabled unless a local model path is set."""
+    """Mandatory lazy-loaded detector using a local model directory."""
 
     def __init__(
         self,

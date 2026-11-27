@@ -23,6 +23,8 @@ Or programmatically:
 
 import ast
 import copy
+import datetime
+import gzip as _gzip
 import hashlib
 import json
 import os
@@ -67,6 +69,7 @@ from ..analysis.defense_config import (
     set_auto_confirmations,
     set_direct_injection_mode,
     set_method_enabled,
+    set_planning_enabled,
     set_ring_enabled,
     set_user_anchor_mode,
 )
@@ -470,12 +473,24 @@ def api_get_status():
             },
             {"id": "visualization_graph", "name": "拓扑图可视化", "status": visualization_ok, "layer": "Visualization"},
             {
-                "id": "visualization_timeline",
-                "name": "事件时间线",
+                "id": "visualization_summary",
+                "name": "统计概览与任务总结",
                 "status": visualization_ok,
                 "layer": "Visualization",
             },
             {"id": "visualization_risk", "name": "风险卡片", "status": visualization_ok, "layer": "Visualization"},
+            {
+                "id": "visualization_history",
+                "name": "历史回放",
+                "status": visualization_ok,
+                "layer": "Visualization",
+            },
+            {
+                "id": "visualization_storage",
+                "name": "环境变更",
+                "status": visualization_ok,
+                "layer": "Visualization",
+            },
             {"id": "execution_preset", "name": "跨 APP 预设任务", "status": True, "layer": "Execution"},
             {"id": "execution_attack", "name": "跨 APP 攻击测试", "status": True, "layer": "Execution"},
             {"id": "execution_llm_real", "name": "真实 LLM 调用", "status": llm_configured, "layer": "Execution"},
@@ -505,6 +520,7 @@ def api_get_status():
                 },
                 "defense_enabled": interceptor_module._defense_enabled,
                 "defense_rings": {ring: defense_config[ring]["enabled"] for ring in RING_METHODS},
+                "planning_enabled": defense_config["planning_enabled"],
                 "graph_stats": {
                     "nodes": node_count,
                     "edges": edge_count,
@@ -766,6 +782,7 @@ def api_get_defense_config():
             "direct_injection_mode": config["direct_injection_mode"],
             "user_anchor_mode": config["user_anchor_mode"],
             "auto_confirmations": config["auto_confirmations"],
+            "planning_enabled": config["planning_enabled"],
         }
     )
 
@@ -796,11 +813,24 @@ def api_set_defense_config():
                 "direct_injection_mode",
                 "user_anchor_mode",
                 "auto_confirmations",
+                "planning_enabled",
             )
         ):
             return jsonify({"error": "缺少 enabled、rings 或注入处理模式参数"}), 400
         if "enabled" in data:
             interceptor_module._defense_enabled = bool(data["enabled"])
+            set_planning_enabled(
+                interceptor_module._defense_enabled
+            )
+            if interceptor_module._defense_enabled:
+                for ring in RING_METHODS:
+                    set_ring_enabled(ring, True)
+                    for method in RING_METHODS[ring]:
+                        set_method_enabled(
+                            ring,
+                            method,
+                            True,
+                        )
             status_text = "已启用" if interceptor_module._defense_enabled else "已关闭"
             print(f"[defense] 防御机制状态已更新: {status_text}")
         if "rings" in data:
@@ -823,6 +853,10 @@ def api_set_defense_config():
             set_user_anchor_mode(str(data["user_anchor_mode"]))
         if "auto_confirmations" in data:
             set_auto_confirmations(bool(data["auto_confirmations"]))
+        if "planning_enabled" in data:
+            set_planning_enabled(
+                bool(data["planning_enabled"])
+            )
         config = get_config()
         return jsonify(
             {
@@ -838,6 +872,7 @@ def api_set_defense_config():
                 "direct_injection_mode": config["direct_injection_mode"],
                 "user_anchor_mode": config["user_anchor_mode"],
                 "auto_confirmations": config["auto_confirmations"],
+                "planning_enabled": config["planning_enabled"],
                 "status": "ok",
             }
         )
@@ -854,6 +889,7 @@ import glob as _glob
 import os as _os
 
 _in_memory_traces = []
+_trace_history_lock = threading.Lock()
 
 
 def _get_traces_dir():
@@ -892,52 +928,256 @@ def _json_safe(obj):
     return str(obj)
 
 
+def _trace_attack_info(trace: Mapping[str, Any]) -> Mapping[str, Any]:
+    attack_info = trace.get("attack_info")
+    return attack_info if isinstance(attack_info, Mapping) else {}
+
+
+def _trace_defense_enabled(trace: Mapping[str, Any]) -> bool:
+    explicit = trace.get("defense_enabled")
+    if isinstance(explicit, bool):
+        return explicit
+    attack_info = _trace_attack_info(trace)
+    explicit = attack_info.get("defense_enabled")
+    if isinstance(explicit, bool):
+        return explicit
+    return bool(trace.get("task_data_plan"))
+
+
+def _trace_task_identity(trace: Mapping[str, Any]) -> str:
+    """Return the task and run-variant key used for trace retention."""
+    task_evaluation = trace.get("task_evaluation")
+    task_evaluation = (
+        task_evaluation
+        if isinstance(task_evaluation, Mapping)
+        else {}
+    )
+    request_payload = trace.get("request")
+    request_payload = (
+        request_payload
+        if isinstance(request_payload, Mapping)
+        else {}
+    )
+    attack_info = _trace_attack_info(trace)
+    task_id = (
+        task_evaluation.get("task_id")
+        or request_payload.get("task_id")
+        or request_payload.get("cross_app_task_id")
+        or attack_info.get("cross_app_task_id")
+    )
+    attack_type = str(attack_info.get("attack_type") or "").strip()
+    is_attack = bool(
+        attack_type
+        or str(attack_info.get("mode") or "").strip()
+        == "cross_app"
+    )
+    defense_enabled = _trace_defense_enabled(trace)
+    if is_attack:
+        variant = "|".join(
+            (
+                "attack",
+                attack_type,
+                str(attack_info.get("injection_point_id") or ""),
+                str(attack_info.get("injection_goal_id") or ""),
+                str(attack_info.get("payload_sha256") or ""),
+                "defense_on" if defense_enabled else "defense_off",
+            )
+        )
+    else:
+        variant = (
+            "normal|defense_on"
+            if defense_enabled
+            else "normal|defense_off"
+        )
+    if str(task_id or "").strip():
+        return f"{str(task_id).strip()}::{variant}"
+    prompt = " ".join(
+        str(trace.get("prompt", "")).casefold().split()
+    )
+    material = "|".join(
+        (
+            str(trace.get("app_name", "")),
+            str(trace.get("suite", "")),
+            prompt,
+        )
+    )
+    return hashlib.sha256(
+        material.encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _trace_summary(
+    trace: Mapping[str, Any],
+    *,
+    trace_id: str,
+    saved_at: float,
+) -> dict[str, Any]:
+    attack_info = _trace_attack_info(trace)
+    return {
+        "trace_id": trace.get("trace_id", trace_id),
+        "timestamp": trace.get("timestamp", ""),
+        "saved_at": (
+            datetime.datetime.fromtimestamp(
+                saved_at
+            ).isoformat(timespec="seconds")
+            if saved_at > 0
+            else ""
+        ),
+        "prompt": (trace.get("prompt", "") or "")[:80],
+        "app_name": trace.get("app_name", ""),
+        "total_steps": trace.get("total_steps", 0),
+        "run_kind": (
+            "attack"
+            if attack_info.get("attack_type")
+            else "normal"
+        ),
+        "defense_enabled": _trace_defense_enabled(trace),
+        "attack_type": (
+            attack_info.get("attack_type")
+            or ""
+        ),
+        "injection_goal_id": (
+            attack_info.get("injection_goal_id")
+            or ""
+        ),
+        "blocked": bool(trace.get("blocked"))
+        or any(
+            step.get("status") == "blocked"
+            for step in trace.get("steps", [])
+            if isinstance(step, Mapping)
+        ),
+        "status": trace.get(
+            "status",
+            (trace.get("task_outcome") or {}).get(
+                "status",
+                "partial",
+            ),
+        ),
+        "task_outcome": trace.get("task_outcome"),
+        "risk_count": len(trace.get("risk_cards", [])),
+        "policy_event_count": len(
+            trace.get("policy_events", [])
+        ),
+        "has_environment_snapshots": bool(
+            trace.get("environment_snapshots")
+        ),
+    }
+
+
+def _archive_previous_trace_versions(
+    trace_record: Mapping[str, Any],
+    current_trace_id: str,
+) -> None:
+    """Move older versions of the same task out of replay history."""
+    task_key = _trace_task_identity(trace_record)
+    traces_dir = os.path.realpath(_get_traces_dir())
+    archive_dir = os.path.realpath(
+        os.path.join(
+            os.path.dirname(traces_dir),
+            "traces_archive",
+            "history_versions",
+        )
+    )
+    if os.path.commonpath(
+        (traces_dir, archive_dir)
+    ) != os.path.dirname(traces_dir):
+        return
+    os.makedirs(archive_dir, exist_ok=True)
+    with _trace_history_lock:
+        for file_path in _glob.glob(
+            os.path.join(traces_dir, "*.json")
+        ):
+            source = os.path.realpath(file_path)
+            if os.path.dirname(source) != traces_dir:
+                continue
+            trace_id = os.path.splitext(
+                os.path.basename(source)
+            )[0]
+            if trace_id == current_trace_id:
+                continue
+            try:
+                with open(source, encoding="utf-8") as stream:
+                    previous = json.load(stream)
+            except Exception:
+                continue
+            if (
+                not isinstance(previous, Mapping)
+                or _trace_task_identity(previous) != task_key
+            ):
+                continue
+            destination = os.path.join(
+                archive_dir,
+                os.path.basename(source),
+            )
+            if os.path.exists(destination):
+                destination = os.path.join(
+                    archive_dir,
+                    f"{trace_id}_{uuid.uuid4().hex[:8]}.json",
+                )
+            os.replace(source, destination)
+
+
 @app.route("/api/traces", methods=["GET"])
 def api_list_traces():
     try:
-        traces = []
+        indexed_traces = []
         for t in _in_memory_traces:
-            traces.append(
-                {
-                    "trace_id": t.get("trace_id", ""),
-                    "timestamp": t.get("timestamp", ""),
-                    "prompt": (t.get("prompt", "") or "")[:80],
-                    "app_name": t.get("app_name", ""),
-                    "total_steps": t.get("total_steps", 0),
-                    "blocked": bool(t.get("blocked")) or any(s.get("status") == "blocked" for s in t.get("steps", [])),
-                    "status": t.get("status", (t.get("task_outcome") or {}).get("status", "partial")),
-                    "task_outcome": t.get("task_outcome"),
-                    "risk_count": len(t.get("risk_cards", [])),
-                    "policy_event_count": len(t.get("policy_events", [])),
-                    "has_environment_snapshots": bool(t.get("environment_snapshots")),
-                }
+            indexed_traces.append(
+                (
+                    _trace_summary(
+                        t,
+                        trace_id=str(t.get("trace_id", "")),
+                        saved_at=float(
+                            t.get("_saved_at", 0) or 0
+                        ),
+                    ),
+                    _trace_task_identity(t),
+                    float(t.get("_saved_at", 0) or 0),
+                )
             )
         for fp in sorted(_glob.glob(_os.path.join(_get_traces_dir(), "*.json")), reverse=True):
             tid = _os.path.splitext(_os.path.basename(fp))[0]
-            if any(t["trace_id"] == tid for t in traces):
+            if any(
+                item[0]["trace_id"] == tid
+                for item in indexed_traces
+            ):
                 continue
             try:
                 with open(fp, encoding="utf-8") as f:
                     d = json.load(f)
-                traces.append(
-                    {
-                        "trace_id": d.get("trace_id", tid),
-                        "timestamp": d.get("timestamp", ""),
-                        "prompt": (d.get("prompt", "") or "")[:80],
-                        "app_name": d.get("app_name", ""),
-                        "total_steps": d.get("total_steps", 0),
-                        "blocked": bool(d.get("blocked"))
-                        or any(s.get("status") == "blocked" for s in d.get("steps", [])),
-                        "status": d.get("status", (d.get("task_outcome") or {}).get("status", "partial")),
-                        "task_outcome": d.get("task_outcome"),
-                        "risk_count": len(d.get("risk_cards", [])),
-                        "policy_event_count": len(d.get("policy_events", [])),
-                        "has_environment_snapshots": bool(d.get("environment_snapshots")),
-                    }
+                saved_at = _os.path.getmtime(fp)
+                indexed_traces.append(
+                    (
+                        _trace_summary(
+                            d,
+                            trace_id=tid,
+                            saved_at=saved_at,
+                        ),
+                        _trace_task_identity(d),
+                        saved_at,
+                    )
                 )
             except:
                 continue
-        traces.sort(key=lambda t: t["timestamp"], reverse=True)
+        if request.args.get("all", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            traces = [item[0] for item in indexed_traces]
+        else:
+            latest_by_task = {}
+            for item in indexed_traces:
+                previous = latest_by_task.get(item[1])
+                if previous is None or item[2] > previous[2]:
+                    latest_by_task[item[1]] = item
+            traces = [
+                item[0] for item in latest_by_task.values()
+            ]
+        traces.sort(
+            key=lambda item: item.get("saved_at", ""),
+            reverse=True,
+        )
         return jsonify({"traces": traces, "total": len(traces)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -953,12 +1193,33 @@ def api_get_trace(trace_id):
         if not _os.path.exists(fp):
             return jsonify({"error": "Trace not found"}), 404
         with open(fp, encoding="utf-8") as f:
-            return jsonify(_json_safe(json.load(f)))
+            trace_data = _json_safe(json.load(f))
+        payload = json.dumps(
+            trace_data,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        headers = {"Vary": "Accept-Encoding"}
+        if "gzip" in request.headers.get(
+            "Accept-Encoding", ""
+        ).lower():
+            payload = _gzip.compress(
+                payload,
+                compresslevel=5,
+            )
+            headers["Content-Encoding"] = "gzip"
+        return app.response_class(
+            payload,
+            status=200,
+            mimetype="application/json",
+            headers=headers,
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 def _save_trace_to_memory(tr):
+    tr["_saved_at"] = time.time()
     _in_memory_traces.insert(0, tr)
     if len(_in_memory_traces) > 50:
         _in_memory_traces.pop()
@@ -1424,6 +1685,13 @@ _SENSITIVITY_LEVEL_LABELS = {
     "secret": "secret",
 }
 
+_SENSITIVITY_VISIBILITY_LABELS = {
+    "analysis": "\u4f9b\u7ed9 LLM \u5206\u6790\u7684\u771f\u5b9e\u5185\u5bb9",
+    "exposed": "LLM \u53ef\u89c1\u5b57\u6bb5",
+    "reference": "\u4ec5\u4ee5\u5360\u4f4d\u7b26\u5f15\u7528",
+    "hidden": "\u672a\u5411 LLM \u5c55\u793a",
+}
+
 _SENSITIVITY_CATEGORY_LABELS = {
     "personal_name": "personal_name",
     "email": "email",
@@ -1610,54 +1878,178 @@ def _sensitivity_details(
         opaque_fields = data_access.get("opaque_fields")
     if not isinstance(opaque_fields, list):
         opaque_fields = []
+    analysis_fields = exposure.get("analysis_fields")
+    if not isinstance(analysis_fields, list):
+        analysis_fields = data_access.get("analysis_fields")
+    if not isinstance(analysis_fields, list):
+        analysis_fields = []
     catalog = field_sensitivity_catalog().get(app, {}).get(entity, {})
     grouped: dict[
         tuple[str, str, str, tuple[str, ...]],
         dict[str, Any],
     ] = {}
-    field_groups = (
-        ("exposed", exposed_fields),
-        ("hidden", hidden_fields),
-        ("hidden", opaque_fields),
-    )
-    for visibility, raw_paths in field_groups:
-        for raw_path in raw_paths:
-            path = str(raw_path)
-            normalized_path = re.sub(r"\[\d+\]", "[*]", path)
-            raw_policy = field_policies.get(path)
-            if not isinstance(raw_policy, Mapping):
-                raw_policy = field_policies.get(normalized_path)
-            if not isinstance(raw_policy, Mapping):
-                raw_policy = catalog.get(normalized_path) or catalog.get(path) or {}
-            level = str(raw_policy.get("level") or max_level).lower()
-            categories = tuple(sorted(str(item) for item in raw_policy.get("categories", []) or [] if str(item)))
-            field = _field_label(app, entity, normalized_path)
-            key = (visibility, field, level, categories)
-            item = grouped.setdefault(
-                key,
-                {
-                    "visibility": visibility,
-                    "entity": _ENTITY_LABELS.get(
-                        (app, entity),
-                        f"{app}.{entity}" if app and entity else entity.replace("_", " ") or "related_entity",
-                    ),
-                    "field": field,
-                    "level": _SENSITIVITY_LEVEL_LABELS.get(
-                        level,
-                        level,
-                    ),
-                    "categories": [
-                        _SENSITIVITY_CATEGORY_LABELS.get(
-                            category,
-                            category,
+    field_visibility: dict[str, str] = {}
+    for raw_path in exposed_fields:
+        field_visibility.setdefault(str(raw_path), "exposed")
+    for raw_path in opaque_fields:
+        field_visibility[str(raw_path)] = "reference"
+    for raw_path in analysis_fields:
+        field_visibility[str(raw_path)] = "analysis"
+    for raw_path in hidden_fields:
+        field_visibility[str(raw_path)] = "hidden"
+    field_groups = list(field_visibility.items())
+    for raw_path, visibility in field_groups:
+        path = str(raw_path)
+        normalized_path = re.sub(r"\[\d+\]", "[*]", path)
+        raw_policy = field_policies.get(path)
+        if not isinstance(raw_policy, Mapping):
+            raw_policy = field_policies.get(normalized_path)
+        if not isinstance(raw_policy, Mapping):
+            raw_policy = catalog.get(normalized_path) or catalog.get(path) or {}
+        level = str(raw_policy.get("level") or max_level).lower()
+        categories = tuple(sorted(str(item) for item in raw_policy.get("categories", []) or [] if str(item)))
+        field = _field_label(app, entity, normalized_path)
+        key = (visibility, field, level, categories)
+        item = grouped.setdefault(
+            key,
+            {
+                "visibility": visibility,
+                    "visibility_label": (
+                        _SENSITIVITY_VISIBILITY_LABELS.get(
+                            visibility,
+                            visibility,
                         )
-                        for category in categories
-                    ],
-                    "count": 0,
-                },
+                    ),
+                "entity": _ENTITY_LABELS.get(
+                    (app, entity),
+                    f"{app}.{entity}" if app and entity else entity.replace("_", " ") or "related_entity",
+                ),
+                "field": field,
+                "level": _SENSITIVITY_LEVEL_LABELS.get(
+                    level,
+                    level,
+                ),
+                "categories": [
+                    _SENSITIVITY_CATEGORY_LABELS.get(
+                        category,
+                        category,
+                    )
+                    for category in categories
+                ],
+                "count": 0,
+            },
+        )
+        item["count"] += 1
+    for value_item in _hidden_sensitive_values(event):
+        raw_path = str(value_item.get("field", "") or "")
+        if not raw_path:
+            continue
+        normalized_path = re.sub(r"\[\d+\]", "[*]", raw_path)
+        normalized_path = re.sub(
+            r"^\$\[\*\]",
+            "$",
+            normalized_path,
+        )
+        visibility = str(
+            value_item.get("visibility", "") or "hidden"
+        )
+        level = str(value_item.get("level", "") or "unknown").lower()
+        categories = tuple(
+            str(item)
+            for item in value_item.get("categories", []) or []
+            if str(item)
+        )
+        field = _field_label(app, entity, normalized_path)
+        matching = next(
+            (
+                item
+                for item in grouped.values()
+                if item["visibility"] == visibility
+                and item["field"] == field
+            ),
+            None,
+        )
+        if matching is not None:
+            matching["count"] = max(
+                1,
+                int(matching.get("count", 0) or 0),
             )
-            item["count"] += 1
+            continue
+        grouped[
+            (visibility, field, level, categories)
+        ] = {
+            "visibility": visibility,
+            "visibility_label": (
+                _SENSITIVITY_VISIBILITY_LABELS.get(
+                    visibility,
+                    visibility,
+                )
+            ),
+            "entity": _ENTITY_LABELS.get(
+                (app, entity),
+                (
+                    f"{app}.{entity}"
+                    if app and entity
+                    else entity.replace("_", " ")
+                    or "related_entity"
+                ),
+            ),
+            "field": field,
+            "level": _SENSITIVITY_LEVEL_LABELS.get(
+                level,
+                level,
+            ),
+            "categories": [
+                _SENSITIVITY_CATEGORY_LABELS.get(
+                    category,
+                    category,
+                )
+                for category in categories
+            ],
+            "count": 1,
+        }
     return list(grouped.values())
+
+
+def _hidden_sensitive_values(
+    event: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return trusted-user-only values hidden from the Agent."""
+    data_access = event.get("data_access_check")
+    data_access = (
+        data_access if isinstance(data_access, Mapping) else {}
+    )
+    values = data_access.get("user_hidden_values")
+    if not isinstance(values, list):
+        return []
+    result = []
+    for item in values:
+        if not isinstance(item, Mapping):
+            continue
+        field = str(item.get("field", "") or "")
+        if not field or "value" not in item:
+            continue
+        result.append(
+            {
+                "field": field,
+                "value": item.get("value"),
+                "level": str(
+                    item.get("level", "") or "unknown"
+                ),
+                "categories": [
+                    str(category)
+                    for category in item.get(
+                        "categories",
+                        [],
+                    ) or []
+                    if str(category)
+                ],
+                "visibility": str(
+                    item.get("visibility", "") or "hidden"
+                ),
+            }
+        )
+    return result
 
 
 def _sensitivity_visibility_summary(
@@ -1771,6 +2163,47 @@ def _risk_type_for_user(ring: int, policy_id: str) -> str:
     return "安全风险"
 
 
+def _attention_kind_for_risk(
+    ring: int,
+    policy_id: str,
+    *,
+    event_kind: str = "",
+) -> str:
+    """Map internal findings to the four user-facing audit categories."""
+    if policy_id in {
+        "ring0.direct_user_instruction",
+        "ring1.indirect_prompt_injection",
+    }:
+        return "prompt_injection"
+    if ring in {0, 1} and "prompt_injection" in policy_id:
+        return "prompt_injection"
+    if policy_id == "ring3.sensitive_egress" or "sensitive_egress" in policy_id:
+        return "sensitive_egress"
+    if policy_id in {
+        "ring2.l2_confirmation",
+        "ring2.l2_confirmation_rejected",
+        "ring2.source_risk_confirmation",
+        "ring2.graph_authorization",
+    }:
+        return "high_risk_authorization"
+    if (
+        policy_id == "ring2.sensitive_content_exposed"
+        or policy_id.startswith(
+            "ring2.sensitive_data_exposure_"
+        )
+    ):
+        return "sensitive_llm_exposure"
+    return ""
+
+
+_ATTENTION_PRIORITY = {
+    "prompt_injection": 0,
+    "sensitive_egress": 1,
+    "high_risk_authorization": 2,
+    "sensitive_llm_exposure": 3,
+}
+
+
 def _safe_user_content(
     event: Mapping[str, Any],
     risk: Mapping[str, Any],
@@ -1785,15 +2218,26 @@ def _safe_user_content(
     )
     if policy_id == "ring2.sensitive_data_exposure_confirmation":
         details = _sensitivity_details(event, risk)
-        exposed = [
-            f"{item.get('entity')}.{item.get('field')} ×{item.get('count')} ({item.get('level')})"
-            if int(item.get("count", 0) or 0) > 1
-            else f"{item.get('entity')}.{item.get('field')} ({item.get('level')})"
-            for item in details
-            if item.get("visibility") == "exposed"
-        ]
-        if exposed:
-            return f"{action}；向 Agent 提供字段：{', '.join(dict.fromkeys(exposed))}。"
+        counts = {
+            visibility: sum(
+                int(item.get("count", 0) or 0)
+                for item in details
+                if item.get("visibility") == visibility
+            )
+            for visibility in (
+                "analysis",
+                "exposed",
+                "reference",
+                "hidden",
+            )
+        }
+        if any(counts.values()):
+            return (
+                f"{action}。\n"
+                f"拟向 Agent 提供 {counts['analysis'] + counts['exposed']} 个字段；"
+                f"以占位符引用 {counts['reference']} 个；"
+                f"隐藏 {counts['hidden']} 个。"
+            )
     source_count = len(risk.get("source_ids", []) or [])
     if source_count > 1:
         return f"{action}；涉及 {source_count} 条记录。"
@@ -1895,7 +2339,10 @@ def _injection_user_content(
     evidence = _injection_evidence_details(event)
     if evidence:
         fields = list(dict.fromkeys(item["field"] for item in evidence if item.get("field")))
-        return f"检测到 {len(evidence)} 段注入指令。 来源字段：{', '.join(fields) or 'unknown'}。"
+        return (
+            f"检测到 {len(evidence)} 段注入指令。\n"
+            f"来源字段：{', '.join(fields) or 'unknown'}。"
+        )
     for key in (
         "safe_content",
         "user_content",
@@ -1965,11 +2412,7 @@ def _legacy_natural_risk_reason(
         confirmation = confirmation_state or {}
         if confirmation.get("status") == "approved":
             source_label = "默认策略" if confirmation.get("approval_source") == "automatic_default" else "你的确认"
-            if action_text:
-                return f"{action_text}可能产生重要影响，系统已根据{source_label}允许继续执行。"
             return f"系统已根据{source_label}允许该操作继续执行。"
-        if action_text:
-            return f"{action_text}可能产生重要影响，系统已暂停并等待确认。"
         return "该操作可能产生重要影响，系统已暂停并等待确认。"
     compact = re.sub(r"\s+", " ", str(raw_reason or "")).strip()
     return compact[:500] or "系统根据当前任务授权和风险策略处理了该操作。"
@@ -2102,9 +2545,19 @@ def _natural_risk_reason(
         return f"{action} 的 {arguments} 由{source_text}提供。"
 
     if policy_id == "ring2.sensitive_data_exposure_confirmation":
+        analysis = _visibility_field_summary(
+            sensitivity_details,
+            "analysis",
+            include_categories=False,
+        )
         exposed = _visibility_field_summary(
             sensitivity_details,
             "exposed",
+            include_categories=False,
+        )
+        reference = _visibility_field_summary(
+            sensitivity_details,
+            "reference",
             include_categories=False,
         )
         hidden = _visibility_field_summary(
@@ -2116,7 +2569,8 @@ def _natural_risk_reason(
             {
                 str(category)
                 for item in sensitivity_details
-                if item.get("visibility") == "exposed"
+                if item.get("visibility")
+                in {"analysis", "exposed"}
                 for category in item.get("categories", []) or []
                 if category
             }
@@ -2136,7 +2590,7 @@ def _natural_risk_reason(
         pre_exposure = ring2_check.get("exposure_check", {}) if isinstance(ring2_check, Mapping) else {}
         pre_max_level = str(pre_exposure.get("max_exposure_level", "") or "")
         if runtime_phase:
-            fields = exposed or ", ".join(evidence_fields)
+            fields = analysis or exposed or ", ".join(evidence_fields)
             level_text = f"（{previous_level} → {current_level}）" if previous_level and current_level else ""
             reason = f"读取后发现 {fields or '结果中的自然语言字段'} 的敏感等级{level_text}"
             if categories:
@@ -2144,13 +2598,29 @@ def _natural_risk_reason(
             if hidden:
                 reason += f"；隐藏字段：{hidden}"
             return reason + "。"
-        reason = f"读取前发现待暴露字段{'：' + exposed if exposed else ''}"
+        reason_lines = [
+            f"读取前发现待暴露字段{'：' + exposed if exposed else ''}"
+        ]
         if pre_max_level:
-            reason += f"；计划上限 {pre_max_level}"
+            reason_lines.append(f"计划上限：{pre_max_level}")
         if categories:
-            reason += f"；敏感类别：{', '.join(categories)}"
+            reason_lines.append(
+                f"敏感类别：{', '.join(categories)}"
+            )
         if hidden:
-            reason += f"；隐藏字段：{hidden}"
+            reason_lines.append(f"隐藏字段：{hidden}")
+        if analysis:
+            reason_lines.append(
+                f"供 LLM 分析：{analysis}"
+            )
+        if exposed:
+            reason_lines.append(
+                f"LLM 可见：{exposed}"
+            )
+        if reference:
+            reason_lines.append(
+                f"仅以占位符引用：{reference}"
+            )
         if natural_language_hidden:
             hidden_language = ", ".join(
                 f"{item.get('entity', 'related_entity')}."
@@ -2159,8 +2629,10 @@ def _natural_risk_reason(
                 f"{item.get('reason', 'prompt_injection')})"
                 for item in natural_language_hidden
             )
-            reason += f"；对 Agent 隐藏自然语言内容：{hidden_language}"
-        return reason + "。"
+            reason_lines.append(
+                f"对 Agent 隐藏自然语言内容：{hidden_language}"
+            )
+        return "\n".join(reason_lines) + "。"
 
     if policy_id in {
         "ring2.l2_confirmation",
@@ -2171,23 +2643,24 @@ def _natural_risk_reason(
             return f"{tool} 的控制参数来自已隔离注入影响的来源。"
         if tool == "send_money":
             return "该转账会写入银行交易记录，属于 L2 写操作。"
-        if tool in {
-            "send_email",
-            "send_direct_message",
-            "send_channel_message",
-            "share_file",
-        }:
-            return "该操作会向外部接收方发送内容，属于 L2 外发。"
+        if tool == "send_direct_message":
+            return "该操作会向指定 Slack 用户发送消息并写入会话记录，属于 L2 外发。"
+        if tool == "send_channel_message":
+            return "该操作会向 Slack 频道发送消息并写入频道记录，属于 L2 外发。"
+        if tool == "send_email":
+            return "该操作会向邮件收件人发送内容，属于 L2 外发。"
+        if tool == "share_file":
+            return "该操作会向指定对象共享文件，属于 L2 外发。"
         if tool in {"delete_file", "delete_email", "cancel_calendar_event"}:
             return "该操作会删除或取消现有数据，属于 L2 操作。"
         return "该操作属于计划内 L2 操作。"
 
     if policy_id == "ring2.l2_chain_inconsistent":
-        return f"{action_text or action} 的调用原因、参数或来源与任务计划步骤不一致。"
+        return "调用原因、参数或来源与任务计划步骤不一致。"
 
     if policy_id.startswith("ring2.task_scope"):
         reason_key = _concise_policy_reason_key(raw_reason)
-        return f"{action_text or action} 未通过任务范围检查：{reason_key}。"
+        return f"未通过任务范围检查：{reason_key}。"
 
     if policy_id == "ring2.sensitive_field_withheld":
         hidden = _visibility_field_summary(
@@ -2198,10 +2671,10 @@ def _natural_risk_reason(
 
     if policy_id == "ring2.requirement_coverage":
         reason_key = _concise_policy_reason_key(raw_reason)
-        return f"{action_text or action} 未执行，因为 {reason_key}。"
+        return f"操作未执行，因为 {reason_key}。"
 
     if policy_id == "ring2.execution_atomicity_unavailable":
-        return f"{action_text or action} 可能已产生副作用，但当前环境无法保证失败时完整回滚。"
+        return "操作可能已产生副作用，但当前环境无法保证失败时完整回滚。"
 
     if ring == 3 or "sensitive_egress" in policy_id:
         ring3 = event.get("ring3_check")
@@ -2213,18 +2686,46 @@ def _natural_risk_reason(
         if destination:
             details.append(
                 {
-                    "fixed_authorized": "接收方为固定授权目标",
-                    "derived_authorized": "接收方为受控派生目标",
-                    "unauthorized": "接收方未授权",
+                    "fixed_authorized": "接收方：显式授权目标",
+                    "derived_authorized": "接收方：由任务数据动态解析，属于受控授权目标",
+                    "unauthorized": "接收方：未授权",
                 }.get(destination, destination)
             )
         confidentiality = str(authorization.get("confidentiality", "") or "")
         maximum = str(authorization.get("max_confidentiality", "") or "")
         if confidentiality:
-            details.append(f"内容等级 {confidentiality}" + (f"，上限 {maximum}" if maximum else ""))
+            confidentiality_rank = {
+                "public": 0,
+                "internal": 1,
+                "confidential": 2,
+                "secret": 3,
+            }
+            within_limit = (
+                not maximum
+                or confidentiality_rank.get(
+                    confidentiality.lower(),
+                    -1,
+                )
+                <= confidentiality_rank.get(maximum.lower(), -1)
+            )
+            details.append(
+                f"内容等级：{confidentiality}"
+                + (
+                    f"，{'未超过' if within_limit else '超过'}"
+                    f"计划上限 {maximum}"
+                    if maximum
+                    else ""
+                )
+            )
         provenance = str(authorization.get("provenance_state", "") or "")
         if provenance:
-            details.append(f"来源状态 {provenance}")
+            details.append(
+                {
+                    "complete": "来源：完整（complete）",
+                    "incomplete": "来源：不完整（incomplete）",
+                    "invalid": "来源：无效（invalid）",
+                }.get(provenance, f"来源状态 {provenance}")
+            )
         sync = authorization.get("runtime_confidentiality_sync")
         if str(decision).upper() == "ADVISORY" and isinstance(
             sync,
@@ -2238,27 +2739,36 @@ def _natural_risk_reason(
                 or ""
             )
             current = str(sync.get("max_confidentiality", "") or "")
-            detail_text = "；".join(details)
+            detail_text = "\n".join(details)
             transition = (
                 f"，计划上限由 {previous} 同步为 {current}"
                 if previous and current
                 else (f"，计划上限同步为 {current}" if current else "")
             )
             return (
-                f"{action_text or action} 的内容等级较高：{detail_text}"
+                "触发敏感数据外发告警。\n"
+                f"{detail_text}"
                 f"{transition}；该次外发仍需 L2 确认，风险会提示但不阻断。"
             )
         reason_key = _concise_policy_reason_key(raw_reason)
-        detail_text = "；".join(details) or reason_key
-        return f"{action_text or action} 的外发检查未通过：{detail_text}。"
+        detail_text = "\n".join(details) or reason_key
+        if str(decision).upper() == "ADVISORY":
+            return (
+                "触发敏感数据外发告警。\n"
+                f"{detail_text}"
+            )
+        return (
+            "外发检查未通过。\n"
+            f"{detail_text}"
+        )
 
     reason_key = _concise_policy_reason_key(raw_reason)
     if reason_key and reason_key != str(raw_reason or ""):
-        return f"{action_text or action}：{reason_key}。"
+        return f"{reason_key}。"
     compact = re.sub(r"\s+", " ", str(raw_reason or "")).strip()
     if compact:
-        return f"{action_text or action}：{compact[:300]}。"
-    return f"{action_text or action} 触发了 {policy_id or '安全策略'}。"
+        return f"{compact[:300]}。"
+    return f"触发了 {policy_id or '安全策略'}。"
 
 
 def _build_risk_cards_from_events(
@@ -2290,9 +2800,6 @@ def _build_risk_cards_from_events(
             ]
         for risk in risks:
             event_kind = str(risk.get("event_kind", "security"))
-            decision = str(risk.get("decision", "ADVISORY")).upper()
-            if event_kind != "security" and not (event_kind == "policy" and decision == "HOLD"):
-                continue
             existing = next(
                 (card for card in risk_cards if card.get("risk_id") == risk.get("risk_id")),
                 None,
@@ -2322,13 +2829,48 @@ def _build_risk_cards_from_events(
                 action,
                 policy_id,
             )
-            confirmation_state = _confirmation_state(event)
+            confirmation_state = (
+                _confirmation_state(event)
+                if (
+                    policy_id.startswith(
+                        "ring2.sensitive_data_exposure_"
+                    )
+                    or policy_id in {
+                        "ring2.l2_confirmation",
+                        "ring2.l2_confirmation_rejected",
+                        "ring2.source_risk_confirmation",
+                    }
+                )
+                else {}
+            )
             if str(action).upper() == "HOLD" and confirmation_state:
                 defense_action = confirmation_state["defense_action"]
             risk_type = _risk_type_for_user(ring, policy_id)
             user_content = _safe_user_content(event, risk)
             injection_evidence = _injection_evidence_details(event)
             sensitivity_details = _sensitivity_details(event, risk)
+            hidden_sensitive_values = (
+                _hidden_sensitive_values(event)
+                if policy_id
+                == "ring2.sensitive_data_exposure_confirmation"
+                else []
+            )
+            attention_kind = _attention_kind_for_risk(
+                ring,
+                policy_id,
+                event_kind=event_kind,
+            )
+            if not attention_kind:
+                continue
+            attention_label = {
+                "prompt_injection": "\u63d0\u793a\u6ce8\u5165\u653b\u51fb",
+                "sensitive_egress": "\u654f\u611f\u6570\u636e\u5916\u53d1",
+                "high_risk_authorization": "\u9ad8\u98ce\u9669\u64cd\u4f5c\u6388\u6743",
+                "sensitive_llm_exposure": (
+                    "\u654f\u611f\u6570\u636e\u5bf9 LLM \u66b4\u9732"
+                ),
+            }[attention_kind]
+            risk_type = attention_label
             sensitivity_level = _highest_sensitivity_level(sensitivity_details)
             subject_app, subject_entity = _sensitivity_subject(event)
             natural_language_hidden = _natural_language_hidden_details(
@@ -2378,6 +2920,8 @@ def _build_risk_cards_from_events(
                     "event_kind": event_kind,
                     "severity": risk.get("severity", "medium"),
                     "policy_id": policy_id,
+                    "attention_kind": attention_kind,
+                    "attention_label": attention_label,
                     "phase": risk.get("phase", ""),
                     "fsm_before": risk.get("fsm_before"),
                     "fsm_after": risk.get("fsm_after"),
@@ -2410,6 +2954,7 @@ def _build_risk_cards_from_events(
                     "sensitivity_details": sensitivity_details,
                     "sensitivity_level": sensitivity_level,
                     "natural_language_hidden": natural_language_hidden,
+                    "hidden_sensitive_values": hidden_sensitive_values,
                     "user_view": {
                         "risk_type": risk_type,
                         "content": user_content,
@@ -2418,12 +2963,19 @@ def _build_risk_cards_from_events(
                         "sensitivity_details": sensitivity_details,
                         "sensitivity_level": sensitivity_level,
                         "natural_language_hidden": natural_language_hidden,
+                        "hidden_sensitive_values": hidden_sensitive_values,
                         "content_trusted": True,
                     },
                     "graph_focus": graph_focus,
                 }
             )
-    return risk_cards
+    return sorted(
+        risk_cards,
+        key=lambda card: _ATTENTION_PRIORITY.get(
+            str(card.get("attention_kind", "")),
+            99,
+        ),
+    )
 
 
 def _build_policy_events_from_events(
@@ -2452,11 +3004,24 @@ def _build_policy_events_from_events(
             phase = str(
                 risk.get("phase", "") or ("pre_execution" if risk.get("fsm_before") == "ACTION_PROPOSED" else "")
             )
+            attention_kind = _attention_kind_for_risk(
+                ring,
+                policy_id,
+                event_kind="policy",
+            )
+            if not attention_kind:
+                continue
             app = _event_app(event, suite)
             user_content = _safe_user_content(event, risk)
             injection_evidence = _injection_evidence_details(event)
             confirmation_state = _confirmation_state(event)
             sensitivity_details = _sensitivity_details(event, risk)
+            hidden_sensitive_values = (
+                _hidden_sensitive_values(event)
+                if policy_id
+                == "ring2.sensitive_data_exposure_confirmation"
+                else []
+            )
             sensitivity_level = _highest_sensitivity_level(sensitivity_details)
             subject_app, subject_entity = _sensitivity_subject(event)
             natural_language_hidden = _natural_language_hidden_details(
@@ -2477,7 +3042,15 @@ def _build_policy_events_from_events(
                 risk,
                 injection_evidence,
             )
-            risk_type = _risk_type_for_user(ring, policy_id)
+            attention_label = {
+                "prompt_injection": "\u63d0\u793a\u6ce8\u5165\u653b\u51fb",
+                "sensitive_egress": "\u654f\u611f\u6570\u636e\u5916\u53d1",
+                "high_risk_authorization": "\u9ad8\u98ce\u9669\u64cd\u4f5c\u6388\u6743",
+                "sensitive_llm_exposure": (
+                    "\u654f\u611f\u6570\u636e\u5bf9 LLM \u66b4\u9732"
+                ),
+            }[attention_kind]
+            risk_type = attention_label
             defense_action = _get_defense_action(
                 ring,
                 str(risk.get("decision", "ADVISORY")).upper(),
@@ -2508,6 +3081,8 @@ def _build_policy_events_from_events(
                         phase,
                     ),
                     "policy_id": policy_id,
+                    "attention_kind": attention_kind,
+                    "attention_label": attention_label,
                     "decision": risk.get("decision", ""),
                     "severity": risk.get("severity", "medium"),
                     "confidence": risk.get("confidence"),
@@ -2540,6 +3115,7 @@ def _build_policy_events_from_events(
                     "sensitivity_details": sensitivity_details,
                     "sensitivity_level": sensitivity_level,
                     "natural_language_hidden": natural_language_hidden,
+                    "hidden_sensitive_values": hidden_sensitive_values,
                     "user_view": {
                         "risk_type": risk_type,
                         "content": user_content,
@@ -2548,6 +3124,7 @@ def _build_policy_events_from_events(
                         "sensitivity_details": sensitivity_details,
                         "sensitivity_level": sensitivity_level,
                         "natural_language_hidden": natural_language_hidden,
+                        "hidden_sensitive_values": hidden_sensitive_values,
                         "content_trusted": True,
                     },
                     "graph_focus": {
@@ -2562,7 +3139,13 @@ def _build_policy_events_from_events(
                     },
                 }
             )
-    return policy_events
+    return sorted(
+        policy_events,
+        key=lambda event: _ATTENTION_PRIORITY.get(
+            str(event.get("attention_kind", "")),
+            99,
+        ),
+    )
 
 
 def _build_untrusted_views(events: list, task_id: str) -> list:
@@ -2673,6 +3256,9 @@ def _deterministic_completion_audit(
     ]
     failed_checks = [item for item in checks if not item.get("passed")]
     passed = bool(task_evaluation.get("passed"))
+    business_goal_zh = str(
+        task_evaluation.get("business_goal_zh", "") or ""
+    )
     if passed:
         summary = "确定性任务校验通过。"
     else:
@@ -2686,6 +3272,7 @@ def _deterministic_completion_audit(
         "overall": "completed" if passed else "incomplete",
         "summary": summary,
         "outcomes": [],
+        "business_goal_zh": business_goal_zh,
         "warnings": [],
         "deterministic_evaluation_checks": checks,
         "deterministic_evaluation_failed_checks": failed_checks,
@@ -2826,8 +3413,61 @@ def _record_execution_outcome(
     return task_outcome
 
 
+def _optional_request_bool(
+    data: Mapping[str, Any],
+    key: str,
+) -> bool | None:
+    if key not in data:
+        return None
+    value = data[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
+def _apply_execution_runtime_options(
+    data: Mapping[str, Any] | None,
+) -> bool:
+    """Apply explicit UI runtime options before an execution request."""
+    payload = data or {}
+    requested_defense = _optional_request_bool(
+        payload,
+        "defense_enabled",
+    )
+    requested_auto_confirm = _optional_request_bool(
+        payload,
+        "auto_confirmations",
+    )
+    previous_config = get_config()
+    previous_defense_enabled = interceptor_module._defense_enabled
+
+    if requested_defense is not None:
+        if requested_defense:
+            if not previous_defense_enabled:
+                reset_config()
+                set_direct_injection_mode(
+                    str(previous_config["direct_injection_mode"])
+                )
+                set_auto_confirmations(
+                    bool(previous_config["auto_confirmations"])
+                )
+            interceptor_module._defense_enabled = True
+            set_planning_enabled(True)
+        else:
+            interceptor_module._defense_enabled = False
+            disable_defense_layer()
+
+    if requested_auto_confirm is not None:
+        set_auto_confirmations(requested_auto_confirm)
+
+    return interceptor_module._defense_enabled
+
+
 @_exclusive_task_execution
-def _execute_action_with_pipeline(action: str) -> dict[str, Any]:
+def _execute_action_with_pipeline(
+    action: str,
+    runtime_options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """执行预设场景，通过 AgentPipeline 让 LLM 自主决策工具调用。
 
     预设场景只提供 prompt 文本，不预设任何工具调用。
@@ -2846,6 +3486,16 @@ def _execute_action_with_pipeline(action: str) -> dict[str, Any]:
     scenario_suite = mock_scenario.get("suite", "workspace")
     app_name = scenario_suite if scenario_suite in APP_DOMAINS else "unified"
 
+    if not _llm_config["api_key"]:
+        return {"error": "LLM 未配置，请先设置 API Key"}
+
+    try:
+        defense_enabled = _apply_execution_runtime_options(
+            runtime_options,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     # 自动重置，确保新任务的调用链独立
     reset_all_environments()
     _pipeline_cache.clear()
@@ -2856,11 +3506,8 @@ def _execute_action_with_pipeline(action: str) -> dict[str, Any]:
     kg_instance = KnowledgeGraph()
     agent_id = kg_instance.agent_node
 
-    if not _llm_config["api_key"]:
-        return {"error": "LLM 未配置，请先设置 API Key"}
-
     try:
-        return _execute_with_real_llm(
+        result = _execute_with_real_llm(
             prompt,
             ctx,
             now,
@@ -2870,6 +3517,8 @@ def _execute_action_with_pipeline(action: str) -> dict[str, Any]:
             scenario=mock_scenario,
             cross_app_task=CROSS_APP_TASKS.get(action),
         )
+        result["defense_enabled"] = defense_enabled
+        return result
     except Exception as e:
         _safe_print(f"[error] 真实 LLM 执行失败: {e}")
         return {"error": f"LLM 执行失败: {e!s}"}
@@ -3123,6 +3772,10 @@ def _execute_with_real_llm(
         "timestamp": _format_timestamp(now),
         "prompt": prompt,
         "llm_mode": "real",
+        "defense_enabled": bool(
+            interceptor_module._defense_enabled
+        ),
+        "defense_config": get_config(),
         "app_name": app_name,
         "agent_id": agent_id,
         "messages": [
@@ -3265,6 +3918,10 @@ def _save_trace_to_file(trace_record: dict[str, Any]) -> bool:
                 default=str,
             )
         os.replace(temp_filename, filename)
+        _archive_previous_trace_versions(
+            trace_record,
+            trace_id,
+        )
         _safe_print(f"[trace] 追踪记录已保存: {filename}")
         return True
     except Exception as e:
@@ -3316,6 +3973,10 @@ def _save_trace_to_file(trace_record: dict[str, Any]) -> bool:
         )
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(fallback, f, ensure_ascii=False, indent=2, default=str)
+        _archive_previous_trace_versions(
+            fallback,
+            trace_id,
+        )
         _safe_print(f"[trace] 已保存最小追踪记录: {filename}")
         return True
     except Exception as fallback_error:
@@ -3999,7 +4660,27 @@ def _cross_app_injection_points(
     *,
     policy: str = "all",
 ) -> list[dict[str, Any]]:
-    return classify_injection_points(task, policy=policy)
+    preview = task.prompt.strip()
+    if len(preview) > 240:
+        preview = preview[:237] + "..."
+    user_prompt_point = {
+        "id": "user_prompt",
+        "app": "system",
+        "collection": "user_prompt",
+        "index": 0,
+        "field": "prompt",
+        "label": "用户提示 · Ring 0",
+        "preview": preview,
+        "required_read": True,
+        "delivery_guarantee": "all_paths",
+        "source_step_ids": [],
+        "source_tools": [],
+        "surface": "user_prompt",
+    }
+    return [
+        user_prompt_point,
+        *classify_injection_points(task, policy=policy),
+    ]
 
 
 def _cross_app_compatible_attack_goal_ids(
@@ -4075,6 +4756,8 @@ def _cross_app_attack_scenario(
 ) -> dict[str, Any]:
     point = _cross_app_injection_point(task, injection_point_id)
     scenario = copy.deepcopy(task.to_scenario())
+    if point.get("surface") == "user_prompt":
+        return scenario
     entry = scenario["fixtures"][point["app"]][point["collection"]][point["index"]]
     original = str(entry.get(point["field"], "")).rstrip()
     separator = "\n\n" if "\n" in original else " "
@@ -4205,22 +4888,6 @@ def _execute_cross_app_attack(data: Mapping[str, Any]):
     injection_point_id = str(data.get("injection_point_id", ""))
     injection_goal_id = str(data.get("injection_goal_id", ""))
     attack_type = str(data.get("attack_type", "direct"))
-    requested_defense_mode = data.get(
-        "defense_enabled",
-        True,
-    )
-    if not isinstance(requested_defense_mode, bool):
-        return (
-            jsonify(
-                {
-                    "error": (
-                        "defense_enabled must be a boolean"
-                    )
-                }
-            ),
-            400,
-        )
-    defense_enabled = requested_defense_mode
     configured_task = CROSS_APP_TASKS.get(task_id)
     if (
         configured_task is not None
@@ -4275,13 +4942,33 @@ def _execute_cross_app_attack(data: Mapping[str, Any]):
         return jsonify({"error": str(exc)}), 400
 
     clean_scenario = task.to_scenario()
-    clean_value = str(
-        clean_scenario["fixtures"][point["app"]][point["collection"]][point["index"]].get(point["field"], "")
-    ).rstrip()
-    injected_value = str(
-        scenario["fixtures"][point["app"]][point["collection"]][point["index"]].get(point["field"], "")
+    is_user_prompt_injection = (
+        point.get("surface") == "user_prompt"
     )
+    if is_user_prompt_injection:
+        clean_value = task.prompt.rstrip()
+        injected_value = (
+            f"{clean_value}\n\n{injection_string}"
+        )
+    else:
+        clean_value = str(
+            clean_scenario["fixtures"][point["app"]][point["collection"]][point["index"]].get(
+                point["field"],
+                "",
+            )
+        ).rstrip()
+        injected_value = str(
+            scenario["fixtures"][point["app"]][point["collection"]][point["index"]].get(
+                point["field"],
+                "",
+            )
+        )
     payload_offset = injected_value.find(injection_string)
+    try:
+        defense_enabled = _apply_execution_runtime_options(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     attack_info = {
         "mode": "cross_app",
         "attack_type": attack_type,
@@ -4297,7 +4984,15 @@ def _execute_cross_app_attack(data: Mapping[str, Any]):
             "collection": point["collection"],
             "index": point["index"],
             "field": point["field"],
-            "source_field": (f"fixtures.{point['app']}.{point['collection']}[{point['index']}].{point['field']}"),
+            "source_field": (
+                "prompt"
+                if point.get("surface") == "user_prompt"
+                else (
+                    f"fixtures.{point['app']}.{point['collection']}"
+                    f"[{point['index']}].{point['field']}"
+                )
+            ),
+            "surface": point.get("surface", "tool_output"),
         },
         "payload_offset": payload_offset,
         "payload_length": len(injection_string),
@@ -4306,36 +5001,29 @@ def _execute_cross_app_attack(data: Mapping[str, Any]):
         "suite": "unified",
     }
 
-    interceptor_module._defense_enabled = defense_enabled
-    if defense_enabled:
-        reset_config()
-    else:
-        disable_defense_layer()
-    set_auto_confirmations(True)
-    try:
-        reset_all_environments()
-        _pipeline_cache.clear()
-        _reset_graph_and_context()
-        ctx = TrackingContext()
-        now = time.time()
-        kg_instance = KnowledgeGraph()
-        result = _execute_with_real_llm(
-            prompt=task.prompt,
-            ctx=ctx,
-            now=now,
-            agent_id=kg_instance.agent_node,
-            app_name="unified",
-            endpoint="/api/execute/attack",
-            scenario=scenario,
-            cross_app_task=task,
-            attack_info=attack_info,
-            attack_goal_id=injection_goal_id,
-            attack_context=attack_context,
-        )
-    finally:
-        interceptor_module._defense_enabled = True
-        reset_config()
-        set_auto_confirmations(True)
+    reset_all_environments()
+    _pipeline_cache.clear()
+    _reset_graph_and_context()
+    ctx = TrackingContext()
+    now = time.time()
+    kg_instance = KnowledgeGraph()
+    result = _execute_with_real_llm(
+        prompt=(
+            injected_value
+            if is_user_prompt_injection
+            else task.prompt
+        ),
+        ctx=ctx,
+        now=now,
+        agent_id=kg_instance.agent_node,
+        app_name="unified",
+        endpoint="/api/execute/attack",
+        scenario=scenario,
+        cross_app_task=task,
+        attack_info=attack_info,
+        attack_goal_id=injection_goal_id,
+        attack_context=attack_context,
+    )
     result["attack_info"] = attack_info
     result["defense_enabled"] = defense_enabled
     return jsonify(result)
@@ -4395,6 +5083,14 @@ def api_execute_attack():
         # 根据 attack_type 生成注入字符串
         injection_string = _generate_injection_string(attack_type, injection_goal)
 
+        if not _llm_config["api_key"]:
+            return jsonify({"error": "LLM 未配置，请先设置 API Key"}), 400
+
+        try:
+            _apply_execution_runtime_options(data)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
         # 自动重置，确保新任务的调用链独立
         _reset_graph_and_context()
 
@@ -4402,9 +5098,6 @@ def api_execute_attack():
         now = time.time()
         kg_instance = KnowledgeGraph()
         agent_id = kg_instance.agent_node
-
-        if not _llm_config["api_key"]:
-            return jsonify({"error": "LLM 未配置，请先设置 API Key"}), 400
 
         try:
             # 执行带注入的 prompt
@@ -4704,6 +5397,10 @@ def _execute_with_injected_env(
         "prompt": prompt,
         "injection_string": injection_string,
         "llm_mode": "real",
+        "defense_enabled": bool(
+            interceptor_module._defense_enabled
+        ),
+        "defense_config": get_config(),
         "app_name": app_name,
         "agent_id": agent_id,
         "messages": [
@@ -4814,7 +5511,10 @@ def api_execute():
         if not data or "action" not in data:
             return jsonify({"error": "缺少 action 参数"}), 400
         action = data["action"]
-        result = _execute_action_with_pipeline(action)
+        result = _execute_action_with_pipeline(
+            action,
+            runtime_options=data,
+        )
         if "error" in result:
             return jsonify(result), 400
         return jsonify(result)

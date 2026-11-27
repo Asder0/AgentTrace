@@ -274,12 +274,16 @@ const STATUS_PANEL = {
         // 更新防御机制状态
         const defenseEl = document.getElementById('statusDefenseMode');
         const defenseRings = status.defense_rings || {};
+        const planningEnabled = status.planning_enabled !== false;
         const ringStates = Object.values(defenseRings);
         const enabledRings = ringStates.filter(Boolean).length;
         if (defenseEl) {
             const defenseEnabled = status.defense_enabled;
             if (defenseEnabled === true) {
-                if (ringStates.length && enabledRings === 0) {
+                if (!planningEnabled) {
+                    defenseEl.textContent = '计划关闭';
+                    defenseEl.className = 'status-info-value status-warn';
+                } else if (ringStates.length && enabledRings === 0) {
                     defenseEl.textContent = '已关闭';
                     defenseEl.className = 'status-info-value status-warn';
                 } else if (ringStates.length && enabledRings < ringStates.length) {
@@ -336,7 +340,9 @@ const STATUS_PANEL = {
     _renderDefenseRings(ringStates) {
         const container = document.getElementById('statusDefenseRings');
         if (!container) return;
+        container.hidden = true;
         container.innerHTML = '';
+        return;
         const labels = {
             ring_0: 'Ring 0',
             ring_1: 'Ring 1',

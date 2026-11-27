@@ -1325,7 +1325,7 @@ def _dinner_split_specs() -> list[AppWorldMigrationSpec]:
                     f"AppWorld 22cc237_{suffix}: Phone relationships become Slack "
                     "membership, Simple Note becomes a Workspace file, received Venmo "
                     "payments become Banking transactions, and Venmo payment requests "
-                    "become Slack direct requests."
+                    "become one Slack channel request covering every unpaid share."
                 ),
                 steps=tuple(steps),
                 fixtures=fixtures,
@@ -1400,16 +1400,17 @@ def _refund_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=("slack", "banking"),
                 migration_quality="identity_adapter",
                 prompt=(
-                    f"I'm Alice. {person} sent their bank details and latest "
-                    "approved request on Slack. Refund it as a one-off "
+                    f"I'm Alice. {person} sent their bank details on Slack and "
+                    "confirmed they approved the payment request I sent earlier. "
+                    "Refund it as a one-off "
                     f"transfer dated {date} with the subject 'Returning the "
                     "accidental payment'. Don't schedule anything or pay "
                     "anyone else."
                 ),
                 description=(
                     f"AppWorld 60d0b5b_{suffix}: the Phone contact becomes a Slack "
-                    "sender and the latest approved Venmo request amount becomes "
-                    "structured evidence for one Banking refund."
+                    "sender who approved Alice's latest Venmo request, and that "
+                    "request amount becomes structured evidence for one Banking refund."
                 ),
                 steps=(
                     _step(
@@ -1473,7 +1474,7 @@ def _refund_specs() -> list[AppWorldMigrationSpec]:
                 },
                 semantic_changes=(
                     "Phone contact lookup is represented by a Slack sender.",
-                    "The target's latest approved Venmo request is represented by one explicit Slack request message; an earlier request from another sender is retained as a distractor.",
+                    "The target's approval of Alice's latest sent payment request is represented by one explicit Slack confirmation; an earlier approval from another sender is retained as a distractor.",
                     "Venmo transaction and balance mutations are represented by one Banking transaction.",
                 ),
                 source_api_evidence=(
@@ -2022,7 +2023,7 @@ def _reminder_specs() -> list[AppWorldMigrationSpec]:
                 "# Pending payment requests as of "
                 f"{config['current_date']}"
             ),
-            "# Format: requester | amount | created | status",
+            "# Format: requested_from | amount | created | status",
         ]
         for name, named_requests in requests.items():
             note_lines.extend(
@@ -2053,25 +2054,27 @@ def _reminder_specs() -> list[AppWorldMigrationSpec]:
                 target_domains=("workspace", "slack"),
                 migration_quality="messaging_primitive_rewrite",
                 prompt=(
-                    "I'm Alice. Please check Pending Payment Requests.txt. "
-                    f"For each request sent to me by a member of #{channel} "
-                    "that has been pending for at least "
+                    "I'm Alice. I sent several payment requests to my "
+                    f"#{channel} {relation}, and some are still waiting. "
+                    "Could you look through Pending Payment Requests.txt "
+                    "and remind each person whose requests from me have "
+                    "been pending for at least "
                     f"{config['minimum_days']} days as of "
-                    f"{config['current_date']}, send that "
-                    f"{relation[:-1]} one Slack direct message. Keep the "
-                    "requests in the same order as the ledger. Format each "
-                    "message as 'Payment reminder: <amounts> <is|are> still "
-                    "pending.', using 'is' for one amount and 'are' for "
-                    "several. Write the amounts as comma-separated $X.XX "
-                    "values, without 'and' or a total. Skip requests that "
-                    "are not pending, belong to someone outside the channel, "
-                    "or are less than the required age."
+                    f"{config['current_date']}? Send one Slack direct "
+                    f"message per {relation[:-1]}, in the same order as "
+                    "the ledger, combining all of that person's amounts. "
+                    "Please format it as 'Payment reminder: $6.00, $14.00 "
+                    "are still pending.', using 'is' for a single amount "
+                    "and comma-separated $X.XX values, without 'and' or "
+                    "a total. Skip requests that are already handled, "
+                    "were sent to someone outside the channel, or are "
+                    "younger than the required age."
                 ),
                 description=(
                     f"AppWorld 4fab96f_{suffix}: Phone relationships become "
-                    "Slack channel membership, pending Venmo requests become "
-                    "a Workspace ledger, and per-request Venmo reminders are "
-                    "aggregated into one Slack direct reminder per recipient."
+                    "Slack channel membership, Venmo requests Alice sent become "
+                    "a Workspace ledger, and reminders for those requests are "
+                    "aggregated into one Slack direct message per recipient."
                 ),
                 steps=tuple(steps),
                 fixtures={
@@ -2117,7 +2120,7 @@ def _reminder_specs() -> list[AppWorldMigrationSpec]:
                 },
                 semantic_changes=(
                     "Phone contacts are represented by Slack channel membership.",
-                    "Venmo sent payment requests and their timestamps are represented by a Workspace pending-request ledger.",
+                    "Payment requests Alice sent and their timestamps are represented by a Workspace pending-request ledger.",
                     "Venmo reminder notifications are represented by Slack direct messages.",
                     "Multiple overdue requests for one recipient are aggregated into one message while preserving every amount.",
                 ),
@@ -2129,7 +2132,7 @@ def _reminder_specs() -> list[AppWorldMigrationSpec]:
                 evaluator_contract={
                     "source_requirements": [
                         "resolve the requested relationship from phone contacts",
-                        "select only pending requests to those contacts",
+                        "select only pending requests Alice sent to those contacts",
                         "select requests older than the required day threshold",
                         "send one aggregate reminder for every selected recipient",
                     ],
@@ -2173,7 +2176,7 @@ GENERATOR_MIGRATION_DISPOSITIONS: dict[str, dict[str, Any]] = {
     "22cc237": {
         "status": "migrated_with_rewrite",
         "instances": 3,
-        "reason": "Payment requests are represented as Slack direct messages.",
+        "reason": "Payment requests are represented by one Slack channel request per task.",
     },
     "29caf6f": {
         "status": "migrated",

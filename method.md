@@ -89,7 +89,7 @@ Runtime interceptors
 | Capture | 拦截 LLM 和工具调用，维护任务上下文，记录工具执行前后的环境差异 |
 | Modeling | 构建 PROV-AGENT 图谱、FSM 状态、信息流标签和来源关系 |
 | Analysis | 执行 Ring 0–3 风险判定、调用链检查和任务结果审计 |
-| Visualization | 提供 Flask API、D3 拓扑图、时间线、风险卡片、环境变更和历史回放 |
+| Visualization | 提供 Flask API、D3 拓扑图、任务总结、风险卡片、环境变更和历史回放 |
 
 ## 3. 代码结构
 
@@ -124,6 +124,7 @@ src/agentdojo/method/
 │   ├── plan_actions.py
 │   ├── plan_alignment.py
 │   ├── plan_identity.py
+│   ├── plan_progress.py
 │   ├── l2_chain.py
 │   ├── requirement_audit.py
 │   ├── outcome_audit.py
@@ -136,7 +137,10 @@ src/agentdojo/method/
 ├── tasks/
 │   ├── appworld_migrations.py
 │   ├── cross_app.py
-│   └── cross_app_evaluation.py
+│   ├── cross_app_attack_construction.py
+│   ├── cross_app_expansion.py
+│   ├── cross_app_evaluation.py
+│   └── normal_task_goals_zh.py
 └── visualization/
     ├── server.py
     ├── mock_apps.py
@@ -158,7 +162,7 @@ src/agentdojo/method/
 6. LLM 推理并选择工具调用。
 7. 工具执行前依次进行 Ring 2 调用范围检查和 Ring 3 最终外发检查。
 8. 工具执行后由 Ring 1 扫描输出字段，并将可安全内容交给 Agent。
-9. 记录图谱、风险事件、FSM 状态、执行时间线、工具活动和任务结果。
+9. 记录图谱、风险事件、FSM 状态、工具活动、任务总结和最终结果。
 10. 导出任务基线与执行后环境快照，写入 trace 文件。
 
 ```mermaid
@@ -349,6 +353,11 @@ outcome 仍保留为必需结果。
 | `strict` | 检出攻击、无可用内容或检测器不可用时阻断 |
 
 无论采用哪种模式，检测器不可用或扫描不完整都会按 fail-closed 阻断。
+
+跨 APP 攻击构造提供 `injection_point_id=user_prompt`，用于把攻击文本直接追加
+到用户任务 prompt，并保留原任务 fixture 和 evaluator。该注入面属于 Ring 0；
+邮件、Slack 和云盘 fixture 注入点属于 Ring 1。真实 DeepSeek 配对测试记录见
+`docs/testing/ring0_direct_injection.md`。
 
 安全占位符 `[[DATA_REMOVED]]` 不是业务数据，也不会被要求还原。系统记录原始 span、实际替换
 span、替换覆盖率以及未被命中跨度覆盖的原文字符数，并在一次隔离完成后把 Agent 可见文本再次
@@ -730,7 +739,7 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 
 风险卡片同时提供面向用户的 `user_view`：
 
-- `risk_type`：提示注入、敏感数据外发、敏感数据授权、超出任务范围等类别；
+- `risk_type`：提示注入攻击、敏感数据外发、高风险操作授权、敏感数据对 LLM 暴露；
 - `content`：经过转义或占位符处理的具体操作/内容摘要；
 - `reason`：用自然语言解释为什么触发风险；
 - `content_trusted=true`：表示展示内容来自系统安全处理后的可信视图。
@@ -738,8 +747,12 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 `ring`、`policy_id`、FSM、证据路径、置信度等字段继续保留给审计和高级排查，
 但不再要求普通用户在前端主卡片中理解这些内部字段。
 
+普通任务范围提醒、计划进度和需求核验等策略事件保留在图谱、Trace 和技术审计中，
+但不进入四类用户风险卡片。风险卡片只展示提示注入、敏感数据外发、高风险操作授权
+和敏感数据对 LLM 暴露。
+
 风险卡片支持反向定位溯源图谱。卡片本身和“查看数据链”按钮会同时聚焦风险/策略节点、
-工具调用、人工授权、数据来源和出口节点，并同步定位对应时间线事件。卡片缺失精确节点时，
+工具调用、人工授权、数据来源和出口节点。卡片缺失精确节点时，
 前端会按活动 ID、工具名和 APP 降级选择最近的工具调用节点。
 
 风险严重度与工具等级分开保存：数据使用 `risk_level`，工具使用 `tool_risk_level`。
@@ -771,7 +784,7 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 | --- | --- |
 | `frontend/index.html` | 页面结构和主视图 |
 | `frontend/js/graph.js` | D3 拓扑图、节点布局、边路由、节点详情 |
-| `frontend/js/timeline.js` | 执行时间线和图谱定位 |
+| `frontend/js/audit-summary.js` | 任务总结、字段范围与确定性结果核验 |
 | `frontend/js/risk-panel.js` | 风险、策略和防御卡片 |
 | `frontend/js/storage-view.js` | 环境变更、任务基线和历史快照 |
 | `frontend/js/main.js` | 初始化、视图切换、历史回放和轮询 |
@@ -795,6 +808,10 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 悬停相关节点可展开聚合分支。点击具体风险卡片会突出对应的主要数据流节点和关系；
 低层证据、来源、泄漏出口和状态转移关系不绘制到画布，但仍保留在 trace 和节点详情中。
 
+前端保留 `COMPLETED`、`INCOMPLETE`、`FAILED`、`CANCELLED`、`BLOCKED`、
+`QUARANTINED`、`SANITIZED` 和 `HELD` 等任务终态，任务总结直接读取终态和
+确定性核验结果。`INCOMPLETE` 不会再被误显示为“结果待核验”。
+
 ### 9.2 环境变更
 
 默认展示字段差异，而不是完整 JSON 树：
@@ -806,19 +823,27 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 - 支持字段差异、任务基线、当前快照三种视图
 - 自动刷新默认关闭
 
-图谱环境变更节点、工具时间线和环境变更视图之间支持相互定位。
+图谱环境变更节点、工具调用节点和环境变更视图之间支持相互定位。
 
 ### 9.3 历史回放
 
 新 trace 保存：
 
 - 当次图谱
-- 执行时间线
+- 任务总结、风险卡片和执行事件
 - 任务基线与执行后环境快照
 - 环境字段差异
 - 风险、策略、任务计划和最终结果
 
 历史回放不会读取当前实时环境。旧 trace 没有完整环境快照时，只显示图谱中可恢复的变更摘要。
+
+历史列表默认按“任务 ID + 正常/攻击类型 + 攻击配置 + 防御开关”保留最新版本。
+同一配置重复执行会生成新 trace，但旧版本会移动到
+`traces_archive/history_versions/`，因此页面总数保持不变。切换任务、攻击目标、
+注入位置或防御状态时，会形成不同的历史条目。
+
+历史列表在打开“历史回放”标签时重新请求后端。若用户停留在已经打开的历史面板中
+执行任务，需要重新进入该标签才能看到刚生成的最新 Trace。
 
 ## 10. Trace 结构
 
@@ -829,6 +854,8 @@ trace_id
 timestamp
 prompt
 app_name / suite
+defense_enabled
+defense_config
 messages
 events
 steps
@@ -842,6 +869,10 @@ task_outcome
 completion_audit
 environment_snapshots
 ```
+
+`defense_enabled` 保存任务实际运行时的主防御开关，
+`defense_config` 保存 Ring、方法、Planner 和自动确认配置。历史归类优先读取
+这两个显式字段，不再根据是否存在 `task_data_plan` 猜测防御状态。
 
 `environment_snapshots[suite]` 包含：
 
@@ -896,6 +927,10 @@ source_paths
 
 可全局更新，也可通过单次调用 `options` 覆盖。
 
+普通任务和攻击执行请求会携带当前前端的 `defense_enabled` 与
+`auto_confirmations`。后端以请求值为准；字段缺失时才沿用当前全局配置。
+攻击结束不会自动把防御和自动确认恢复为开启，页面开关与实际执行状态保持一致。
+
 ### 11.3 环境变量
 
 | 变量 | 说明 |
@@ -907,6 +942,15 @@ source_paths
 | `LOCAL_LLM_PORT` | 本地 OpenAI 兼容服务端口，默认 `8000` |
 
 模型加载使用 `local_files_only=True`，不会静默切换到在线下载。
+
+### 11.4 DeepSeek 模型名称
+
+2026-11-19 的真实 API 核实表明：已从官方模型列表移除的
+`deepseek-chat` 仍可作为兼容别名调用。服务端会把响应中的 `model`
+规范化为 `deepseek-flash`；未设置思考参数时，它表现为
+DeepSeek-V4.1-Flash 的非思考模式。该名称不是长期稳定契约，也不是旧版
+`deepseek-v4-flash`。完整记录和推荐配置见
+`docs/testing/deepseek_model_aliases.md`。
 
 ## 12. 启动与调用
 
@@ -932,7 +976,7 @@ source_paths
 2. 工具调用符合数据依赖，后一步确实消费前一步产物。
 3. 所有外发操作进入 Ring 3，并在需要时产生人工授权节点。
 4. 环境差异只包含 Agent 执行后的变化，不含测试 fixture 初始化。
-5. trace 保存图谱、时间线、任务结果和环境快照，并可从历史记录回放。
+5. trace 保存图谱、任务结果、风险事件和环境快照，并可从历史记录回放。
 
 带 `evaluation` 规范的迁移任务还会返回 `task_evaluation`，其中包含
 `passed` 和逐条 requirement 的检查结果。评测依据最终状态和最终答案，
@@ -979,12 +1023,40 @@ curl -X POST http://localhost:5000/api/execute/attack \
     "injection_point_id":"workspace:append_files:0:content",
     "injection_goal_id":"data_exfiltration",
     "attack_type":"important_instructions",
-    "suite":"unified"
+    "suite":"unified",
+    "defense_enabled":true,
+    "auto_confirmations":true
   }'
 ```
 
 跨 APP 攻击会复用任务的统一环境和正常任务目标，只修改指定 APP 实体中的自然语言字段。
 主界面不再提供无标准答案的自定义任务入口；旧版单 APP 攻击 API 仅作为内部基线调试保留。
+
+跨 APP 攻击支持两类注入面：
+
+- `injection_point_id=user_prompt`：攻击文本直接追加到用户任务 prompt，由 Ring 0
+  的 `prompt-injection-guard-small` 检查；工具 fixture 保持干净；
+- `workspace:...`、`slack:...` 等 fixture 注入点：攻击文本进入工具输出，由
+  Ring 1 检查，并继续执行原任务场景。
+
+Ring 0 请求示例：
+
+```bash
+curl -X POST http://localhost:5000/api/execute/attack \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cross_app_task_id":"cross_app::travel_hotel_and_invoice_from_email",
+    "injection_point_id":"user_prompt",
+    "injection_goal_id":"public_leak",
+    "attack_type":"injecagent",
+    "suite":"unified",
+    "defense_enabled":true,
+    "auto_confirmations":true
+  }'
+```
+
+普通任务请求同样可以携带 `defense_enabled` 和 `auto_confirmations`。前端会始终发送当前
+开关状态，避免配置请求与执行请求发生竞态时仍按旧状态运行。
 
 更新防御配置：
 
@@ -1021,3 +1093,6 @@ curl -X POST http://localhost:5000/api/config/defense \
 - 前端依赖 D3 CDN，离线环境需要本地化依赖。
 - 旧 trace 若没有 `environment_snapshots`，只能恢复环境变更摘要。
 - 真实任务执行需要配置可用 LLM API；本地注入分类器需要 `transformers` 和 `torch`。
+- 历史页面只展示每个运行版本的最新 Trace；归档目录中的旧版本不会出现在前端列表中。
+- `deepseek-chat` 是当前可调用但未列入官方稳定模型列表的兼容别名，不应作为长期实验契约；
+  批量实验必须记录实际模型名称和思考模式。

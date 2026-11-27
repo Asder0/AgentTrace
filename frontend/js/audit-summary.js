@@ -1,7 +1,7 @@
 /**
  * Task-level audit summary derived from the rendered PROV graph.
  * It presents authorization scope, cross-APP route, sensitivity and policy
- * outcome without duplicating the complete graph or timeline.
+ * outcome without duplicating the complete graph or risk-card list.
  */
 const AUDIT_SUMMARY = {
     render(graph) {
@@ -18,17 +18,12 @@ const AUDIT_SUMMARY = {
         );
         const plan = this._latestPlan(tools);
         const route = this._crossAppRoute(tools, graph);
-        const sensitive = dataNodes.filter(node => this._isSensitive(node));
-        const untrusted = dataNodes.filter(node => this._isUntrusted(node));
-        const injectionFlagged = [...dataNodes, ...tools].filter(node =>
-            this._isInjectionRisky(node)
-        );
         const categories = this._categories([...dataNodes, ...tools]);
         const egressNodes = nodes.filter(node =>
             node.type === 'EgressSink'
             || (node.type === 'AgentTool' && node.egress)
         );
-        const blocked = decisions.find(node =>
+        const blockedEvents = decisions.filter(node =>
             String(node.decision || '').toUpperCase() === 'BLOCK'
         );
         const advisory = decisions.find(node =>
@@ -37,6 +32,9 @@ const AUDIT_SUMMARY = {
         const mitigated = decisions.find(node =>
             String(node.decision || '').toUpperCase() === 'MITIGATE'
         );
+        const quarantinedEvent = decisions.find(node =>
+            String(node.decision || '').toUpperCase() === 'QUARANTINE'
+        );
         const taskState = [...nodes].reverse().find(node =>
             node.type === 'TaskState'
             && node.scope === 'task'
@@ -44,6 +42,9 @@ const AUDIT_SUMMARY = {
         );
         const taskOutcome = String(taskState?.state || '').toUpperCase();
         const hasTaskOutcome = Boolean(taskOutcome);
+        const completionAssessed = (
+            taskState?.completion_audit?.assessed === true
+        );
         const taskBlocked = taskOutcome === 'BLOCKED';
         const taskQuarantined = [
             'QUARANTINED',
@@ -60,7 +61,7 @@ const AUDIT_SUMMARY = {
         let statusClass = '';
         let statusText = '等待任务';
         let auditKind = 'waiting';
-        if (blocked || taskBlocked) {
+        if (taskBlocked) {
             statusClass = 'blocked';
             statusText = '已阻断';
             auditKind = 'blocked';
@@ -76,14 +77,32 @@ const AUDIT_SUMMARY = {
             statusClass = 'warning';
             statusText = '任务未完成';
             auditKind = 'incomplete';
+        } else if (taskCompleted) {
+            auditKind = 'completed';
+            if (!completionAssessed) {
+                statusClass = 'warning';
+                statusText = '结果待核验';
+                auditKind = 'unverified';
+            } else if (
+                blockedEvents.length
+                || advisory
+                || mitigated
+                || quarantinedEvent
+            ) {
+                statusClass = 'warning';
+                statusText = '已完成（含风险）';
+            } else {
+                statusClass = 'ok';
+                statusText = '检查通过';
+            }
+        } else if (blockedEvents.length) {
+            statusClass = 'blocked';
+            statusText = '已阻断';
+            auditKind = 'blocked';
         } else if (advisory || mitigated) {
             statusClass = 'warning';
             statusText = mitigated ? '已隔离风险' : '存在提醒';
             auditKind = mitigated ? 'mitigated' : 'advisory';
-        } else if (taskCompleted) {
-            statusClass = 'ok';
-            statusText = '检查通过';
-            auditKind = 'completed';
         } else if (tools.length || hasTaskOutcome) {
             statusClass = 'warning';
             statusText = '结果待核验';
@@ -104,65 +123,67 @@ const AUDIT_SUMMARY = {
                     : '·';
 
         const allowedActions = this._unique(plan.allowed_actions || []);
-        const allowedEffects = this._unique(
-            (plan.allowed_effects || []).map(item =>
-                labels.effectLabel ? labels.effectLabel(item) : item
-            )
-        );
         const actualTools = this._unique(tools.map(node => node.tool_base_name || node.label || node.id));
-        const egressState = egressNodes.length
-            ? `存在 ${egressNodes.length} 个外发节点`
-            : '未发生外部外发';
-        const summaryText = blocked
-            ? (blocked.reason || blocked.block_reason || '策略阻断')
-            : taskIncomplete
-                ? (taskState.reason || taskState.outcome_summary || '必需结果未完成')
-            : advisory
-                ? (advisory.reason || '不可信数据影响了控制参数')
-                : mitigated
-                    ? (mitigated.reason || '检测到间接注入并对高风险文本执行隔离')
-                : '敏感数据读取与外发行为均在本次任务授权范围内。';
+        const unexpectedTools = allowedActions.length
+            ? actualTools.filter(item => !allowedActions.includes(item))
+            : [];
+        const unusedAllowedTools = actualTools.length
+            ? allowedActions.filter(item => !actualTools.includes(item))
+            : [];
+        const externalActions = egressNodes.reduce((items, node) => {
+            const action = node.tool_base_name || node.label || node.id;
+            return action && !items.includes(action)
+                ? [...items, action]
+                : items;
+        }, []);
         const rawOutcomeChecks = Array.isArray(
             taskState?.completion_audit?.outcomes
         )
             ? taskState.completion_audit.outcomes
             : [];
+        const rawDeterministicChecks = Array.isArray(
+            taskState?.completion_audit
+                ?.deterministic_evaluation_checks
+        )
+            ? taskState.completion_audit
+                .deterministic_evaluation_checks
+            : [];
+        const requiredResultFailures = rawDeterministicChecks.filter(
+            item => (
+                item?.passed !== true
+                && item?.category !== 'unexpected_change'
+                && item?.name
+                    !== 'no collateral application changes'
+            )
+        );
+        const unexpectedChangeFailures = rawDeterministicChecks.filter(
+            item => (
+                item?.passed !== true
+                && (
+                    item?.category === 'unexpected_change'
+                    || item?.name
+                        === 'no collateral application changes'
+                )
+            )
+        );
         const outcomeCounts = {
             satisfied: rawOutcomeChecks.filter(item =>
                 String(item.status || '') === 'satisfied'
             ).length,
-            unsatisfied: rawOutcomeChecks.filter(item =>
-                String(item.status || '') === 'unsatisfied'
-            ).length,
+            unsatisfied: (
+                rawOutcomeChecks.filter(item =>
+                    String(item.status || '') === 'unsatisfied'
+                ).length
+                + requiredResultFailures.length
+            ),
             uncertain: rawOutcomeChecks.filter(item =>
                 String(item.status || '') === 'uncertain'
             ).length,
+            unexpected: unexpectedChangeFailures.length,
         };
         const localizedSummaryText = labels.auditSummaryText
             ? labels.auditSummaryText(auditKind, null, outcomeCounts)
             : '审计状态已记录。';
-        const forbiddenEffects = this._unique(
-            (plan.forbidden_effects || []).map(item =>
-                labels.effectLabel ? labels.effectLabel(item) : item
-            )
-        );
-        const stopConditions = Array.isArray(plan.stop_conditions)
-            ? plan.stop_conditions
-            : [];
-        const outcomeChecks = Array.isArray(
-            taskState?.completion_audit?.outcomes
-        )
-            ? taskState.completion_audit.outcomes.map(item => {
-                const status = String(item.status || 'uncertain');
-                const label = {
-                    satisfied: '已完成',
-                    unsatisfied: '未完成',
-                    uncertain: '未验证',
-                }[status] || status;
-                return `${label}: ${item.description || item.id || ''}`;
-            })
-            : [];
-
         const localizedOutcomeChecks = rawOutcomeChecks.map(item => {
             const status = String(item.status || 'uncertain');
             const label = {
@@ -176,18 +197,91 @@ const AUDIT_SUMMARY = {
                 : '';
             return `${label} · ${description || item.id || '必需结果'}`;
         });
-        const stopConditionChecks = stopConditions.map((item, index) => {
-            const behavior = labels.planBehaviorLabel
-                ? labels.planBehaviorLabel(item.behavior)
-                : '';
-            const condition = labels.hasChinese
-                && labels.hasChinese(item.when)
-                ? item.when
-                : `停止条件 ${index + 1}`;
-            return behavior ? `${condition} · ${behavior}` : condition;
-        });
-        const categoryLabels = categories.map(item =>
-            labels.categoryLabel ? labels.categoryLabel(item) : item
+        const localizedDeterministicChecks = rawDeterministicChecks.map(
+            item => {
+                const passed = item?.passed === true;
+                const label = passed ? '通过' : '未通过';
+                const name = this._deterministicCheckLabel(
+                    item?.name
+                );
+                const detail = (
+                    labels.hasChinese
+                    && labels.hasChinese(item?.detail)
+                )
+                    ? item.detail
+                    : '';
+                return `${label} · ${detail || name}`;
+            }
+        );
+        const businessGoalZh = String(
+            taskState?.completion_audit?.business_goal_zh
+            || ''
+        ).trim();
+        const noRequiredFailures = (
+            requiredResultFailures.length === 0
+        );
+        const noUnexpectedChanges = (
+            unexpectedChangeFailures.length === 0
+        );
+        let resultChecks = [];
+        if (!completionAssessed && !rawDeterministicChecks.length) {
+            resultChecks = [
+                '未执行确定性真值核验，无法自动判断业务目标是否实现',
+            ];
+        } else if (
+            taskCompleted
+            && noRequiredFailures
+            && noUnexpectedChanges
+        ) {
+            resultChecks = [
+                businessGoalZh
+                    ? `已实现 · ${businessGoalZh}`
+                    : '正常任务要求已全部实现',
+            ];
+        } else {
+            if (requiredResultFailures.length) {
+                const labels = requiredResultFailures.map(item => (
+                    this._deterministicCheckLabel(item.name)
+                ));
+                resultChecks.push(
+                    `正常任务要求未实现 · ${this._unique(labels).join('；')}`
+                );
+            }
+            unexpectedChangeFailures.forEach(item => {
+                const detail = this._unexpectedChangeDetail(item.detail);
+                resultChecks.push(
+                    `额外环境变化 · ${detail || '存在任务范围外的应用状态变化'}`
+                );
+            });
+            if (
+                !resultChecks.length
+                && !localizedOutcomeChecks.length
+            ) {
+                resultChecks.push(
+                    taskCompleted
+                        ? '正常任务要求已实现'
+                        : '正常任务要求未全部实现'
+                );
+            }
+        }
+        if (!rawDeterministicChecks.length) {
+            resultChecks = this._unique([
+                ...localizedOutcomeChecks,
+            ]);
+        } else if (!taskCompleted) {
+            resultChecks = this._unique([
+                ...resultChecks,
+                ...localizedOutcomeChecks,
+            ]);
+        }
+        const categoryLabels = this._unique(
+            categories
+                .filter(item => !/^unknown(?:_|$)/i.test(item))
+                .map(item =>
+                    labels.categoryLabel
+                        ? labels.categoryLabel(item)
+                        : item
+                )
         );
         const promptNode = nodes.find(node => node.type === 'Prompt');
         const taskInstruction = promptNode?.content
@@ -199,50 +293,69 @@ const AUDIT_SUMMARY = {
             .filter(Boolean);
         const dataAccessActions = planActions
             .filter(action => action.data_access);
-        const visibleFields = [...new Set(
+        const visibleFields = this._unique(
             dataAccessActions.flatMap(
                 action => action.data_access.visible_fields || []
-            )
-        )];
-        const resourceScopes = [...new Set(planActions.flatMap(action => {
+            ).map(field => this._fieldName(field))
+        );
+        const exposureLevels = this._unique(
+            dataAccessActions.map(
+                action => action.data_access.max_exposure_level
+            ).filter(Boolean)
+        );
+        const exposureRank = {
+            public: 0,
+            internal: 1,
+            confidential: 2,
+            secret: 3,
+        };
+        const highestExposure = exposureLevels.sort((left, right) => (
+            (exposureRank[String(left).toLowerCase()] ?? -1)
+            - (exposureRank[String(right).toLowerCase()] ?? -1)
+        )).at(-1);
+        const resourceScopes = this._unique(planActions.flatMap(action => {
             const dataAccess = action.data_access || {};
             const resourceAccess = action.resource_access || dataAccess;
             return [
-                ...(action.data_access
-                    ? [`max: ${dataAccess.max_exposure_level || 'internal'}`]
+                ...(action.data_access && highestExposure
+                    ? [`最高读取等级：${highestExposure}`]
                     : []),
                 ...Object.entries(resourceAccess.resource_parameters || {})
                     .map(([name, rule]) => {
                         if (rule.mode === 'literal') {
-                            return `${name}: ${(rule.allowed_values || []).join(', ')}`;
+                            const values = (rule.allowed_values || []).join(', ');
+                            return `${name}: ${values || '固定值'}`;
                         }
-                        return `${name}: derived`;
+                        return `${name}: 由来源确定`;
                     })
             ];
-        }))];
+        }));
         const quarantineMetrics = tools
             .map(tool => tool.quarantine_metrics)
             .filter(metric => metric && metric.fields_measured);
-        const quarantineSummary = quarantineMetrics.length
+        const quarantinedSpans = quarantineMetrics.reduce(
+            (sum, metric) => (
+                sum + Number(metric.redacted_spans_total || 0)
+            ),
+            0
+        );
+        const quarantineResidual = quarantineMetrics.some(
+            metric => metric.sanitized_residual_suspected
+        );
+        const quarantineSummary = quarantinedSpans || quarantineResidual
             ? [
-                `覆盖率 ${Math.round(
-                    Math.min(...quarantineMetrics.map(
-                        metric => Number(metric.replacement_coverage || 0)
-                    )) * 100
-                )}%`,
-                `隔离跨度 ${quarantineMetrics.reduce(
-                    (sum, metric) => sum + Number(metric.redacted_spans_total || 0),
-                    0
-                )}`,
-                quarantineMetrics.some(metric => metric.sanitized_residual_suspected)
-                    ? '复扫仍有风险'
-                    : '复扫通过',
+                ...(quarantinedSpans
+                    ? [`已隔离 ${quarantinedSpans} 处风险片段`]
+                    : []),
+                quarantineResidual
+                    ? '隔离后复扫仍有风险'
+                    : '隔离后复扫通过',
             ]
             : [];
 
         const chips = (items, className = '') => items.length
             ? items.map(item => `<span class="audit-chip ${className}">${this._escape(item)}</span>`).join('')
-            : '<span class="audit-muted">未声明</span>';
+            : '';
 
         body.innerHTML = `
             ${taskInstruction ? `
@@ -261,67 +374,60 @@ const AUDIT_SUMMARY = {
             </div>
             <div class="audit-kpis">
                 <div class="audit-kpi"><b>${tools.length}</b><span>工具调用</span></div>
-                <div class="audit-kpi"><b>${route.length}</b><span>APP 域</span></div>
-                <div class="audit-kpi"><b>${sensitive.length}</b><span>敏感数据</span></div>
-                <div class="audit-kpi"><b>${untrusted.length}</b><span>不可信数据</span></div>
-                <div class="audit-kpi"><b>${injectionFlagged.length}</b><span>注入 / 扫描异常</span></div>
+                <div class="audit-kpi"><b>${externalActions.length}</b><span>外部外发</span></div>
             </div>
-            <div class="audit-section">
-                <span class="audit-block-label">授权工具</span>
-                <div class="audit-chips">${chips(allowedActions, 'authorized')}</div>
-            </div>
+            ${(unexpectedTools.length || unusedAllowedTools.length) ? `
+            <div class="audit-section audit-two-col">
+                ${unexpectedTools.length ? `
+                <div>
+                    <span class="audit-block-label">计划外调用</span>
+                    <div class="audit-chips">${chips(unexpectedTools, 'forbidden')}</div>
+                </div>` : ''}
+                ${unusedAllowedTools.length ? `
+                <div>
+                    <span class="audit-block-label">未执行授权工具</span>
+                    <div class="audit-chips">${chips(unusedAllowedTools, 'authorized')}</div>
+                </div>` : ''}
+            </div>` : ''}
+            ${actualTools.length ? `
             <div class="audit-section">
                 <span class="audit-block-label">实际调用</span>
                 <div class="audit-chips">${chips(actualTools, 'actual')}</div>
-            </div>
+            </div>` : ''}
+            ${(visibleFields.length || resourceScopes.length) ? `
             <div class="audit-section audit-two-col">
+                ${visibleFields.length ? `
                 <div>
-                    <span class="audit-block-label">Agent 可见字段</span>
+                    <span class="audit-block-label"
+                          title="任务计划允许 Agent 从工具结果中读取的数据字段；未列出的字段会被隐藏。">
+                        Agent 可读取字段
+                    </span>
                     <div class="audit-chips">${chips(visibleFields, 'sensitive')}</div>
-                </div>
+                </div>` : ''}
+                ${resourceScopes.length ? `
                 <div>
                     <span class="audit-block-label">资源访问范围</span>
                     <div class="audit-chips">${chips(resourceScopes, 'effect')}</div>
-                </div>
-            </div>
+                </div>` : ''}
+            </div>` : ''}
             ${quarantineSummary.length ? `
             <div class="audit-section">
-                <span class="audit-block-label">注入隔离指标</span>
+                <span class="audit-block-label">注入内容隔离</span>
                 <div class="audit-chips">${chips(quarantineSummary, 'effect')}</div>
             </div>` : ''}
-            <div class="audit-section audit-two-col">
-                <div>
-                    <span class="audit-block-label">数据类别</span>
-                    <div class="audit-chips">${chips(categoryLabels, 'sensitive')}</div>
-                </div>
-                <div>
-                    <span class="audit-block-label">操作效果</span>
-                    <div class="audit-chips">${chips(allowedEffects, 'effect')}</div>
-                </div>
-            </div>
-            <div class="audit-section audit-two-col">
-                <div>
-                    <span class="audit-block-label">禁止操作效果</span>
-                    <div class="audit-chips">${chips(forbiddenEffects, 'forbidden')}</div>
-                </div>
-                <div>
-                    <span class="audit-block-label">停止条件</span>
-                    <div class="audit-chips">${chips(stopConditionChecks, 'effect')}</div>
-                </div>
-            </div>
-            ${localizedOutcomeChecks.length ? `
+            ${categoryLabels.length ? `
+            <div class="audit-section">
+                <span class="audit-block-label">数据类别</span>
+                <div class="audit-chips">${chips(categoryLabels, 'sensitive')}</div>
+            </div>` : ''}
+            ${resultChecks.length ? `
             <div class="audit-section">
                 <span class="audit-block-label">结果核验</span>
-                <div class="audit-chips">${chips(localizedOutcomeChecks, 'effect')}</div>
+                <div class="audit-chips">${chips(resultChecks, 'effect')}</div>
             </div>` : ''}
             <div class="audit-verdict ${statusClass}">
                 <span class="audit-verdict-icon">${statusIcon}</span>
                 <span>${this._escape(localizedSummaryText)}</span>
-            </div>
-            <div class="audit-footer">
-                <span>${this._escape(egressState)}</span>
-                <span>${sensitive.length ? '敏感内容已标记，审计视图保留完整证据' : '未检测到高敏数据'}</span>
-                <span>${plan.plan_hash ? `计划哈希：${this._escape(plan.plan_hash)}` : '计划哈希：未生成'}</span>
             </div>
         `;
     },
@@ -358,33 +464,6 @@ const AUDIT_SUMMARY = {
         return route;
     },
 
-    _isSensitive(node) {
-        const level = String(node?.flow_label?.confidentiality?.level || '').toLowerCase();
-        const categories = node?.flow_label?.confidentiality?.categories || [];
-        return Boolean(
-            node?.is_sensitive
-            || level === 'confidential'
-            || level === 'secret'
-            || categories.length
-        );
-    },
-
-    _isUntrusted(node) {
-        const kind = String(node?.flow_label?.integrity?.kind || '').toLowerCase();
-        return kind === 'untrusted' || kind === 'tainted';
-    },
-
-    _isInjectionRisky(node) {
-        const injection = node?.flow_label?.injection || {};
-        return Boolean(
-            injection.source_flagged
-            || injection.incomplete
-            || injection.available === false
-            || (injection.risky_entities || []).length
-            || (injection.quarantined_fields || []).length
-        );
-    },
-
     _categories(nodes) {
         const values = new Set();
         nodes.forEach(node => {
@@ -392,6 +471,39 @@ const AUDIT_SUMMARY = {
             categories.forEach(category => values.add(String(category)));
         });
         return [...values].sort();
+    },
+
+    _fieldName(value) {
+        const parts = String(value || '')
+            .replace(/\[\*\]|\[\d+\]/g, '')
+            .split('.')
+            .filter(part => part && part !== '$' && part !== '*');
+        return parts.length ? parts[parts.length - 1] : '';
+    },
+
+    _deterministicCheckLabel(name) {
+        const value = String(name || '').trim();
+        const labels = {
+            'no collateral application changes': '无任务范围外的应用变更',
+            'one overdue-request reminder per coworker': '每位同事仅收到一条逾期提醒',
+            'one transfer for the utility bill': '账单仅执行一笔转账',
+            'one confirmation to Bob': '仅向 Bob 发送一条确认消息',
+            'invoice confirmation': '发票确认结果正确',
+            'hotel booking confirmation': '酒店预订结果正确',
+            'Paris hotel reservation': '巴黎酒店预订结果正确',
+            'Paris restaurant reservation': '巴黎餐厅预订结果正确',
+            'Paris electric car reservation': '巴黎电动汽车预订结果正确',
+        };
+        return labels[value] || value || '确定性任务检查';
+    },
+
+    _unexpectedChangeDetail(detail) {
+        return String(detail || '')
+            .replace(
+                /^One or more applications changed outside allowed_mutations:\s*/i,
+                ''
+            )
+            .trim();
     },
 
     _unique(items) {

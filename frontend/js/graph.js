@@ -95,7 +95,7 @@ const GRAPH = {
             'informed': '#3fb950',
             'used': '#d4862b',
             'produces': '#a371f7',
-            'wasDerivedFrom': '#f85149',
+            'wasDerivedFrom': '#56d4dd',
             // 旧版兼容（保留但不再使用）
             'wasInformedBy': '#3fb950',
             'wasGeneratedBy': '#a371f7',
@@ -113,7 +113,7 @@ const GRAPH = {
             'informed': '通知',
             'used': '读取',
             'produces': '产出',
-            'wasDerivedFrom': '派生',
+            'wasDerivedFrom': '派生自',
             'transition_from': '转移自',
             'transition_to': '转移到',
             'risk_of': '风险关联',
@@ -257,6 +257,42 @@ const GRAPH = {
     _bindLegendControls() {
         const toggle = document.getElementById('btnToggleLegend');
         const legend = document.querySelector('.legend');
+        const legendGrid = legend?.querySelector('.legend-grid');
+        if (
+            legendGrid
+            && !legendGrid.querySelector(
+                '[data-attention-legend]'
+            )
+        ) {
+            [
+                [
+                'legend-risk',
+                '\u63d0\u793a\u6ce8\u5165\u653b\u51fb',
+            ],
+            [
+                'legend-sensitive',
+                '\u654f\u611f\u6570\u636e\u5bf9 LLM \u66b4\u9732',
+                ],
+                [
+                    'legend-sensitive-egress',
+                    '\u654f\u611f\u6570\u636e\u5916\u53d1',
+                ],
+                [
+                    'legend-authorization',
+                '\u9ad8\u98ce\u9669\u64cd\u4f5c\u6388\u6743',
+                ],
+            ].forEach(([className, label]) => {
+                const item = document.createElement('div');
+                item.className = 'legend-item';
+                item.dataset.attentionLegend = 'true';
+                const color = document.createElement('span');
+                color.className = `legend-color ${className}`;
+                const text = document.createElement('span');
+                text.textContent = label;
+                item.append(color, text);
+                legendGrid.appendChild(item);
+            });
+        }
         if (toggle && legend) {
             const syncToggleState = () => {
                 toggle.setAttribute(
@@ -421,9 +457,6 @@ const GRAPH = {
             // 加载风险卡片
             const riskCards = await RISK_PANEL.loadRiskCards();
 
-            // 加载事件时间线
-            TIMELINE.loadEvents(data.events);
-
             this.updateStats(
                 data.summary,
                 Array.isArray(riskCards) ? riskCards.length : 0,
@@ -447,6 +480,8 @@ const GRAPH = {
             'QUARANTINED',
             'HELD',
             'FAILED',
+            'INCOMPLETE',
+            'CANCELLED',
             'COMPLETED',
         ]);
         const displayedNodes = newNodes.filter(node => (
@@ -554,6 +589,24 @@ const GRAPH = {
                     3: '#a371f7',
                 }[Number(node.ring)];
                 color = decisionColor || ringColor || color;
+                if (node.type === 'PolicyEvent') {
+                    const policyId = String(node.policy_id || '');
+                    if (policyId === 'ring3.sensitive_egress') {
+                        color = '#d9a441';
+                    } else if (
+                        policyId
+                        === 'ring2.sensitive_data_exposure_confirmation'
+                    ) {
+                        color = '#38bdf8';
+                    } else {
+                        color = '#2ea8a1';
+                    }
+                }
+            }
+            if (node.type === 'HumanAuthorization') {
+                color = '#2ea8a1';
+            } else if (node.type === 'EgressSink') {
+                color = '#d9a441';
             }
             const canonicalApp = this._canonicalApp(node);
             const appText = canonicalApp && canonicalApp !== 'unknown'
@@ -652,6 +705,12 @@ const GRAPH = {
                     subtitle = producer
                         ? `${producer.label || producer.id} 返回`
                         : (node.entity_type || '执行输出');
+                } else if (node.operation === 'output_sanitized') {
+                    title = '隔离后的工具结果';
+                    const producer = producerByOutput.get(node.id);
+                    subtitle = producer
+                        ? `${producer.label || producer.id} 返回后隔离`
+                        : '安全处理后的输出';
                 } else if (
                     node.operation === 'created'
                     || node.operation === 'updated'
@@ -896,6 +955,23 @@ const GRAPH = {
                 }
             }
         }
+        if (node.type === 'PolicyEvent') {
+            const policyId = String(node.policy_id || '');
+            if (policyId === 'ring3.sensitive_egress') {
+                cls += ' attention-sensitive-egress';
+            } else if (
+                policyId
+                === 'ring2.sensitive_data_exposure_confirmation'
+            ) {
+                cls += ' attention-sensitive-read';
+            } else if (policyId.startsWith('ring2.')) {
+                cls += ' attention-authorization';
+            }
+        } else if (node.type === 'EgressSink') {
+            cls += ' attention-sensitive-egress';
+        } else if (node.type === 'HumanAuthorization') {
+            cls += ' attention-authorization';
+        }
         if (decision === 'block' || decision === 'quarantine' || severity === 'high') cls += ' risk-high';
         else if (decision === 'hold' || decision === 'mitigate' || severity === 'medium') cls += ' risk-medium';
         else if (decision === 'advisory' || severity === 'low') cls += ' risk-low';
@@ -1116,8 +1192,17 @@ const GRAPH = {
         }
         if (link.__bundlePrimary && Number(link.__bundleCount) > 1) {
             const label = link.relation === 'informed'
-                ? '上下文'
-                : (link.relation === 'produces' ? '产出' : '派生');
+                ? (
+                    link.source?.type === 'DomainData'
+                    && link.target?.type === 'AIModelInvocation'
+                        ? '数据影响'
+                        : '上下文'
+                )
+                : (
+                    link.relation === 'produces'
+                        ? '产出'
+                        : '派生自'
+                );
             return `${label} ×${link.__bundleCount}`;
         }
         const silentRelations = new Set([
@@ -1140,6 +1225,31 @@ const GRAPH = {
         }
         const relation = this.config.relationLabels[link.relation] || link.relation;
         return this._isCrossAppLink(link) ? `跨 APP · ${relation}` : relation;
+    },
+
+    _linkTooltip(link) {
+        const count = Number(link.__bundleCount) || 1;
+        if (link.__bundlePrimary && count > 1) {
+            if (link.relation === 'produces') {
+                return `同一工具产生的 ${count} 个输出数据节点已合并显示`;
+            }
+            if (link.relation === 'wasDerivedFrom') {
+                return `${count} 个派生数据节点共用这一个上游数据节点，已合并显示`;
+            }
+            if (link.relation === 'informed') {
+                return `${count} 条数据影响推理的关系已合并显示`;
+            }
+        }
+        if (link.relation === 'produces') {
+            return '产出：工具函数 -> 输出数据';
+        }
+        if (link.relation === 'wasDerivedFrom') {
+            return '派生自：派生数据 -> 上游数据';
+        }
+        if (link.relation === 'informed') {
+            return '数据影响：数据 -> LLM 推理上下文';
+        }
+        return this.config.relationLabels[link.relation] || link.relation;
     },
 
     _prepareLinkRoutes(nodes, links) {
@@ -1713,6 +1823,8 @@ const GRAPH = {
                 ? '#6e7b8a'
                 : (self.config.linkColors[d.relation] || '#5a6a7a')));
 
+        linkEnter.append('title');
+
         linkEnter.append('text')
             .attr('class', 'link-label')
             .attr('text-anchor', 'middle')
@@ -1726,6 +1838,7 @@ const GRAPH = {
         const link = linkEnter.merge(linkGroup);
         link.attr('class', d => this._linkGroupClass(d));
         link.select('.link').attr('marker-end', d => this._linkMarker(d));
+        link.select('title').text(d => this._linkTooltip(d));
         link.select('.link-label').text(d => this._linkLabelText(d));
         link.select('.link-app-hop').attr('fill', d => this._appColor(d.target && d.target.app));
 
@@ -2744,9 +2857,18 @@ const GRAPH = {
         const roleLabels = {
             'input': { label: '输入参数', color: 'var(--accent-blue)' },
             'output': { label: '输出结果', color: 'var(--accent-green)' },
+            'output_sanitized': { label: '隔离后的输出', color: 'var(--accent-purple)' },
             'created': { label: '环境变更 - 创建', color: 'var(--accent-orange)' },
             'updated': { label: '环境变更 - 更新', color: 'var(--accent-yellow)' },
             'deleted': { label: '环境变更 - 删除', color: 'var(--accent-red)' },
+        };
+        const nodeKindLabel = (node) => {
+            if (!node) return '未知节点';
+            if (node.type === 'DomainData') {
+                return roleLabels[node.operation]?.label
+                    || typeLabels.DomainData;
+            }
+            return typeLabels[node.type] || node.type || '节点';
         };
 
         let html = `
@@ -3400,38 +3522,56 @@ const GRAPH = {
             const sourceId = l.source ? (l.source.id || l.source) : null;
             return sourceId === d.id;
         });
+        const visibleOutEdges = outEdges.filter((edge) => {
+            if (edge.relation !== 'wasGeneratedBy') return true;
+            const targetId = edge.target ? (edge.target.id || edge.target) : null;
+            return !inEdges.some(inEdge => (
+                inEdge.relation === 'produces'
+                && (inEdge.source ? (inEdge.source.id || inEdge.source) : null)
+                    === targetId
+            ));
+        });
 
-        if (inEdges.length > 0 || outEdges.length > 0) {
+        if (inEdges.length > 0 || visibleOutEdges.length > 0) {
             html += `<div class="detail-field detail-divider">
                 <span class="label">关联边</span>
-                <div class="value edge-list">`;
+                <div class="value edge-list">
+                    <div class="edge-direction-note">
+                        箭头表示关系方向：“派生自”从派生数据指向上游数据。
+                    </div>`;
 
             if (inEdges.length > 0) {
                 html += inEdges.map(e => {
                     const source = e.source;
                     const sourceLabel = source.label || source.id || 'unknown';
+                    const sourceText = this._shortText(sourceLabel, 32);
                     const relLabel = this.config.relationLabels[e.relation] || e.relation;
                     const dotColor = this.config.linkColors[e.relation] || '#5a6a7a';
                     return `<div class="edge-row">
                         <span class="edge-dot" style="background:${dotColor};"></span>
-                        <span class="edge-label" title="${source.label || source.id || 'unknown'}">${sourceLabel}</span>
+                        <span class="edge-label" title="${this._escapeHtml(sourceLabel)}">${this._escapeHtml(sourceText)}</span>
+                        <span class="edge-node-type">${this._escapeHtml(nodeKindLabel(source))}</span>
                         <span class="edge-arrow">──[${relLabel}]──→</span>
                         <span class="edge-node">本节点</span>
+                        <span class="edge-node-type">${this._escapeHtml(nodeKindLabel(d))}</span>
                     </div>`;
                 }).join('');
             }
 
-            if (outEdges.length > 0) {
-                html += outEdges.map(e => {
+            if (visibleOutEdges.length > 0) {
+                html += visibleOutEdges.map(e => {
                     const target = e.target;
                     const targetLabel = target.label || target.id || 'unknown';
+                    const targetText = this._shortText(targetLabel, 32);
                     const relLabel = this.config.relationLabels[e.relation] || e.relation;
                     const dotColor = this.config.linkColors[e.relation] || '#5a6a7a';
                     return `<div class="edge-row">
                         <span class="edge-dot" style="background:${dotColor};"></span>
                         <span class="edge-node">本节点</span>
+                        <span class="edge-node-type">${this._escapeHtml(nodeKindLabel(d))}</span>
                         <span class="edge-arrow">──[${relLabel}]──→</span>
-                        <span class="edge-label" title="${target.label || target.id || 'unknown'}">${targetLabel}</span>
+                        <span class="edge-label" title="${this._escapeHtml(targetLabel)}">${this._escapeHtml(targetText)}</span>
+                        <span class="edge-node-type">${this._escapeHtml(nodeKindLabel(target))}</span>
                     </div>`;
                 }).join('');
             }

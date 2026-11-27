@@ -62,8 +62,9 @@ _CONFIG = _copy_config(DEFAULT_CONFIG)
 _DIRECT_INJECTION_MODE = "quarantine"
 # Interactive executions still expose the underlying confirmation events, but
 # the default workflow accepts L2 holds automatically for end-user usability.
-# Requirement-resolution choices are never auto-selected because they change
-# the task contract rather than merely approving an already-authorized action.
+# Requirement-resolution confirmations follow the documented automatic policy:
+# waive all currently offered relaxable requirements when available, otherwise
+# cancel the task. Every automatic decision keeps its audit source and hash.
 _AUTO_CONFIRMATIONS = True
 _PLANNING_ENABLED = True
 

@@ -27,12 +27,14 @@ class RequirementCheck:
     name: str
     passed: bool
     detail: str = ""
+    category: str = "required_result"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "passed": self.passed,
             "detail": self.detail,
+            "category": self.category,
         }
 
 
@@ -41,12 +43,14 @@ class CrossAppEvaluationResult:
     task_id: str
     passed: bool
     checks: tuple[RequirementCheck, ...]
+    business_goal_zh: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
             "passed": self.passed,
             "checks": [check.to_dict() for check in self.checks],
+            "business_goal_zh": self.business_goal_zh,
         }
 
 
@@ -1012,6 +1016,7 @@ def evaluate_cross_app_task(
                     f"allowed_mutations: {'; '.join(snapshot_differences)}"
                 )
             ),
+            category="unexpected_change",
         )
     )
 
@@ -1181,6 +1186,7 @@ def evaluate_cross_app_task(
         task_id=task.task_id,
         passed=all(check.passed for check in checks),
         checks=tuple(checks),
+        business_goal_zh=task.business_goal_zh,
     )
 
 

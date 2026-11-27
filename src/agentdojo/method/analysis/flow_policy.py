@@ -1914,6 +1914,30 @@ def check_sensitive_egress(
                     fsm_after="ADMITTED",
                     confidence=1.0,
                 )
+            elif (
+                CONFIDENTIALITY_LEVELS.get(level, 3)
+                > CONFIDENTIALITY_LEVELS["internal"]
+                or categories
+            ):
+                result["risk"] = make_risk(
+                    3,
+                    DECISION_ADVISORY,
+                    (
+                        f"Authorized sensitive egress through {tool_name} "
+                        f"contains {level} data for an authorized "
+                        "destination; the action is allowed with an "
+                        "audit warning."
+                    ),
+                    severity="medium",
+                    event_kind="security",
+                    policy_id="ring3.sensitive_egress",
+                    activity_id=event.get("activity_id"),
+                    source_ids=result.get("data_sources", []),
+                    sink_ids=[tool_name],
+                    fsm_before="ACTION_PROPOSED",
+                    fsm_after="ADMITTED",
+                    confidence=1.0,
+                )
         else:
             result.update(
                 passed=False,
