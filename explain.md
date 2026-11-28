@@ -25,7 +25,7 @@
 ## 二、交互式可视化展示平台
 
 ### 前端架构
-frontend/index.html - 主页面
+frontend/index.html - 主页面（由 Flask 在 `/` 同源托管）
 frontend/js/graph.js - D3.js 拓扑图
 frontend/js/risk-panel.js - 风险卡片面板
 frontend/js/status-panel.js - 系统状态面板

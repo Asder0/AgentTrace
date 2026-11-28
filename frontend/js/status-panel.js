@@ -204,7 +204,10 @@ const STATUS_PANEL = {
         } catch (err) {
             const meta = document.getElementById('statusRefreshMeta');
             if (meta) {
-                meta.textContent = '刷新失败，显示上一次状态';
+                meta.textContent = API.formatError(
+                    err,
+                    '刷新失败，显示上一次状态；'
+                );
                 meta.className = 'status-refresh-meta stale';
             }
             console.warn('刷新系统状态失败:', err.message);
@@ -388,6 +391,8 @@ const STATUS_PANEL = {
     _updateFeatures(features) {
         const container = document.getElementById('statusFeatures');
         if (!container || !features) return;
+        const escape = window.AgentTraceContent?.escapeHtml
+            || (value => String(value == null ? '' : value));
 
         // 按层分组
         const grouped = {};
@@ -406,13 +411,13 @@ const STATUS_PANEL = {
             const layerLabel = window.AgentTraceRiskLabels?.layerLabel
                 ? window.AgentTraceRiskLabels.layerLabel(layer)
                 : layer;
-            html += `<div class="status-feature-layer">${layerLabel}</div>`;
+            html += `<div class="status-feature-layer">${escape(layerLabel)}</div>`;
             for (const f of grouped[layer]) {
                 const statusClass = f.status ? 'feature-ok' : 'feature-fail';
                 html += `
                     <div class="status-feature-item ${statusClass}">
                         <span class="status-feature-icon"></span>
-                        <span class="status-feature-name">${f.name}</span>
+                        <span class="status-feature-name">${escape(f.name)}</span>
                     </div>
                 `;
             }

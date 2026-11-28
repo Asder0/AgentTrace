@@ -16,6 +16,7 @@ import copy
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 import networkx as nx
@@ -231,6 +232,10 @@ def transition_state(
     kg = KnowledgeGraph()
     ensure_task_state()
     from_state = kg.current_state_id
+    resolved_scope = (
+        scope
+        or ("task" if activity_id is None else "activity")
+    )
     state_id = _state_id(
         kg.task_id or "task",
         state_name,
@@ -246,16 +251,19 @@ def transition_state(
         app="system",
         suite=kg.suite,
         task_id=kg.task_id,
-        scope=scope or ("task" if activity_id is None else "activity"),
-        terminal=state_name
-        in {
-            "COMPLETED",
-            "BLOCKED",
-            "QUARANTINED",
-            "FAILED",
-            "CANCELLED",
-            "INCOMPLETE",
-        },
+        scope=resolved_scope,
+        terminal=(
+            resolved_scope == "task"
+            and state_name
+            in {
+                "COMPLETED",
+                "BLOCKED",
+                "QUARANTINED",
+                "FAILED",
+                "CANCELLED",
+                "INCOMPLETE",
+            }
+        ),
     )
     if from_state:
         _add_edge(kg.G, from_state, state_id, "stateTransition")
@@ -881,6 +889,14 @@ def record_risk_assessments(
     risks = raw_risks if isinstance(raw_risks, list) else []
     activity_id = event.get("activity_id")
     risk_ids: list[str] = []
+
+    def sink_relation(risk: Mapping[str, Any]) -> str:
+        return (
+            "leak_sink"
+            if risk.get("policy_id") == "ring3.sensitive_egress"
+            else "applies_to_sink"
+        )
+
     for risk in risks:
         risk_id = str(risk.get("risk_id") or f"Risk_{uuid.uuid4().hex[:10]}")
         risk["risk_id"] = risk_id
@@ -946,20 +962,30 @@ def record_risk_assessments(
             G.nodes[activity_id].setdefault(id_field, []).append(risk_id)
             if event_kind == "security":
                 G.nodes[activity_id]["risk_decision"] = risk.get("decision")
-        for entity_id in risk.get("evidence_entity_ids", []):
+        evidence_ids = set(risk.get("evidence_entity_ids", []))
+        for entity_id in evidence_ids:
             if entity_id in G:
                 _add_edge(G, risk_id, entity_id, "risk_evidence")
-                _add_edge(G, risk_id, entity_id, "source_of")
         for source_id in risk.get("source_ids", []):
-            if source_id in G:
-                _add_edge(G, risk_id, source_id, "source_of")
+            if source_id in G and source_id not in evidence_ids:
+                _add_edge(G, source_id, risk_id, "triggered_by")
         for sink_id in risk.get("sink_ids", []):
             if sink_id in G:
-                _add_edge(G, risk_id, sink_id, "leak_sink")
+                _add_edge(
+                    G,
+                    risk_id,
+                    sink_id,
+                    sink_relation(risk),
+                )
             else:
                 graph_sink_id = f"EgressSink_{sink_id}"
                 if graph_sink_id in G:
-                    _add_edge(G, risk_id, graph_sink_id, "leak_sink")
+                    _add_edge(
+                        G,
+                        risk_id,
+                        graph_sink_id,
+                        sink_relation(risk),
+                    )
     if risk_ids and activity_id in G:
         for id_field in ("risk_ids", "policy_ids"):
             if id_field in G.nodes[activity_id]:
@@ -1166,6 +1192,141 @@ def get_graph_data() -> dict[str, Any]:
                 else "unknown"
             )
     return data
+
+
+def normalize_graph_semantics(
+    graph_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Normalize current and historical graph data at the read boundary."""
+    nodes = graph_data.get("nodes")
+    links = graph_data.get("links")
+    if not isinstance(nodes, list) or not isinstance(links, list):
+        return graph_data
+
+    nodes_by_id = {
+        str(node.get("id")): node
+        for node in nodes
+        if isinstance(node, dict) and node.get("id")
+    }
+
+    def endpoint_id(value: Any) -> str:
+        if isinstance(value, dict):
+            return str(value.get("id", ""))
+        return str(value or "")
+
+    for node in nodes:
+        if (
+            isinstance(node, dict)
+            and node.get("type") == "TaskState"
+            and node.get("scope") != "task"
+        ):
+            node["terminal"] = False
+
+    evidence_edges = {
+        (
+            endpoint_id(link.get("source")),
+            endpoint_id(link.get("target")),
+        )
+        for link in links
+        if isinstance(link, dict)
+        and link.get("relation") == "risk_evidence"
+    }
+    normalized_links: list[dict[str, Any]] = []
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        source_id = endpoint_id(link.get("source"))
+        target_id = endpoint_id(link.get("target"))
+        source_node = nodes_by_id.get(source_id, {})
+        relation = str(link.get("relation", ""))
+        if (
+            relation == "source_of"
+            and source_node.get("type")
+            in {"RiskEvent", "PolicyEvent"}
+        ):
+            if (source_id, target_id) in evidence_edges:
+                continue
+            normalized_links.append(
+                {
+                    **link,
+                    "source": {"id": target_id},
+                    "target": {"id": source_id},
+                    "relation": "triggered_by",
+                }
+            )
+            continue
+        if (
+            relation == "leak_sink"
+            and source_node.get("type")
+            in {"RiskEvent", "PolicyEvent"}
+            and source_node.get("policy_id")
+            != "ring3.sensitive_egress"
+        ):
+            normalized_links.append(
+                {
+                    **link,
+                    "relation": "applies_to_sink",
+                }
+            )
+            continue
+        normalized_links.append(link)
+
+    incident = {
+        endpoint_id(link.get("source"))
+        for link in normalized_links
+    } | {
+        endpoint_id(link.get("target"))
+        for link in normalized_links
+    }
+    prompt_nodes = [
+        node
+        for node in nodes
+        if isinstance(node, dict) and node.get("type") == "Prompt"
+    ]
+    prompt_id = str(prompt_nodes[0].get("id")) if prompt_nodes else ""
+    if prompt_id:
+        for risk in nodes:
+            if (
+                not isinstance(risk, dict)
+                or risk.get("type") not in {"RiskEvent", "PolicyEvent"}
+                or not str(risk.get("policy_id", "")).startswith("ring0.")
+                or str(risk.get("id")) in incident
+            ):
+                continue
+            risk_id = str(risk.get("id"))
+            normalized_links.append(
+                {
+                    "source": {"id": prompt_id},
+                    "target": {"id": risk_id},
+                    "relation": "triggered_by",
+                }
+            )
+            risk["source_ids"] = list(
+                dict.fromkeys(
+                    [
+                        *risk.get("source_ids", []),
+                        prompt_id,
+                    ]
+                )
+            )
+            risk.setdefault("evidence_total", {})["sources"] = len(
+                risk["source_ids"]
+            )
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for link in normalized_links:
+        key = (
+            endpoint_id(link.get("source")),
+            endpoint_id(link.get("target")),
+            str(link.get("relation", "")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(link)
+    graph_data["links"] = deduped
+    return graph_data
 
 
 def get_graph_summary() -> dict[str, Any]:

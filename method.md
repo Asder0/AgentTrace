@@ -272,9 +272,11 @@ flowchart LR
 | `produces` | 工具产生输出数据 |
 | `wasDerivedFrom` | 派生数据来源于父数据 |
 | `risk_of` / `policy_of` | 风险或策略事件关联到工具 |
-| `risk_evidence` / `source_of` | 风险关联到具体数据来源 |
+| `risk_evidence` | 风险指向支持该判定的证据数据 |
+| `triggered_by` | 数据或用户 Prompt 指向由其触发的风险 |
 | `egress_to` | 工具连接外部出口 |
-| `leak_sink` | 风险关联到外部出口 |
+| `leak_sink` | Ring 3 敏感外发风险关联到外部出口 |
+| `applies_to_sink` | 授权或来源风险关联到所作用的出口 |
 | `authorizes` | 人工授权允许某次工具调用 |
 | `transition_to` | 工具或推理触发 FSM 状态 |
 
@@ -752,9 +754,12 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 但不进入四类用户风险卡片。风险卡片只展示提示注入、敏感数据外发、高风险操作授权
 和敏感数据对 LLM 暴露。
 
-风险卡片支持反向定位溯源图谱。卡片本身和“查看数据链”按钮会同时聚焦风险/策略节点、
+风险卡片支持反向定位溯源图谱。点击卡片内容或“查看数据链”按钮会同时聚焦风险/策略节点、
 工具调用、人工授权、数据来源和出口节点。卡片缺失精确节点时，
 前端会按活动 ID、工具名和 APP 降级选择最近的工具调用节点。
+
+风险卡片使用 `article` 容器，标题为原生 `h3`；“查看数据链”是主要键盘操作入口，
+审计信息使用原生 `details/summary`。卡片本身不再伪造按钮语义，避免交互控件嵌套。
 
 风险严重度与工具等级分开保存：数据使用 `risk_level`，工具使用 `tool_risk_level`。
 
@@ -774,6 +779,22 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 | 历史 | `GET /api/traces`、`GET /api/traces/<trace_id>` |
 | 环境变更 | `GET /api/storage/suites`、`GET /api/storage/suites/<suite>` |
 | 重置 | `POST /api/reset` |
+
+所有 API 错误统一返回：
+
+```json
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "请求格式或参数不正确。",
+    "retryable": false,
+    "request_id": "req_0123456789abcdef"
+  }
+}
+```
+
+验证错误返回可公开的具体原因；未知 5xx 只返回通用说明。内部异常详情仅写入服务端日志，
+客户端和响应头使用同一 `request_id` 便于排查。
 
 执行接口共享进程内串行锁，任务期间不会并发修改环境或任务基线。
 
@@ -809,8 +830,11 @@ PASS -> ADVISORY -> MITIGATE -> HOLD -> QUARANTINE -> BLOCK
 悬停相关节点可展开聚合分支。点击具体风险卡片会突出对应的主要数据流节点和关系；
 低层证据、来源、泄漏出口和状态转移关系不绘制到画布，但仍保留在 trace 和节点详情中。
 
+只有 `scope=task` 的状态可以标记为任务终态；活动级 `FAILED`、`QUARANTINED`
+等状态只表示一次工具活动的结束，不终止整个任务。
+
 前端保留 `COMPLETED`、`INCOMPLETE`、`FAILED`、`CANCELLED`、`BLOCKED`、
-`QUARANTINED`、`SANITIZED` 和 `HELD` 等任务终态，任务总结直接读取终态和
+`QUARANTINED`、`SANITIZED` 和 `HELD` 等关键状态，任务总结直接读取任务级终态和
 确定性核验结果。`INCOMPLETE` 不会再被误显示为“结果待核验”。
 
 ### 9.2 环境变更
@@ -995,14 +1019,14 @@ curl -X POST http://localhost:5000/api/execute \
 ```bash
 conda activate agent
 pip install -e ".[transformers,privacy]"
-pip install flask flask-cors networkx
+pip install flask networkx
 python -m agentdojo.method.visualization.server
 ```
 
-前端直接打开：
+前端由 Flask 同源托管，在浏览器访问：
 
 ```text
-frontend/index.html
+http://127.0.0.1:5000/
 ```
 
 前端使用项目内置的 D3 v7（`frontend/vendor/d3.v7.min.js`）。页面直接从本地加载可视化依赖，无需连接 D3 CDN。
@@ -1091,7 +1115,8 @@ curl -X POST http://localhost:5000/api/config/defense \
 ## 14. 已知边界
 
 - 执行串行锁是单进程锁；多进程部署需要外部锁或按 `task_id` 隔离环境。
-- trace 默认可包含完整邮件、文件内容、账户信息和工具输出，属于敏感审计数据。当前 API 未提供额外鉴权，建议仅在本机可信环境运行。
+- trace 默认可包含完整邮件、文件内容、账户信息和工具输出，属于敏感审计数据。服务默认仅监听
+  `127.0.0.1`，前端与 API 同源，跨源请求和非本机 Host 会被拒绝。当前版本仍不面向公网部署。
 - 前端已内置 D3 v7 本地依赖，无需访问外网即可初始化拓扑图。
 - 当前版本不兼容旧 Trace Schema；旧 Trace 和历史归档已删除。
 - 真实任务执行需要配置可用 LLM API；本地注入分类器需要 `transformers` 和 `torch`。

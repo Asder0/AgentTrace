@@ -18,7 +18,7 @@ Usage:
 
 Or programmatically:
     from agentdojo.method.visualization.server import start_server
-    start_server(port=5000, debug=True)
+    start_server(port=5000)
 """
 
 import ast
@@ -27,6 +27,7 @@ import datetime
 import gzip as _gzip
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -35,7 +36,9 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from functools import wraps
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 for _stream in (sys.stdout, sys.stderr):
     _reconfigure = getattr(_stream, "reconfigure", None)
@@ -45,15 +48,8 @@ for _stream in (sys.stdout, sys.stderr):
         except (OSError, ValueError):
             pass
 
-from flask import Flask, jsonify, request
-
-try:
-    from flask_cors import CORS  # pyright: ignore[reportMissingModuleSource]
-except ImportError:  # Optional convenience dependency.
-
-    def CORS(app):  # noqa: N802 - mirrors flask_cors.CORS
-        return app
-
+from flask import Flask, abort, g, jsonify, request, send_from_directory
+from werkzeug.exceptions import HTTPException
 
 from agentdojo.types import get_text_content_as_str
 
@@ -88,6 +84,7 @@ from ..modeling.graph_db import (
     finalize_task_outcome,
     get_graph_data,
     get_graph_summary,
+    normalize_graph_semantics,
     reset_graph,
 )
 from ..modeling.policy import base_tool_name
@@ -127,7 +124,248 @@ from .storage_view import (
 )
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
+_FRONTEND_DIR = Path(__file__).resolve().parents[4] / "frontend"
+_LOCAL_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self' blob:; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'none'; "
+        "frame-ancestors 'none'; "
+        "form-action 'self'"
+    ),
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
 _execution_lock = threading.RLock()
+
+
+def _error_code_for_status(status_code: int) -> str:
+    if status_code == 400:
+        return "invalid_request"
+    if status_code == 403:
+        return "request_rejected"
+    if status_code == 404:
+        return "not_found"
+    if status_code == 405:
+        return "method_not_allowed"
+    if status_code == 409:
+        return "state_conflict"
+    if status_code == 429:
+        return "rate_limited"
+    if status_code == 502:
+        return "upstream_error"
+    if status_code == 503:
+        return "service_unavailable"
+    if status_code == 504:
+        return "upstream_timeout"
+    if status_code >= 500:
+        return "internal_error"
+    return "request_failed"
+
+
+def _public_error_message(status_code: int) -> str:
+    messages = {
+        400: "请求格式或参数不正确。",
+        403: "请求被拒绝。",
+        404: "请求的资源不存在。",
+        405: "请求方法不被允许。",
+        409: "当前任务状态不允许执行该操作。",
+        429: "请求过于频繁，请稍后重试。",
+        502: "上游模型服务返回异常，请稍后重试。",
+        503: "服务暂时不可用，请稍后重试。",
+        504: "上游模型服务响应超时，请稍后重试。",
+    }
+    return messages.get(status_code, "服务器处理请求失败，请稍后重试。")
+
+
+def _error_payload(
+    code: str,
+    message: str,
+    *,
+    retryable: bool = False,
+) -> dict[str, Any]:
+    return {
+        "error": {
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+            "request_id": getattr(g, "api_request_id", ""),
+        }
+    }
+
+
+def _normalize_api_error_response(response):
+    if (
+        not request.path.startswith("/api/")
+        or response.status_code < 400
+    ):
+        return response
+
+    payload = response.get_json(silent=True)
+    existing_error = (
+        payload.get("error")
+        if isinstance(payload, dict)
+        else None
+    )
+    if (
+        isinstance(existing_error, dict)
+        and existing_error.get("code")
+        and existing_error.get("request_id")
+    ):
+        return response
+
+    raw_message = (
+        existing_error
+        if isinstance(existing_error, str)
+        else ""
+    )
+    status_code = response.status_code
+    if status_code >= 500:
+        logger.error(
+            "API request failed request_id=%s method=%s path=%s status=%s error=%s",
+            getattr(g, "api_request_id", ""),
+            request.method,
+            request.path,
+            status_code,
+            raw_message or "unavailable",
+        )
+        message = _public_error_message(status_code)
+    else:
+        message = raw_message or _public_error_message(status_code)
+
+    response.set_data(
+        json.dumps(
+            _error_payload(
+                _error_code_for_status(status_code),
+                message,
+                retryable=status_code >= 500,
+            ),
+            ensure_ascii=False,
+        )
+    )
+    response.content_type = "application/json; charset=utf-8"
+    return response
+
+
+def _authority_identity(scheme: str, authority: str) -> tuple[str, int] | None:
+    try:
+        parsed = urlsplit(f"{scheme}://{authority}")
+        hostname = (parsed.hostname or "").lower()
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    default_port = 443 if parsed.scheme == "https" else 80
+    return hostname, parsed.port or default_port
+
+
+@app.before_request
+def _enforce_local_request_boundary():
+    g.api_request_id = f"req_{uuid.uuid4().hex[:16]}"
+    request_identity = _authority_identity(request.scheme, request.host)
+    if request_identity is None or request_identity[0] not in _LOCAL_HOSTNAMES:
+        abort(403)
+
+    if request.method not in _MUTATING_METHODS:
+        return None
+
+    source = (
+        request.headers.get("Origin")
+        or request.headers.get("Referer")
+    )
+    if source:
+        parsed_source = urlsplit(source)
+        source_identity = _authority_identity(
+            parsed_source.scheme,
+            parsed_source.netloc,
+        )
+        if (
+            parsed_source.scheme != request.scheme
+            or source_identity != request_identity
+        ):
+            abort(403)
+    if request.headers.get("Sec-Fetch-Site", "").lower() in {
+        "cross-site",
+        "same-site",
+    }:
+        abort(403)
+    return None
+
+
+@app.after_request
+def _apply_security_headers(response):
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    response.headers["X-Request-ID"] = getattr(
+        g,
+        "api_request_id",
+        "",
+    )
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+        return _normalize_api_error_response(response)
+    return response
+
+
+@app.errorhandler(HTTPException)
+def _handle_http_exception(error: HTTPException):
+    if not request.path.startswith("/api/"):
+        return error.get_response()
+    status_code = int(error.code or 500)
+    return (
+        jsonify(
+            _error_payload(
+                _error_code_for_status(status_code),
+                _public_error_message(status_code),
+                retryable=status_code >= 500,
+            )
+        ),
+        status_code,
+    )
+
+
+@app.errorhandler(Exception)
+def _handle_unexpected_exception(error: Exception):
+    logger.exception(
+        "Unhandled API request failure request_id=%s method=%s path=%s",
+        getattr(g, "api_request_id", ""),
+        request.method,
+        request.path,
+    )
+    return (
+        jsonify(
+            _error_payload(
+                "internal_error",
+                _public_error_message(500),
+                retryable=True,
+            )
+        ),
+        500,
+    )
+
+
+@app.get("/")
+def frontend_index():
+    return send_from_directory(_FRONTEND_DIR, "index.html")
+
+
+@app.get("/<path:asset_path>")
+def frontend_asset(asset_path: str):
+    if asset_path == "api" or asset_path.startswith("api/"):
+        abort(404)
+    return send_from_directory(_FRONTEND_DIR, asset_path)
 
 
 def _exclusive_task_execution(handler):
@@ -194,6 +432,7 @@ def _normalize_graph_data(
         suite=suite if suite in APP_DOMAINS else None,
         tool_app=tool_app,
     )
+    normalize_graph_semantics(graph_data)
     return tool_app
 
 
@@ -208,12 +447,22 @@ def _current_suite() -> str | None:
         return None
 
 
-CORS(app)
-
 # ============================================================
 # LLM 配置（全局，可通过 API 动态设置）
 # 始终使用真实 LLM，没有"模拟模式"
 # ============================================================
+_SUPPORTED_LLM_PROVIDERS = frozenset(
+    {
+        "anthropic",
+        "deepseek",
+        "google",
+        "local",
+        "openai",
+    }
+)
+_LLM_MODEL_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:/@+\- ]{0,199}"
+)
 _llm_config = {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -230,12 +479,23 @@ def _get_llm_config() -> dict:
 
 def _set_llm_config(config: dict) -> dict:
     global _llm_config
+    if not isinstance(config, dict):
+        raise ValueError("LLM configuration must be an object")
     if "provider" in config:
-        _llm_config["provider"] = config["provider"]
+        provider = str(config["provider"] or "").strip().lower()
+        if provider not in _SUPPORTED_LLM_PROVIDERS:
+            raise ValueError("Unsupported LLM provider")
+        _llm_config["provider"] = provider
     if "model" in config:
-        _llm_config["model"] = config["model"]
+        model = str(config["model"] or "").strip()
+        if not _LLM_MODEL_PATTERN.fullmatch(model):
+            raise ValueError("Invalid LLM model name")
+        _llm_config["model"] = model
     if "api_key" in config:
-        _llm_config["api_key"] = config["api_key"]
+        api_key = config["api_key"]
+        if not isinstance(api_key, str) or len(api_key) > 8192:
+            raise ValueError("Invalid LLM API key")
+        _llm_config["api_key"] = api_key
     _pipeline_cache.clear()
     from ..analysis.data_need import clear_task_plan_cache
 
@@ -743,7 +1003,7 @@ def api_get_llm_config():
 @_exclusive_task_execution
 def api_set_llm_config():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
             return jsonify({"error": "缺少请求体"}), 400
         config = _set_llm_config(data)
@@ -755,6 +1015,8 @@ def api_set_llm_config():
                 "status": "ok",
             }
         )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1057,6 +1319,27 @@ def _trace_summary(
     }
 
 
+def _normalize_trace_graph(trace: dict[str, Any]) -> dict[str, Any]:
+    graph = trace.get("graph")
+    if not isinstance(graph, dict):
+        return trace
+    normalize_graph_semantics(graph)
+    nodes = graph.get("nodes") or []
+    links = graph.get("links") or []
+    summary = trace.get("graph_summary")
+    if isinstance(summary, dict):
+        edge_types: dict[str, int] = {}
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            relation = str(link.get("relation", ""))
+            edge_types[relation] = edge_types.get(relation, 0) + 1
+        summary["total_nodes"] = len(nodes)
+        summary["total_edges"] = len(links)
+        summary["edge_types"] = edge_types
+    return trace
+
+
 def _archive_previous_trace_versions(
     trace_record: Mapping[str, Any],
     current_trace_id: str,
@@ -1181,12 +1464,15 @@ def api_get_trace(trace_id):
     try:
         for t in _in_memory_traces:
             if t.get("trace_id") == trace_id:
-                return jsonify(_json_safe(t))
+                trace_data = _json_safe(copy.deepcopy(t))
+                _normalize_trace_graph(trace_data)
+                return jsonify(trace_data)
         fp = _os.path.join(_get_traces_dir(), f"{trace_id}.json")
         if not _os.path.exists(fp):
             return jsonify({"error": "Trace not found"}), 404
         with open(fp, encoding="utf-8") as f:
             trace_data = _json_safe(json.load(f))
+        _normalize_trace_graph(trace_data)
         payload = json.dumps(
             trace_data,
             ensure_ascii=False,
@@ -3388,22 +3674,18 @@ def _execute_action_with_pipeline(
     kg_instance = KnowledgeGraph()
     agent_id = kg_instance.agent_node
 
-    try:
-        result = _execute_with_real_llm(
-            prompt,
-            ctx,
-            now,
-            agent_id,
-            app_name=app_name,
-            endpoint="/api/execute",
-            scenario=mock_scenario,
-            cross_app_task=CROSS_APP_TASKS.get(action),
-        )
-        result["defense_enabled"] = defense_enabled
-        return result
-    except Exception as e:
-        _safe_print(f"[error] 真实 LLM 执行失败: {e}")
-        return {"error": f"LLM 执行失败: {e!s}"}
+    result = _execute_with_real_llm(
+        prompt,
+        ctx,
+        now,
+        agent_id,
+        app_name=app_name,
+        endpoint="/api/execute",
+        scenario=mock_scenario,
+        cross_app_task=CROSS_APP_TASKS.get(action),
+    )
+    result["defense_enabled"] = defense_enabled
+    return result
 
 
 @_exclusive_task_execution
@@ -4464,7 +4746,7 @@ def _stable_attack_target(
     digest = hashlib.sha256(
         (
             f"{task.task_id}|{injection_point_id}|{goal_id}"
-        ).encode("utf-8")
+        ).encode()
     ).digest()
     offset = int.from_bytes(digest[:4], "big")
     for index in range(len(candidates)):
@@ -5377,59 +5659,48 @@ def _execute_with_injected_env(
 
 @app.route("/api/execute", methods=["POST"])
 def api_execute():
-    try:
-        data = request.get_json()
-        if not data or "action" not in data:
-            return jsonify({"error": "缺少 action 参数"}), 400
-        action = data["action"]
-        result = _execute_action_with_pipeline(
-            action,
-            runtime_options=data,
-        )
-        if "error" in result:
-            return jsonify(result), 400
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    data = request.get_json(silent=True)
+    action = data.get("action") if isinstance(data, dict) else None
+    if not isinstance(action, str) or not action.strip():
+        return jsonify({"error": "缺少 action 参数"}), 400
+    result = _execute_action_with_pipeline(
+        action.strip(),
+        runtime_options=data,
+    )
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result)
 
 
 @app.route("/api/execute/custom", methods=["POST"])
 def api_execute_custom():
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "缺少请求体"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "缺少请求体"}), 400
 
-        custom_prompt = data.get("prompt", "")
-        if not custom_prompt:
-            return jsonify({"error": "缺少 prompt 参数（请输入自然语言指令）"}), 400
+    custom_prompt = data.get("prompt", "")
+    if not isinstance(custom_prompt, str) or not custom_prompt.strip():
+        return jsonify({"error": "缺少 prompt 参数（请输入自然语言指令）"}), 400
 
-        ctx = TrackingContext()
-        now = time.time()
-        kg_instance = KnowledgeGraph()
-        agent_id = kg_instance.agent_node
+    ctx = TrackingContext()
+    now = time.time()
+    kg_instance = KnowledgeGraph()
+    agent_id = kg_instance.agent_node
 
-        if not _llm_config["api_key"]:
-            return jsonify({"error": "LLM 未配置，请先设置 API Key"}), 400
+    if not _llm_config["api_key"]:
+        return jsonify({"error": "LLM 未配置，请先设置 API Key"}), 400
 
-        try:
-            # 使用 "unified" 模式：合并四个 suite 的所有工具
-            return jsonify(
-                _execute_with_real_llm(
-                    custom_prompt,
-                    ctx,
-                    now,
-                    agent_id,
-                    app_name="unified",
-                    endpoint="/api/execute/custom",
-                )
-            )
-        except Exception as e:
-            _safe_print(f"[warning] 真实 LLM 自定义执行失败: {e}")
-            return jsonify({"error": f"LLM 执行失败: {e!s}"}), 500
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    # 使用 "unified" 模式：合并四个 suite 的所有工具
+    return jsonify(
+        _execute_with_real_llm(
+            custom_prompt.strip(),
+            ctx,
+            now,
+            agent_id,
+            app_name="unified",
+            endpoint="/api/execute/custom",
+        )
+    )
 
 
 # ============================================================
@@ -5502,7 +5773,7 @@ def api_storage_suite(suite_name):
 # ============================================================
 
 
-def start_server(host: str = "0.0.0.0", port: int = 5000, debug: bool = False, use_reloader: bool = False):
+def start_server(host: str = "127.0.0.1", port: int = 5000, debug: bool = False, use_reloader: bool = False):
     try:
         from ..capture.interceptor import enable_tracking
 
@@ -5578,7 +5849,7 @@ def start_server(host: str = "0.0.0.0", port: int = 5000, debug: bool = False, u
     print("   - GET /api/scenarios   - 获取可用场景列表")
     print("   - GET /api/attack-types - 获取攻击类型列表")
     print("   - GET /api/attack-scenarios - 获取攻击场景列表")
-    print("   Frontend: open frontend/index.html in browser")
+    print(f"   Frontend: open http://127.0.0.1:{port}/ in browser")
     app.run(
         host=host,
         port=port,
@@ -5590,6 +5861,6 @@ def start_server(host: str = "0.0.0.0", port: int = 5000, debug: bool = False, u
 
 if __name__ == "__main__":
     start_server(
-        debug=True,
+        debug=os.getenv("AGENTDOJO_DEBUG", "").lower() in ("1", "true", "yes"),
         use_reloader=os.getenv("AGENTDOJO_USE_RELOADER", "").lower() in ("1", "true", "yes"),
     )

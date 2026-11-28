@@ -1,373 +1,232 @@
 /**
- * API 模块 - 与后端 Flask 服务通信
- * 
- * 提供从后端获取图谱数据、事件历史、风险卡片等数据的接口。
- * 使用 agentdojo 原本的 AgentPipeline + FunctionsRuntime 执行真实工具调用。
- * 
- * 核心设计原则：
- * - 所有操作都通过后端 API 调用真实 LLM 和 FunctionsRuntime
- * - 前端不进行任何硬编码的指令解析或模拟
- * - 后端不可用时返回错误，不降级到模拟数据
- * 
- * 增强功能：
- * - 跨 APP 预设任务与攻击任务执行
- * - 预设场景执行（通过 /api/execute）
- * - LLM 配置管理（通过 /api/config/llm）
- * - 增量数据更新支持
+ * API client for the same-origin Flask service.
+ *
+ * All non-2xx responses use the structured API error contract:
+ * { error: { code, message, retryable, request_id } }.
  */
 
+class ApiError extends Error {
+    constructor(message, {
+        code = 'request_failed',
+        status = 0,
+        retryable = false,
+        requestId = '',
+    } = {}) {
+        super(message);
+        this.name = 'ApiError';
+        this.code = code;
+        this.status = status;
+        this.retryable = retryable;
+        this.requestId = requestId;
+    }
+}
+
 const API = {
-    // 后端 API 基础 URL
-    BASE_URL: 'http://localhost:5000/api',
+    BASE_URL: '/api',
 
-    /**
-     * 获取图谱数据
-     * @returns {Promise<{graph: Object, summary: Object, events: Array}>}
-     */
-    async getGraphData() {
+    async _request(path, options = {}, timeoutMs = 0) {
+        const controller = timeoutMs > 0 ? new AbortController() : null;
+        const timeoutId = controller
+            ? setTimeout(() => controller.abort(), timeoutMs)
+            : null;
         try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 5000);
-            const response = await fetch(`${this.BASE_URL}/graph`, {
-                method: 'GET',
-                headers: { 'Accept': 'application/json' },
-                signal: controller.signal
+            const response = await fetch(`${this.BASE_URL}${path}`, {
+                ...options,
+                signal: controller?.signal,
             });
-            clearTimeout(timeoutId);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取图谱数据失败:', err.message);
-            throw err;
-        }
-    },
-
-    /**
-     * 获取风险卡片列表
-     * @returns {Promise<Array>}
-     */
-    async getRiskCards() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/risk-cards`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取风险卡片失败:', err.message);
-            throw err;
-        }
-    },
-
-    /**
-     * 获取任务范围等策略事件。
-     * @returns {Promise<Array>}
-     */
-    async getPolicyEvents() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/policy-events`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取策略事件失败:', err.message);
-            throw err;
-        }
-    },
-
-    /**
-     * 获取所有可用的预设场景列表
-     * @returns {Promise<Array>}
-     */
-    async getScenarios() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/scenarios`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取场景列表失败:', err.message);
-            throw err;
-        }
-    },
-
-    /**
-     * 执行预设场景操作（通过 AgentPipeline 调用真实 LLM 自主决策）
-     * @param {string} action - 操作名称
-     * @returns {Promise<Object>} 更新后的图谱数据
-     */
-    async executeAction(action, runtimeOptions = {}) {
-        try {
-            const response = await fetch(`${this.BASE_URL}/execute`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    action,
-                    ...runtimeOptions,
-                })
+            const text = await response.text();
+            let payload = null;
+            if (text) {
+                try {
+                    payload = JSON.parse(text);
+                } catch (_error) {
+                    payload = text;
+                }
+            }
+            const structured = payload?.error;
+            if (!response.ok || structured) {
+                const message = (
+                    typeof structured === 'string'
+                        ? structured
+                        : structured?.message
+                ) || `请求失败（HTTP ${response.status}）`;
+                throw new ApiError(message, {
+                    code: structured?.code || 'request_failed',
+                    status: response.status,
+                    retryable: Boolean(structured?.retryable),
+                    requestId: (
+                        structured?.request_id
+                        || response.headers.get('X-Request-ID')
+                        || ''
+                    ),
+                });
+            }
+            return payload;
+        } catch (error) {
+            if (error instanceof ApiError) throw error;
+            if (error?.name === 'AbortError') {
+                throw new ApiError('请求超时，请稍后重试。', {
+                    code: 'timeout',
+                    retryable: true,
+                });
+            }
+            throw new ApiError('无法连接本地服务，请确认后端仍在运行。', {
+                code: 'network_error',
+                retryable: true,
             });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('执行操作失败:', err.message);
-            throw err;
+        } finally {
+            if (timeoutId !== null) clearTimeout(timeoutId);
         }
     },
 
-    /**
-     * 重置所有数据
-     * @returns {Promise<Object>}
-     */
-    async resetData() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/reset`, {
-                method: 'POST',
-            });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('重置数据失败:', err.message);
-            throw err;
-        }
+    formatError(error, prefix = '') {
+        const message = error instanceof Error
+            ? error.message
+            : String(error || '未知错误');
+        const requestId = error?.requestId
+            ? `（请求编号：${error.requestId}）`
+            : '';
+        return `${prefix}${message}${requestId}`;
     },
 
-    // ============================================================
-    // 系统状态 API
-    // ============================================================
-
-    /**
-     * 获取系统状态（健康检查 + 功能清单）
-     * @returns {Promise<Object>} { status, layers, features, llm_config, graph_stats }
-     */
-    async getSystemStatus() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/status`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取系统状态失败:', err.message);
-            throw err;
-        }
+    getGraphData() {
+        return this._request(
+            '/graph',
+            { headers: { 'Accept': 'application/json' } },
+            5000,
+        );
     },
 
-    // ============================================================
-    // LLM 配置 API
-    // ============================================================
-
-    /**
-     * 获取当前 LLM 配置
-     * @returns {Promise<Object>} { provider, model, has_api_key }
-     */
-    async getLLMConfig() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/config/llm`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取 LLM 配置失败:', err.message);
-            throw err;
-        }
+    getRiskCards() {
+        return this._request('/risk-cards');
     },
 
-    /**
-     * 设置 LLM 配置
-     * @param {Object} config - LLM 配置
-     * @param {string} config.provider - 提供商 (google/openai/anthropic/local)
-     * @param {string} config.model - 模型名称
-     * @param {string} config.api_key - API Key
-     * @returns {Promise<Object>}
-     */
-    async setLLMConfig(config) {
-        try {
-            const response = await fetch(`${this.BASE_URL}/config/llm`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(config)
-            });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('设置 LLM 配置失败:', err.message);
-            throw err;
-        }
+    getPolicyEvents() {
+        return this._request('/policy-events');
     },
 
-    // ============================================================
-    // 防御配置 API
-    // ============================================================
-
-    /**
-     * 获取当前防御机制状态
-     * @returns {Promise<Object>} { enabled: boolean }
-     */
-    async getDefenseConfig() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/config/defense`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取防御配置失败:', err.message);
-            throw err;
-        }
+    getScenarios() {
+        return this._request('/scenarios');
     },
 
-    /**
-     * 设置防御机制状态
-     * @param {boolean} enabled - 是否启用防御机制
-     * @returns {Promise<Object>} { enabled: boolean, status: string }
-     */
-    async getTraces() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/traces`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) { return { traces: [], total: 0 }; }
+    executeAction(action, runtimeOptions = {}) {
+        return this._request('/execute', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                action,
+                ...runtimeOptions,
+            }),
+        });
     },
 
-    async getTrace(traceId) {
-        try {
-            const r = await fetch(`${this.BASE_URL}/traces/${traceId}`);
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            return await r.json();
-        } catch (err) { return null; }
+    resetData() {
+        return this._request('/reset', { method: 'POST' });
     },
 
-    async setDefenseConfig(
+    getSystemStatus() {
+        return this._request('/status');
+    },
+
+    getLLMConfig() {
+        return this._request('/config/llm');
+    },
+
+    setLLMConfig(config) {
+        return this._request('/config/llm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config),
+        });
+    },
+
+    getDefenseConfig() {
+        return this._request('/config/defense');
+    },
+
+    getTraces() {
+        return this._request('/traces');
+    },
+
+    getTrace(traceId) {
+        return this._request(
+            `/traces/${encodeURIComponent(traceId)}`,
+        );
+    },
+
+    setDefenseConfig(
         enabled,
         rings = null,
         directInjectionMode = null,
-        autoConfirmations = null
+        autoConfirmations = null,
     ) {
-        try {
-            const body = {};
-            if (enabled !== null && enabled !== undefined) {
-                body.enabled = enabled;
-            }
-            if (rings) {
-                body.rings = rings;
-            }
-            if (directInjectionMode) {
-                body.direct_injection_mode = directInjectionMode;
-            }
-            if (autoConfirmations !== null && autoConfirmations !== undefined) {
-                body.auto_confirmations = autoConfirmations;
-            }
-            const response = await fetch(`${this.BASE_URL}/config/defense`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('设置防御配置失败:', err.message);
-            throw err;
+        const body = {};
+        if (enabled !== null && enabled !== undefined) {
+            body.enabled = enabled;
         }
+        if (rings) body.rings = rings;
+        if (directInjectionMode) {
+            body.direct_injection_mode = directInjectionMode;
+        }
+        if (
+            autoConfirmations !== null
+            && autoConfirmations !== undefined
+        ) {
+            body.auto_confirmations = autoConfirmations;
+        }
+        return this._request('/config/defense', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
     },
 
-    async getPendingConfirmations() {
-        const response = await fetch(`${this.BASE_URL}/confirmations`);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
+    getPendingConfirmations() {
+        return this._request('/confirmations');
     },
 
-    async resolveConfirmation(requestId, approved) {
-        const response = await fetch(
-            `${this.BASE_URL}/confirmations/${encodeURIComponent(requestId)}`,
+    resolveConfirmation(requestId, approved) {
+        return this._request(
+            `/confirmations/${encodeURIComponent(requestId)}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ approved: !!approved }),
-            }
+            },
         );
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
     },
 
-    async resolveRequirementDecision(requestId, decision) {
-        const response = await fetch(
-            `${this.BASE_URL}/confirmations/${encodeURIComponent(requestId)}`,
+    resolveRequirementDecision(requestId, decision) {
+        return this._request(
+            `/confirmations/${encodeURIComponent(requestId)}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ decision }),
-            }
+            },
         );
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
     },
 
-    // ============================================================
-    // 攻击场景 API
-    // ============================================================
-
-    async getCrossAppAttackTargets() {
-        try {
-            const response = await fetch(
-                `${this.BASE_URL}/attack/cross-app-targets`
-            );
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取跨 APP 攻击目标失败:', err.message);
-            throw err;
-        }
+    getCrossAppAttackTargets() {
+        return this._request('/attack/cross-app-targets');
     },
 
-    /**
-     * 执行攻击场景
-     * @param {Object} params - 攻击场景参数
-     * @param {string} params.cross_app_task_id - 跨 APP 基础任务 ID
-     * @param {string} params.injection_point_id - 注入位置 ID
-     * @param {string} params.injection_goal_id - 恶意目标 ID
-     * @param {string} params.attack_type - 攻击类型
-     * @returns {Promise<Object>} 执行结果（含图谱数据、风险卡片等）
-     */
-    async executeAttack(params) {
-        try {
-            const response = await fetch(`${this.BASE_URL}/execute/attack`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(params)
-            });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('执行攻击场景失败:', err.message);
-            throw err;
-        }
+    executeAttack(params) {
+        return this._request('/execute/attack', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params),
+        });
     },
 
-    // ============================================================
-    // 环境变更视图 API
-    // ============================================================
-
-    /**
-     * 获取四个 suite 的存储概要
-     * @returns {Promise<Object>} { suites: [...] }
-     */
-    async getStorageSuites() {
-        try {
-            const response = await fetch(`${this.BASE_URL}/storage/suites`);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取存储概要失败:', err.message);
-            throw err;
-        }
+    getStorageSuites() {
+        return this._request('/storage/suites');
     },
 
-    /**
-     * 获取指定 suite 的初始/当前快照与差异
-     * @param {string} suite
-     * @param {string} include - both | initial | current
-     * @returns {Promise<Object>}
-     */
-    async getStorageSuite(suite, include = 'both') {
-        try {
-            const url = `${this.BASE_URL}/storage/suites/${encodeURIComponent(suite)}?include=${encodeURIComponent(include)}`;
-            const response = await fetch(url);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return await response.json();
-        } catch (err) {
-            console.error('获取存储快照失败:', err.message);
-            throw err;
-        }
+    getStorageSuite(suite, include = 'both') {
+        const params = new URLSearchParams({ include });
+        return this._request(
+            `/storage/suites/${encodeURIComponent(suite)}?${params}`,
+        );
     },
 };

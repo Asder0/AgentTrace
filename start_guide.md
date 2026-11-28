@@ -2,5 +2,5 @@
 conda activate agent
 python -m agentdojo.method.visualization.server
 
-# 另外开一个 PowerShell 终端，在项目根目录打开前端
-Start-Process .\frontend\index.html
+# 另外打开浏览器访问由 Flask 同源托管的前端
+Start-Process http://127.0.0.1:5000/

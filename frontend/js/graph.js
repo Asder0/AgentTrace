@@ -104,7 +104,9 @@ const GRAPH = {
             'risk_of': '#f85149',
             'risk_evidence': '#f85149',
             'source_of': '#f0883e',
+            'triggered_by': '#f0883e',
             'leak_sink': '#f0883e',
+            'applies_to_sink': '#d9a441',
             'egress_to': '#f0883e',
             'authorizes': '#f0b429',
         },
@@ -119,7 +121,9 @@ const GRAPH = {
             'risk_of': '风险关联',
             'risk_evidence': '风险证据',
             'source_of': '风险来源',
+            'triggered_by': '由此触发',
             'leak_sink': '泄漏出口',
+            'applies_to_sink': '作用于出口',
             'policy_of': '策略判定',
             'egress_to': '外发到',
             'authorizes': '人工授权',
@@ -914,14 +918,19 @@ const GRAPH = {
             'stateTransition': 'belongs-to',
             'risk_of': 'derived',
             'risk_evidence': 'derived',
+            'triggered_by': 'derived',
             'leak_sink': 'derived',
+            'applies_to_sink': 'derived',
             'authorizes': 'authorizes',
         };
         return map[relation] || 'other';
     },
 
     _nodeClass(node) {
-        let cls = `node type-${String(node.type || 'unknown').toLowerCase()}`;
+        const typeClass = String(node.type || 'unknown')
+            .toLowerCase()
+            .replace(/[^a-z0-9_-]/g, '') || 'unknown';
+        let cls = `node type-${typeClass}`;
         if (node.blocked) cls += ' abnormal';
         if (this._isSensitiveNode(node)) cls += ' sensitive';
         if (this._isInjectionRisky(node)) {
@@ -976,7 +985,9 @@ const GRAPH = {
         else if (decision === 'hold' || decision === 'mitigate' || severity === 'medium') cls += ' risk-medium';
         else if (decision === 'advisory' || severity === 'low') cls += ' risk-low';
         if (node.type === 'HumanAuthorization') {
-            const status = String(node.status || 'pending').toLowerCase();
+            const status = String(node.status || 'pending')
+                .toLowerCase()
+                .replace(/[^a-z0-9_-]/g, '') || 'pending';
             cls += ` authorization-${status}`;
         }
         if (!this.config.showLabels) cls += ' label-hidden';
@@ -1995,9 +2006,40 @@ const GRAPH = {
         const nodeOrder = new Map(nodes.map((node, index) => [node.id, index]));
 
         const relatedAuxiliary = (nodeId) => {
-            const risks = links
-                .filter(l => l.source && l.target && l.target.id === nodeId && (l.relation === 'risk_of' || l.relation === 'policy_of') && (isType(l.source, 'RiskEvent') || isType(l.source, 'PolicyEvent')))
-                .map(l => l.source);
+            const controls = links
+                .filter((link) => {
+                    if (!link.source || !link.target) return false;
+                    const sourceIsControl = (
+                        isType(link.source, 'RiskEvent')
+                        || isType(link.source, 'PolicyEvent')
+                    );
+                    const targetIsControl = (
+                        isType(link.target, 'RiskEvent')
+                        || isType(link.target, 'PolicyEvent')
+                    );
+                    if (
+                        link.target.id === nodeId
+                        && sourceIsControl
+                        && [
+                            'risk_of',
+                            'policy_of',
+                            'risk_evidence',
+                            'source_of',
+                        ].includes(link.relation)
+                    ) {
+                        return true;
+                    }
+                    return (
+                        link.source.id === nodeId
+                        && targetIsControl
+                        && link.relation === 'triggered_by'
+                    );
+                })
+                .map(link =>
+                    link.source.id === nodeId
+                        ? link.target
+                        : link.source
+                );
             const states = links
                 .filter(l => l.source && l.target && l.source.id === nodeId && l.relation === 'transition_to' && isType(l.target, 'TaskState'))
                 .map(l => l.target);
@@ -2007,7 +2049,14 @@ const GRAPH = {
             const authorizations = links
                 .filter(l => l.source && l.target && l.target.id === nodeId && l.relation === 'authorizes' && isType(l.source, 'HumanAuthorization'))
                 .map(l => l.source);
-            return [...new Set([...risks, ...states, ...sinks, ...authorizations])];
+            return [
+                ...new Set([
+                    ...controls,
+                    ...states,
+                    ...sinks,
+                    ...authorizations,
+                ]),
+            ];
         };
 
         // 收集工具对应的数据节点（输入 used / 输出 produces）
@@ -2086,6 +2135,19 @@ const GRAPH = {
             });
         }
 
+        const promptAuxiliary = prompts.flatMap(
+            prompt => relatedAuxiliary(prompt.id)
+        );
+        if (promptAuxiliary.length > 0 && rows.length > 0) {
+            const targetRow = rows.find(row => row.thought) || rows[0];
+            targetRow.auxiliary = [
+                ...new Set([
+                    ...promptAuxiliary,
+                    ...targetRow.auxiliary,
+                ]),
+            ];
+        }
+
         // 兜底：没有任何行的数据节点
         const usedData = new Set();
         rows.forEach(r => {
@@ -2094,7 +2156,7 @@ const GRAPH = {
             r.auxiliary.forEach(d => usedData.add(d.id));
         });
         const leftoverData = [...dataNodes, ...auxiliaryNodes].filter(d => !usedData.has(d.id));
-        if (rows.length === 0 && leftoverData.length > 0) {
+        if (leftoverData.length > 0) {
             rows.push({
                 thought: null,
                 tool: null,

@@ -189,11 +189,6 @@ const CONSOLE = {
             const renderedRiskCards = RISK_PANEL.renderExecutionResult(result);
 
             
-            if (result.error) {
-                this._showFeedback(`执行失败：${result.error}`, 'error');
-                return;
-            }
-            
             // 更新图谱 - 优先使用返回的 graph 数据，否则强制从后端重新加载
             if (result.graph && result.graph.nodes && result.graph.nodes.length > 0) {
                 GRAPH.setData(result.graph.nodes, result.graph.links, { suite: result.suite || null });
@@ -234,7 +229,10 @@ const CONSOLE = {
             
         } catch (err) {
             console.error('执行场景失败:', err);
-            this._showFeedback(`执行失败：${err.message}`, 'error');
+            this._showFeedback(
+                API.formatError(err, '执行失败：'),
+                'error'
+            );
         } finally {
             this._isExecuting = false;
         }
@@ -343,6 +341,7 @@ const CONSOLE = {
         llmSection.className = 'console-section llm-config-section';
         
         const hasApiKey = this._llmConfig.has_api_key || false;
+        const modelValue = this._escape(this._llmConfig.model || '');
         
         llmSection.innerHTML = `
             <div class="console-label llm-config-header">
@@ -363,13 +362,15 @@ const CONSOLE = {
                 <div class="llm-config-row">
                     <label class="llm-config-label">模型</label>
                     <input type="text" id="llmModel" class="llm-config-input" 
-                           value="${this._llmConfig.model}" 
+                           value="${modelValue}"
                            placeholder="如: gemini-2.0-flash-001">
                 </div>
                 <div class="llm-config-row">
                     <label class="llm-config-label">API Key</label>
                     <input type="password" id="llmApiKey" class="llm-config-input" 
-                           placeholder="输入 API Key">
+                           placeholder="输入 API Key"
+                           autocomplete="new-password"
+                           spellcheck="false">
                 </div>
                 <div class="llm-config-row llm-config-actions">
                     <button id="btnSaveLLMConfig" class="btn-execute llm-save-btn" type="button">保存配置</button>
@@ -512,7 +513,10 @@ const CONSOLE = {
             }
         } catch (err) {
             console.error('保存 LLM 配置失败:', err);
-            this._showFeedback(`保存失败：${err.message}`, 'error');
+            this._showFeedback(
+                API.formatError(err, '保存失败：'),
+                'error'
+            );
         }
     },
 
@@ -725,18 +729,23 @@ const CONSOLE = {
             const methodToggles = Object.keys(methodFlags).map((method) => {
                 const checked = methodFlags[method] ? 'checked' : '';
                 const label = methodLabels[method] || method;
+                const safeRing = this._escape(ring);
+                const safeMethod = this._escape(method);
+                const safeLabel = this._escape(label);
                 return `
                     <label class="ring-method">
-                        <input type="checkbox" data-role="method" data-ring="${ring}" data-method="${method}" ${checked} ${enabled ? '' : 'disabled'}>
-                        <span title="${method}">${label}</span>
+                        <input type="checkbox" data-role="method" data-ring="${safeRing}" data-method="${safeMethod}" ${checked} ${enabled ? '' : 'disabled'}>
+                        <span title="${safeMethod}">${safeLabel}</span>
                     </label>
                 `;
             }).join('');
+            const safeRing = this._escape(ring);
+            const safeRingLabel = this._escape(ringNames[ring] || ring);
             return `
                 <div class="ring-config-item">
                     <label class="ring-config-label">
-                        <input type="checkbox" data-role="ring" data-ring="${ring}" ${enabled ? 'checked' : ''}>
-                        <span>${ringNames[ring] || ring}</span>
+                        <input type="checkbox" data-role="ring" data-ring="${safeRing}" ${enabled ? 'checked' : ''}>
+                        <span>${safeRingLabel}</span>
                         ${['ring_2', 'ring_3'].includes(ring)
                             ? '<span class="ring-plan-dependency">\u4f9d\u8d56\u4efb\u52a1\u8ba1\u5212</span>'
                             : ''}
@@ -802,7 +811,10 @@ const CONSOLE = {
             }
         } catch (err) {
             console.error('设置 Ring 配置失败:', err);
-            this._showFeedback(`设置 Ring 配置失败：${err.message}`, 'error');
+            this._showFeedback(
+                API.formatError(err, '设置 Ring 配置失败：'),
+                'error'
+            );
             // 重新拉取配置，恢复实际状态
             try {
                 const config = await API.getDefenseConfig();
@@ -839,7 +851,7 @@ const CONSOLE = {
             this._updateAutoConfirmationStatus(toggle.checked);
             console.error('设置自动同意策略失败:', err);
             this._showFeedback(
-                `设置自动同意策略失败：${err.message}`,
+                API.formatError(err, '设置自动同意策略失败：'),
                 'error'
             );
         }
@@ -871,7 +883,10 @@ const CONSOLE = {
             console.error('设置防御配置失败:', err);
             // 恢复开关状态
             toggle.checked = !enabled;
-            this._showFeedback(`设置防御配置失败：${err.message}`, 'error');
+            this._showFeedback(
+                API.formatError(err, '设置防御配置失败：'),
+                'error'
+            );
         }
     },
 
@@ -1128,11 +1143,6 @@ const CONSOLE = {
             const result = await API.executeAttack(params);
             const renderedRiskCards = RISK_PANEL.renderExecutionResult(result);
             
-            if (result.error) {
-                this._showFeedback(`执行失败：${result.error}`, 'error');
-                return;
-            }
-            
             // 更新图谱
             if (result.graph && result.graph.nodes && result.graph.nodes.length > 0) {
                 GRAPH.setData(result.graph.nodes, result.graph.links, { suite: result.suite || null });
@@ -1169,7 +1179,10 @@ const CONSOLE = {
             
         } catch (err) {
             console.error('执行攻击场景失败:', err);
-            this._showFeedback(`执行失败：${err.message}`, 'error');
+            this._showFeedback(
+                API.formatError(err, '执行失败：'),
+                'error'
+            );
         } finally {
             this._isExecuting = false;
         }

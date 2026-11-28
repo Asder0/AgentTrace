@@ -1584,7 +1584,6 @@ body.resizing-side * {
 }
 
 .risk-card:hover,
-.risk-card:focus-visible,
 .risk-card.is-selected {
     border-color: var(--accent-blue);
     box-shadow: 0 0 0 1px rgba(79, 140, 255, 0.28);
@@ -1609,9 +1608,11 @@ body.resizing-side * {
     align-items: center;
     gap: 6px;
     flex-wrap: wrap;
+    margin: 0 0 6px;
     color: var(--text-primary);
+    font-size: inherit;
     font-weight: 600;
-    margin-bottom: 6px;
+    line-height: 1.4;
 }
 
 .risk-detail {

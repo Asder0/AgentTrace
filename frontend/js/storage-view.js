@@ -300,7 +300,13 @@ const STORAGE_VIEW = {
             if (this._suite) await this.loadSuite(this._suite, silent);
         } catch (error) {
             if (this.el?.diffBody) {
-                this.el.diffBody.innerHTML = '<div class="storage-empty">环境数据加载失败，请确认后端服务已启动。</div>';
+                const message = document.createElement('div');
+                message.className = 'storage-empty';
+                message.textContent = API.formatError(
+                    error,
+                    '环境数据加载失败：'
+                );
+                this.el.diffBody.replaceChildren(message);
             }
         }
     },
@@ -328,7 +334,13 @@ const STORAGE_VIEW = {
             this._render();
         } catch (error) {
             if (this.el?.diffBody) {
-                this.el.diffBody.innerHTML = '<div class="storage-empty">该 APP 的环境快照加载失败。</div>';
+                const message = document.createElement('div');
+                message.className = 'storage-empty';
+                message.textContent = API.formatError(
+                    error,
+                    '环境快照加载失败：'
+                );
+                this.el.diffBody.replaceChildren(message);
             }
         }
     },

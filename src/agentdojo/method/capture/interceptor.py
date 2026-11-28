@@ -41,6 +41,7 @@ from ..analysis.defense_config import (
     get_config,
     planning_enabled,
 )
+from ..analysis.flow_policy import SEMANTIC_BINDING_ENFORCEMENT
 from ..analysis.injection_scanner import (
     SECURITY_PLACEHOLDER_NOTICE,
     contains_security_placeholder,
@@ -52,7 +53,6 @@ from ..analysis.parameter_binding import (
     placeholder_notice,
     resolve_parameter_bindings,
 )
-from ..analysis.flow_policy import SEMANTIC_BINDING_ENFORCEMENT
 from ..analysis.pipeline import (
     process_after_execution_with_details,
     process_before_execution,
@@ -2421,6 +2421,31 @@ def _build_tool_catalog(
     return catalog
 
 
+def _attach_ring0_prompt_source(
+    risk_assessments: list[dict[str, Any]],
+    prompt_entity_id: str | None,
+) -> None:
+    """Bind direct-prompt risks to the graph Prompt node."""
+    if not prompt_entity_id:
+        return
+    for risk in risk_assessments:
+        if not str(
+            risk.get("policy_id", "")
+        ).startswith("ring0."):
+            continue
+        risk["source_ids"] = list(
+            dict.fromkeys(
+                [
+                    *risk.get("source_ids", []),
+                    prompt_entity_id,
+                ]
+            )
+        )
+        risk.setdefault("evidence_total", {})["sources"] = len(
+            risk["source_ids"]
+        )
+
+
 def capture_llm_interaction(func: Callable):
     """
     Interceptor for LLM query methods.
@@ -2485,6 +2510,10 @@ def capture_llm_interaction(func: Callable):
             )
             _ring0_diagnostics = defense_diagnostics.get("ring_0", {})
             risk_assessments = list(llm_event.get("risk_assessments", []))
+            _attach_ring0_prompt_source(
+                risk_assessments,
+                ctx.prompt_entity_id,
+            )
             if not allow:
                 block_reason = llm_event.get("block_reason", "Ring 0: Prompt injection detected in user input.")
                 risk = make_risk(

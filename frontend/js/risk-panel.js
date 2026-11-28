@@ -43,23 +43,15 @@ const RISK_PANEL = {
         this.container.addEventListener('click', (event) => {
             const cardEl = event.target.closest('.risk-card[data-risk-index]');
             if (!cardEl) return;
-            if (event.target.closest('details, a, input')) return;
-            if (
-                event.target.closest('button')
-                && !event.target.closest('[data-risk-focus]')
-            ) {
+            const focusButton = event.target.closest('[data-risk-focus]');
+            if (focusButton) {
+                activate(focusButton);
+                return;
+            }
+            if (event.target.closest('button, details, summary, a, input')) {
                 return;
             }
             activate(event.target);
-        });
-        this.container.addEventListener('keydown', (event) => {
-            if (event.key !== 'Enter' && event.key !== ' ') return;
-            const cardEl = event.target.closest('.risk-card[data-risk-index]');
-            if (!cardEl || event.target.closest('button, summary, a')) {
-                return;
-            }
-            event.preventDefault();
-            activate(cardEl);
         });
     },
 
@@ -90,7 +82,17 @@ const RISK_PANEL = {
             this.container
                 .querySelectorAll('.risk-card.is-selected')
                 .forEach(item => item.classList.remove('is-selected'));
+            this.container
+                .querySelectorAll('[data-risk-focus]')
+                .forEach(button => button.setAttribute(
+                    'aria-pressed',
+                    'false'
+                ));
             cardEl?.classList.add('is-selected');
+            cardEl?.querySelector('[data-risk-focus]')?.setAttribute(
+                'aria-pressed',
+                'true'
+            );
         }
         return focused;
     },
@@ -277,7 +279,10 @@ const RISK_PANEL = {
 
         let html = '';
         for (const [cardIndex, card] of normalizedCards.entries()) {
-            const ring = card.ring || 0;
+            const ringNumber = Number(card.ring);
+            const ring = Number.isFinite(ringNumber)
+                ? Math.max(0, Math.trunc(ringNumber))
+                : 0;
             const ringClass = `ring${ring}`;
             const meta = ringMeta[ring] || { color: '#8899aa', action: '未知' };
             const userView = card.user_view || {};
@@ -449,10 +454,19 @@ const RISK_PANEL = {
                 `
                 : '';
             
-            const attentionKind = this._attentionKind(card);
+            const attentionKey = String(
+                this._attentionKind(card) || ''
+            );
+            const attentionKind = attentionKey.replace(
+                /[^a-z0-9_-]/gi,
+                ''
+            );
+            const attentionClass = attentionKind
+                ? ` attention-${attentionKind}`
+                : '';
             const kindClass = card.event_kind === 'policy'
-                ? ` policy-card attention-${attentionKind}`
-                : ` security-card attention-${attentionKind}`;
+                ? ` policy-card${attentionClass}`
+                : ` security-card${attentionClass}`;
             const rawAttentionLabel = String(
                 card.attention_label
                 || {
@@ -460,7 +474,7 @@ const RISK_PANEL = {
                     sensitive_egress: '敏感数据外发',
                     high_risk_authorization: '高风险操作授权',
                     sensitive_llm_exposure: '敏感数据对 LLM 暴露',
-                }[attentionKind]
+                }[attentionKey]
                 || ''
             );
             const attentionLabel = (
@@ -469,22 +483,23 @@ const RISK_PANEL = {
             )
                 ? this._escape(rawAttentionLabel)
                 : '';
-            const cardId = this._escape(this._cardId(card));
+            const rawCardId = this._cardId(card);
+            const cardId = this._escape(rawCardId);
+            const selected = this._selectedRiskId === rawCardId;
             html += `
-                <div class="risk-card${kindClass}"
+                <article class="risk-card${kindClass}"
                      data-risk-index="${cardIndex}"
                      data-risk-id="${cardId}"
-                     role="button"
-                     tabindex="0"
-                     aria-label="查看该风险对应的数据链">
-                    <div class="risk-title">
+                     aria-labelledby="risk-title-${cardIndex}"
+                     aria-describedby="risk-summary-${cardIndex}">
+                    <h3 class="risk-title" id="risk-title-${cardIndex}">
                         <span class="risk-ring ${ringClass}">${riskType}</span>
-                        ${attentionLabel ? `<span class="risk-attention-badge attention-${attentionKind}">${attentionLabel}</span>` : ''}
+                        ${attentionLabel ? `<span class="risk-attention-badge${attentionClass}">${attentionLabel}</span>` : ''}
                         <span class="risk-kind-badge">${decisionLabel}</span>
                         ${phaseLabel ? `<span class="risk-kind-badge risk-phase-badge">${phaseLabel}</span>` : ''}
                         <span class="risk-kind-badge">${levelLabel}：${this._escape(levelValue)}</span>
-                    </div>
-                    <div class="risk-detail">
+                    </h3>
+                    <div class="risk-detail" id="risk-summary-${cardIndex}">
                         ${injectionEvidenceHtml}
                         ${hiddenValuesHtml}
                         <div class="defense-section">
@@ -504,6 +519,8 @@ const RISK_PANEL = {
                         <button type="button"
                                 class="risk-focus-btn"
                                 data-risk-focus
+                                aria-controls="graph-container"
+                                aria-pressed="${selected ? 'true' : 'false'}"
                                 title="在溯源图谱中高亮相关数据链">
                             查看数据链
                         </button>
@@ -529,7 +546,7 @@ const RISK_PANEL = {
                             </details>
                         </details>
                     </div>
-                </div>
+                </article>
             `;
         }
 
@@ -542,6 +559,10 @@ const RISK_PANEL = {
             );
             if (selected) {
                 selected.classList.add('is-selected');
+                selected.querySelector('[data-risk-focus]')?.setAttribute(
+                    'aria-pressed',
+                    'true'
+                );
             } else {
                 this._selectedRiskId = null;
             }
@@ -558,6 +579,12 @@ const RISK_PANEL = {
         this.container
             .querySelectorAll('.risk-card.is-selected')
             .forEach(item => item.classList.remove('is-selected'));
+        this.container
+            .querySelectorAll('[data-risk-focus]')
+            .forEach(button => button.setAttribute(
+                'aria-pressed',
+                'false'
+            ));
     },
 
     /**

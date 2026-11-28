@@ -62,6 +62,7 @@ AgentTrace 在 AgentDojo 基准测试框架之上，通过 AOP 拦截器（Monke
   - 敏感审计：邮件、金融等数据使用信息流标签高亮，审计视图保留完整证据供用户核查
   - 风险事件：按提示注入、敏感数据外发、高风险操作授权和敏感数据对 LLM 暴露分类；普通策略提醒不进入风险面板
   - 风险卡片与防御审计：按提示注入、敏感数据外发、高风险操作授权和敏感数据对 LLM 暴露分类展示，并可反向聚焦图谱
+  - API 错误：统一返回 `code/message/retryable/request_id`；未知 5xx 隐藏内部异常，仅写入服务端日志
   - 历史回放：新记录保存当时的图谱、任务总结、风险事件、任务基线和环境快照；同一任务/攻击配置/防御状态默认只保留最新版本
   - 环境变更：按 APP 查看字段级环境差异、敏感等级和来源链，可定位图谱节点，并回放任务基线与执行后快照
 - **前后端执行配置同步**：普通任务和攻击请求都会携带当前防御开关与自动确认状态，后端以请求配置执行，不再用默认值覆盖前端选择
@@ -85,18 +86,18 @@ pip install -e ".[transformers,privacy]"
 python -c "import sys; print(sys.executable)"
 
 # 2. 安装可视化平台依赖
-pip install flask flask-cors networkx
+pip install flask networkx
 
-# 3. 启动可视化 API 服务
+# 3. 启动同源可视化服务
 python -m agentdojo.method.visualization.server
 
-# 4. 打开前端
+# 4. 在浏览器打开前端
 # Windows
-start frontend/index.html
+start http://127.0.0.1:5000/
 # macOS
-open frontend/index.html
+open http://127.0.0.1:5000/
 # Linux
-xdg-open frontend/index.html
+xdg-open http://127.0.0.1:5000/
 ```
 
 > 首次使用时，需在页面右上角“操作控制台”中配置 LLM（选择模型并填写 API Key，支持 OpenAI / Anthropic / DeepSeek / Gemini 等，详见 `src/agentdojo/agent_pipeline/llms/`），之后即可执行跨 APP 预设任务或攻击测试。
@@ -169,7 +170,8 @@ docs/                     # 文档（mkdocs）
 ## 运行边界
 
 - 当前执行入口在单个 Flask 进程内串行化任务，避免并发任务覆盖 APP 环境、任务基线和 trace。
-- trace 与历史环境快照可能包含完整邮件、文件内容、账户信息等敏感审计数据，建议只在可信的本地环境运行。
+- trace 与历史环境快照可能包含完整邮件、文件内容、账户信息等敏感审计数据。服务默认仅监听
+  `127.0.0.1`，并拒绝非本机 Host 与跨源写操作；不要将该服务直接暴露到局域网或公网。
 - 当前版本只加载包含完整 `environment_snapshots` 和 `defense_config` 的新版 Trace；旧版本 Trace 与兼容回放代码已删除。
 
 ## 许可证

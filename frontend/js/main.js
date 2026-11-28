@@ -81,7 +81,12 @@ const APP = {
             failures.push('GRAPH_DATA');
             console.error('[app] 加载图谱数据失败:', err);
             if (!GRAPH.simulation) {
-                this._showError('图谱数据加载失败：D3 或后端服务不可用，可视化图谱暂不可用。');
+                this._showError(
+                    API.formatError(
+                        err,
+                        '图谱数据加载失败：'
+                    )
+                );
             }
         }
 
@@ -878,6 +883,16 @@ const APP = {
             }
         } catch (err) {
             console.error('[confirmation] resolve failed', err);
+            const error = document.getElementById(
+                'l2RequirementDecisionError'
+            );
+            if (error) {
+                error.hidden = false;
+                error.textContent = API.formatError(
+                    err,
+                    '确认提交失败：'
+                );
+            }
         } finally {
             this._confirmationResolving = false;
             buttons.forEach((button) => { button.disabled = false; });
@@ -912,17 +927,24 @@ const APP = {
     /**
      * 显示错误信息
      */
-    _showError(message) {
+    _showError(message, retryable = true) {
         const container = document.getElementById('graph-container');
         if (!container) return;
         
         const errorEl = document.createElement('div');
         errorEl.className = 'error-overlay';
-        errorEl.innerHTML = `
-            <div class="error-text">${message}</div>
-            <button type="button" class="error-retry">重试</button>
-        `;
-        errorEl.querySelector('.error-retry').addEventListener('click', () => APP.init());
+        const text = document.createElement('div');
+        text.className = 'error-text';
+        text.textContent = String(message || '');
+        errorEl.append(text);
+        if (retryable) {
+            const retry = document.createElement('button');
+            retry.type = 'button';
+            retry.className = 'error-retry';
+            retry.textContent = '重试';
+            retry.addEventListener('click', () => APP.init());
+            errorEl.append(retry);
+        }
         container.appendChild(errorEl);
     },
 
@@ -1018,7 +1040,15 @@ const APP = {
      * 初始化节点详情弹窗
      */
     async _loadHistoryList() {
-        const data = await API.getTraces();
+        let data;
+        try {
+            data = await API.getTraces();
+        } catch (err) {
+            this._showHistoryHint(
+                API.formatError(err, '加载历史记录失败：')
+            );
+            return;
+        }
         let panel = document.getElementById('historyListPanel');
 
         if (!panel) {
@@ -1109,9 +1139,11 @@ const APP = {
             );
         }
         let trace;
+        let replayError = null;
         try {
             trace = await API.getTrace(tid);
         } catch (err) {
+            replayError = err;
             console.error('[app] 加载历史记录失败:', err);
         }
         if (!trace) {
@@ -1122,7 +1154,14 @@ const APP = {
             if (triggerTitle) {
                 triggerTitle.textContent = originalTitle;
             }
-            this._showHistoryHint('历史记录加载失败，请刷新后重试');
+            this._showHistoryHint(
+                replayError
+                    ? API.formatError(
+                        replayError,
+                        '历史记录加载失败：'
+                    )
+                    : '历史记录为空或格式无效。'
+            );
             return;
         }
         this._repairTraceStepNodeIds(trace);
@@ -1636,7 +1675,7 @@ const APP = {
             URL.revokeObjectURL(link.href);
         } catch (err) {
             console.error('[app] 导出 Trace 失败:', err);
-            alert('导出失败，请稍后重试');
+            alert(API.formatError(err, '导出失败：'));
         }
     },
 
@@ -1725,15 +1764,21 @@ const APP = {
             resetBtn.textContent = '重置所有数据';
             resetBtn.addEventListener('click', async () => {
                 if (confirm('确定要重置所有数据吗？')) {
-                    if (Store.get('replaying')) this.exitReplay({ reload: false });
-                    await API.resetData();
-                    await GRAPH.loadData();
-                    RISK_PANEL.loadRiskCards();
-                    Store.set('lastNodeCount', 0);
-                    Store.set('lastEdgeCount', 0);
-                    // 重置后重新加载场景列表
-                    await CONSOLE.loadScenarios();
-                    if (typeof STORAGE_VIEW !== 'undefined') STORAGE_VIEW.notifyDataChanged();
+                    try {
+                        if (Store.get('replaying')) this.exitReplay({ reload: false });
+                        await API.resetData();
+                        await GRAPH.loadData();
+                        RISK_PANEL.loadRiskCards();
+                        Store.set('lastNodeCount', 0);
+                        Store.set('lastEdgeCount', 0);
+                        // 重置后重新加载场景列表
+                        await CONSOLE.loadScenarios();
+                        if (typeof STORAGE_VIEW !== 'undefined') STORAGE_VIEW.notifyDataChanged();
+                    } catch (err) {
+                        this._showHistoryHint(
+                            API.formatError(err, '重置数据失败：')
+                        );
+                    }
                 }
             });
             consoleCard.appendChild(resetBtn);
@@ -1793,5 +1838,12 @@ const APP = {
 // 页面加载完成后启动应用
 // ============================================================
 document.addEventListener('DOMContentLoaded', () => {
+    if (window.location.protocol === 'file:') {
+        APP._showError(
+            '前端必须通过 http://127.0.0.1:5000/ 访问。请先启动后端，不要直接打开 frontend/index.html。',
+            false
+        );
+        return;
+    }
     APP.init();
 });
