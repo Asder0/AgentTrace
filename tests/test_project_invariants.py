@@ -55,6 +55,7 @@ def test_server_defaults_to_loopback_without_cors():
     assert signature.parameters["host"].default == "127.0.0.1"
     assert signature.parameters["debug"].default is False
     assert "CORS(app)" not in source
+    assert "flask_cors" not in source
 
 
 def test_cross_origin_requests_are_rejected():
@@ -82,6 +83,21 @@ def test_cross_origin_requests_are_rejected():
     assert mutation.status_code == 403
 
 
+def test_same_origin_mutation_is_allowed():
+    client = server.app.test_client()
+    original = server.interceptor_module._defense_enabled
+    try:
+        response = client.post(
+            "/api/config/defense",
+            json={"enabled": original},
+            headers={"Origin": "http://localhost"},
+        )
+        assert response.status_code == 200
+    finally:
+        server.interceptor_module._defense_enabled = original
+        server.reset_config()
+
+
 def test_foreign_host_is_rejected():
     response = server.app.test_client().get(
         "/api/status",
@@ -93,8 +109,17 @@ def test_foreign_host_is_rejected():
 
 def test_frontend_is_served_with_security_headers():
     response = server.app.test_client().get("/")
+    d3 = server.app.test_client().get("/vendor/d3.v7.min.js")
+    api = server.app.test_client().get("/js/api.js")
+    index_source = (
+        REPOSITORY_ROOT / "frontend" / "index.html"
+    ).read_text(encoding="utf-8")
 
     assert response.status_code == 200
+    assert d3.status_code == 200
+    assert api.status_code == 200
+    assert 'src="vendor/d3.v7.min.js"' in index_source
+    assert 'src="https://' not in index_source
     assert response.mimetype == "text/html"
     assert response.headers["X-Frame-Options"] == "DENY"
     assert "default-src 'self'" in response.headers[
@@ -173,6 +198,7 @@ def test_unsafe_html_sinks_are_escaped_or_sanitized():
     assert ".replace(/[^a-z0-9_-]/g, '') || 'unknown'" in graph_source
     assert 'const safeRing = this._escape(ring)' in console_source
     assert 'const safeMethod = this._escape(method)' in console_source
+    assert "character => ({" in status_source
 
 
 def test_api_client_uses_structured_errors():

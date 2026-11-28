@@ -392,7 +392,16 @@ const STATUS_PANEL = {
         const container = document.getElementById('statusFeatures');
         if (!container || !features) return;
         const escape = window.AgentTraceContent?.escapeHtml
-            || (value => String(value == null ? '' : value));
+            || (value => String(value == null ? '' : value).replace(
+                /[&<>"']/g,
+                character => ({
+                    '&': '&amp;',
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    '"': '&quot;',
+                    "'": '&#39;',
+                })[character],
+            ));
 
         // 按层分组
         const grouped = {};
