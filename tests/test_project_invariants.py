@@ -219,6 +219,38 @@ def test_documentation_uses_same_origin_frontend():
         assert "xdg-open frontend/index.html" not in text
 
 
+def test_documentation_matches_runtime_contract():
+    readme = (REPOSITORY_ROOT / "README.md").read_text(
+        encoding="utf-8"
+    )
+    method = (REPOSITORY_ROOT / "method.md").read_text(
+        encoding="utf-8"
+    )
+    explain = (REPOSITORY_ROOT / "explain.md").read_text(
+        encoding="utf-8"
+    )
+
+    for name in (
+        "AGENTDOJO_PI_MODEL_PATH",
+        "AGENTDOJO_DIRECT_PI_MODEL_PATH",
+        "AGENTDOJO_FALLBACK_PI_MODEL_PATH",
+        "AGENTDOJO_GLINER_MODEL_PATH",
+        "AGENTDOJO_DEBUG",
+        "AGENTDOJO_USE_RELOADER",
+        "AGENTDOJO_ATTACK_SCENARIOS_PER_SUITE",
+        "LOCAL_LLM_PORT",
+    ):
+        assert name in readme
+        assert name in method
+
+    assert "任务审计摘要" not in readme
+    assert "triggered_by" in explain
+    assert "applies_to_sink" in explain
+    assert "29 个 `/api` 路由" in explain
+    assert "旧 Trace Schema" in readme
+    assert "读取和回放时自动归一化" in readme
+
+
 def test_ring0_risk_is_linked_to_prompt():
     reset_graph()
     try:

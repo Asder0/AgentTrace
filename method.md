@@ -243,8 +243,10 @@ flowchart LR
 
 环境变更只应表示 Agent 行为造成的修改。测试时预先加载的账单邮件、攻击文本或场景数据必须进入任务基线，不能作为 Agent 新增内容。
 
-当前版本只接受包含完整任务级环境快照的新版 Trace。旧 Trace 与降级恢复逻辑已删除；
-缺少快照的记录会直接提示环境变更不可回放。
+当前版本只接受包含完整任务级环境快照的 Trace Schema，不接受旧 Trace Schema；
+旧版的降级环境恢复逻辑已删除，缺少快照的记录会直接提示环境变更不可回放。
+对于当前 Schema 中由旧版本生成的图谱关系，API 读取和回放时会统一归一化，
+但不改写原始 JSON。
 
 ## 6. Modeling Layer
 
@@ -960,10 +962,13 @@ source_paths
 
 | 变量 | 说明 |
 | --- | --- |
-| `AGENTDOJO_PI_MODEL_PATH` | 覆盖 Ring 1 的 Unplug/间接注入模型目录 |
-| `AGENTDOJO_DIRECT_PI_MODEL_PATH` | 覆盖 Ring 0 的 prompt-injection-guard-small 直接注入模型目录 |
-| `AGENTDOJO_USE_RELOADER=true` | 开启 Flask 自动重载 |
-| `AGENTDOJO_ATTACK_SCENARIOS_PER_SUITE` | 旧版单 APP 攻击 API 每个 suite 生成的场景数量；主界面不依赖该变量 |
+| `AGENTDOJO_PI_MODEL_PATH` | 覆盖 Ring 1 的 Unplug/间接注入模型目录，默认 `models/unplug-tiny-v1` |
+| `AGENTDOJO_DIRECT_PI_MODEL_PATH` | 覆盖 Ring 0 直接注入模型目录，默认 `models/prompt-injection-guard-small` |
+| `AGENTDOJO_FALLBACK_PI_MODEL_PATH` | 覆盖 Ring 1 语义块后备检测器目录，默认复用 `models/prompt-injection-guard-small` |
+| `AGENTDOJO_GLINER_MODEL_PATH` | 覆盖 Ring 2 本地 GLiNER 目录，默认 `models/gliner_multi-v2.1`；不可用时 fail-closed |
+| `AGENTDOJO_DEBUG=true` | 开启 Flask debug，默认关闭 |
+| `AGENTDOJO_USE_RELOADER=true` | 开启 Flask 自动重载，不单独开启 debug，默认关闭 |
+| `AGENTDOJO_ATTACK_SCENARIOS_PER_SUITE` | 旧版单 APP 攻击 API 每个 suite 生成的场景数量，默认 `3`；主界面不依赖该变量 |
 | `LOCAL_LLM_PORT` | 本地 OpenAI 兼容服务端口，默认 `8000` |
 
 模型加载使用 `local_files_only=True`，不会静默切换到在线下载。
@@ -1118,7 +1123,7 @@ curl -X POST http://localhost:5000/api/config/defense \
 - trace 默认可包含完整邮件、文件内容、账户信息和工具输出，属于敏感审计数据。服务默认仅监听
   `127.0.0.1`，前端与 API 同源，跨源请求和非本机 Host 会被拒绝。当前版本仍不面向公网部署。
 - 前端已内置 D3 v7 本地依赖，无需访问外网即可初始化拓扑图。
-- 当前版本不兼容旧 Trace Schema；旧 Trace 和历史归档已删除。
+- 当前版本不兼容旧 Trace Schema；当前 Schema 的旧关系语义会在读取时归一化。
 - 真实任务执行需要配置可用 LLM API；本地注入分类器需要 `transformers` 和 `torch`。
 - 历史页面只展示每个运行版本的最新 Trace；归档目录中的旧版本不会出现在前端列表中。
 - `deepseek-chat` 是当前可调用但未列入官方稳定模型列表的兼容别名，不应作为长期实验契约；

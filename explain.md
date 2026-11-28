@@ -64,6 +64,8 @@ frontend/css/style.css - 暗色主题样式
 - 支持按 APP、实体、字段、值或敏感等级搜索
 - 完整初始/当前快照保留为辅助视图，自动刷新默认关闭
 - 新 Trace 保存任务基线和执行后快照，可在历史回放中恢复当次环境差异；旧 Trace Schema 已不再兼容
+- 当前 Trace Schema 中由旧版本生成的关系语义会在 API 读取和回放时归一化，原始 JSON 不改写
+- 只有 `scope=task` 的状态标记为任务终态；活动级 `FAILED`、`QUARANTINED` 等状态不终止整个任务
 
 ## 三、多层防御分析系统（4-Ring）
 
@@ -79,19 +81,30 @@ src/agentdojo/method/modeling/graph_db.py 实现 FSM + PROV 融合知识图谱:
 - PROV 实体: AIAgent, AIModelInvocation, AgentTool, Prompt, DomainData、
   HumanAuthorization、PolicyEvent、RiskEvent、EgressSink
 - PROV/审计关系: belongsTo, informed, used, produces, wasDerivedFrom、
-  authorizes, policy_of, risk_of, risk_evidence, egress_to
+  authorizes, policy_of, risk_of, risk_evidence, triggered_by,
+  egress_to, leak_sink, applies_to_sink
+- 只有 Ring 3 敏感外发使用 `leak_sink`；L2 授权等非外泄风险使用
+  `applies_to_sink`
 - FSM 状态机: State - Transition - State
 - 使用 NetworkX 内存实现
 
 ## 五、后端 API 服务器
 
-src/agentdojo/method/visualization/server.py
-Flask REST API, 使用真实 AgentPipeline 执行
-提供 15+ 个 API 端点覆盖图谱/事件/风险/执行/攻击场景等
+实现位于 `src/agentdojo/method/visualization/server.py`：
+
+- 使用真实 `AgentPipeline` 执行任务
+- 提供 29 个 `/api` 路由，覆盖图谱、事件、风险、执行、攻击场景和历史回放
+- 前端由 Flask 在 `/` 同源托管
+- 默认只监听 `127.0.0.1`，拒绝非本机 Host 和跨源写请求
+- API 错误统一返回 `code/message/retryable/request_id`，未知 5xx 不返回内部异常
 
 ## 六、测试覆盖
 
-当前测试按机制拆分在多个文件中：
+公开仓库当前只纳入 `tests/test_project_invariants.py`，用于校验环境说明、
+同源安全边界、错误响应、Accessibility 和图谱语义。
+
+本机完整研究测试集按机制拆分在以下文件中，这些文件由 `.gitignore` 排除，
+不会随当前 GitHub 仓库发布：
 
 - `tests/test_flow_policy.py`：Ring 2/3 数据流与来源策略
 - `tests/test_ring0_ring1_scanner.py`：直接注入、工具输出注入和 span 处理
@@ -118,4 +131,4 @@ Flask REST API, 使用真实 AgentPipeline 执行
 | 可运行原型 | Flask + D3.js + AgentPipeline | 通过 |
 
 
-生成日期: 2026-07-29
+生成日期: 2026-11-28

@@ -4,6 +4,8 @@
 
 AgentTrace 在 AgentDojo 基准测试框架之上，通过 AOP 拦截器（Monkey Patching）实时捕获 Agent 的 LLM 推理与工具调用，构建 PROV 知识图谱，并以可视化仪表盘呈现完整的数据流转、防御监控与历史回放。
 
+仓库名为 AgentTrace，前端界面展示名为 AgentDojo Trace。
+
 运行时方法、四层风险判定、trace 结构和扩展方式详见 [`method.md`](method.md)。
 
 ## 系统怎么工作
@@ -53,15 +55,15 @@ AgentTrace 在 AgentDojo 基准测试框架之上，通过 AOP 拦截器（Monke
   - 内置只读、文件写入、日历摘要、Slack 外发、酒店预订和敏感转账等跨 APP 验收场景；完整列表见 `method.md`
 - **数据流追踪**：拦截 LLM 推理与工具调用，记录数据来源、去向与推理链路
 - **知识图谱建模**：基于 PROV-AGENT 模型（AIAgent / AIModelInvocation / AgentTool / Prompt / DomainData）
+- **图谱语义**：`triggered_by` 表示数据或 Prompt 触发风险；只有 Ring 3 敏感外发使用 `leak_sink`，普通授权出口使用 `applies_to_sink`
 - **可视化仪表盘**
   - 结构化拓扑图：卡片式节点，按“提示词 → 智能体 → 推理 → 输入数据 → 工具调用 → 输出数据”分列展示；节点带 APP 域标识，顶部 APP 流程条按执行顺序展示跨 APP 调用，支持点击聚焦
   - 图例交互：图例说明可折叠；节点类型、敏感、不可信和风险图例可点击过滤，并自动重排剩余节点
   - 面板折叠：右侧信息栏可拖动调整宽度，拖到最右侧或双击可折叠和恢复
   - 人工授权：L2 待确认操作生成染色的人工授权节点，节点详情内可直接批准或拒绝；决策状态进入 trace
-  - 任务审计摘要：展示任务目标、授权工具、实际调用、跨 APP 路径、敏感数据和策略结论
+  - 任务总结：展示任务指令、实际调用、跨 APP 路径、资源访问范围、数据类别和结果核验
   - 敏感审计：邮件、金融等数据使用信息流标签高亮，审计视图保留完整证据供用户核查
-  - 风险事件：按提示注入、敏感数据外发、高风险操作授权和敏感数据对 LLM 暴露分类；普通策略提醒不进入风险面板
-  - 风险卡片与防御审计：按提示注入、敏感数据外发、高风险操作授权和敏感数据对 LLM 暴露分类展示，并可反向聚焦图谱
+  - 风险事件：按提示注入、敏感数据外发、高风险操作授权和敏感数据对 LLM 暴露分类；普通策略提醒不进入风险面板，点击卡片可反向聚焦图谱
   - API 错误：统一返回 `code/message/retryable/request_id`；未知 5xx 隐藏内部异常，仅写入服务端日志
   - 历史回放：新记录保存当时的图谱、任务总结、风险事件、任务基线和环境快照；同一任务/攻击配置/防御状态默认只保留最新版本
   - 环境变更：按 APP 查看字段级环境差异、敏感等级和来源链，可定位图谱节点，并回放任务基线与执行后快照
@@ -115,8 +117,10 @@ xdg-open http://127.0.0.1:5000/
 | :--- | :--- |
 | `AGENTDOJO_PI_MODEL_PATH=<dir>` | 覆盖本地提示注入检测模型目录；未设置时使用项目内 `models/unplug-tiny-v1` |
 | `AGENTDOJO_DIRECT_PI_MODEL_PATH=<dir>` | 覆盖 Ring 0 直接注入检测模型目录；未设置时使用项目内 `models/prompt-injection-guard-small` |
+| `AGENTDOJO_FALLBACK_PI_MODEL_PATH=<dir>` | 覆盖 Ring 1 语义块后备检测器目录；未设置时复用 `models/prompt-injection-guard-small` |
 | `AGENTDOJO_GLINER_MODEL_PATH=<dir>` | 覆盖本地 GLiNER 目录；未设置时使用 `models/gliner_multi-v2.1`，模型不可用时读取 fail-closed |
-| `AGENTDOJO_USE_RELOADER=true` | 开启 Flask debug 自动重载（默认关闭，避免重复加载模型） |
+| `AGENTDOJO_DEBUG=true` | 开启 Flask debug（默认关闭，避免暴露调试器） |
+| `AGENTDOJO_USE_RELOADER=true` | 开启 Flask 自动重载，不单独开启 debug（默认关闭，避免重复加载模型） |
 | `AGENTDOJO_ATTACK_SCENARIOS_PER_SUITE=<n>` | 每个攻击类型在每个 suite 中生成的预设场景数，默认 3 |
 | `LOCAL_LLM_PORT=<port>` | 本地 OpenAI 兼容模型服务端口，默认 `8000` |
 
@@ -172,7 +176,8 @@ docs/                     # 文档（mkdocs）
 - 当前执行入口在单个 Flask 进程内串行化任务，避免并发任务覆盖 APP 环境、任务基线和 trace。
 - trace 与历史环境快照可能包含完整邮件、文件内容、账户信息等敏感审计数据。服务默认仅监听
   `127.0.0.1`，并拒绝非本机 Host 与跨源写操作；不要将该服务直接暴露到局域网或公网。
-- 当前版本只加载包含完整 `environment_snapshots` 和 `defense_config` 的新版 Trace；旧版本 Trace 与兼容回放代码已删除。
+- 当前版本只加载包含完整 `environment_snapshots` 和 `defense_config` 的新版 Trace Schema，旧 Trace Schema 仍不受支持。
+- 对当前 Schema 中由旧版本生成的关系语义，API 在读取和回放时自动归一化；原始 Trace JSON 不会被改写。
 
 ## 许可证
 
